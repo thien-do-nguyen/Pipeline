@@ -1,0 +1,66 @@
+import random
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from ecommerce_pipeline.config.loader import load_config
+
+from .catalog import load_state, seed_baseline
+from .database import connect, reset_source
+from .models import SeedPlan, StreamPlan
+from .orders import apply_change_events, insert_order
+
+
+def seed_once(config_path: str, plan: SeedPlan, seed: int, reset: bool) -> None:
+    rng = random.Random(seed)
+    config = load_config(config_path)
+    now = _now(config.application.timezone)
+
+    with connect(config.postgres) as conn:
+        with conn.cursor() as cur:
+            if reset:
+                reset_source(cur)
+            state = seed_baseline(cur, rng, plan.customers, now)
+            for idx in range(1, plan.orders + 1):
+                created_at = now - timedelta(days=rng.randint(0, 90), minutes=rng.randint(0, 1440))
+                insert_order(cur, rng, state, f"ORD-{idx:06d}", created_at)
+        conn.commit()
+
+
+def seed_continuous(
+    config_path: str,
+    seed: int,
+    orders_per_batch: int,
+    interval_seconds: float,
+    max_batches: int | None,
+) -> None:
+    plan = StreamPlan(
+        orders_per_batch=orders_per_batch,
+        interval_seconds=interval_seconds,
+        max_batches=max_batches,
+    )
+    rng = random.Random(seed)
+    config = load_config(config_path)
+    batch = 0
+
+    while plan.max_batches is None or batch < plan.max_batches:
+        batch += 1
+        now = _now(config.application.timezone)
+        with connect(config.postgres) as conn:
+            with conn.cursor() as cur:
+                state = load_state(cur)
+                stamp = now.strftime("%Y%m%d%H%M%S%f")
+                for idx in range(1, plan.orders_per_batch + 1):
+                    insert_order(cur, rng, state, f"ORD-RT-{stamp}-{batch:04d}-{idx:03d}", now)
+                apply_change_events(cur, rng, state, now)
+            conn.commit()
+
+        print(f"batch={batch} orders={plan.orders_per_batch} changed_at={now.isoformat()}", flush=True)
+        if plan.max_batches is None or batch < plan.max_batches:
+            time.sleep(plan.interval_seconds)
+
+
+def _now(timezone_name: str) -> datetime:
+    # PostgreSQL columns are TIMESTAMP WITHOUT TIME ZONE. Convert from the
+    # configured business timezone and keep microseconds for reliable watermarks.
+    return datetime.now(ZoneInfo(timezone_name)).replace(tzinfo=None)

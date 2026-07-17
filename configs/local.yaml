@@ -1,0 +1,14 @@
+environment: local
+
+spark:
+  master: "local[*]"
+  config:
+    spark.sql.shuffle.partitions: "4"
+    spark.jars.packages: org.postgresql:postgresql:42.7.3
+    spark.ui.enabled: "false"
+    spark.driver.bindAddress: "127.0.0.1"
+    spark.driver.host: "127.0.0.1"
+    spark.databricks.delta.snapshotPartitions: "2"
+
+lakehouse:
+  base_path: data/lakehouse

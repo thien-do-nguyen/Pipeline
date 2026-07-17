@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecommerce-pipeline"
+version = "0.1.0"
+description = "Local-first PostgreSQL to Delta Lake batch pipeline for an ecommerce lakehouse"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+
+dependencies = [
+    "pyspark==3.5.8",
+    "delta-spark==3.2.0",
+    "pydantic>=2.9,<3",
+    "psycopg[binary]>=3.2,<4",
+    "PyYAML>=6,<7",
+    "python-dotenv>=1,<2",
+]
+
+[project.scripts]
+ecommerce-generate = "ecommerce_pipeline.generator.cli:main"
+ecommerce-batch = "ecommerce_pipeline.jobs.run_batch:main"
+ecommerce-validate = "ecommerce_pipeline.jobs.validate_batch:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "pytest-cov>=5,<8",
+    "ruff>=0.9,<1",
+    "mypy>=1.14,<2",
+    "types-PyYAML",
+    "build",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ecommerce_pipeline = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "integration: requires a running PostgreSQL instance",
+    "e2e: runs Spark/Delta and PostgreSQL end to end",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+explicit_package_bases = true
+mypy_path = "src"
+disable_error_code = ["import-untyped"]

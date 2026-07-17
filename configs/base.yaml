@@ -1,0 +1,32 @@
+# Shared settings used by every deployment environment.
+
+application:
+  name: azure-lakehouse-pipeline
+  source_system: ecommerce
+  timezone: Asia/Ho_Chi_Minh
+
+postgres:
+  host: "${POSTGRES_HOST}"
+  port: "${POSTGRES_PORT}"
+  database: "${POSTGRES_DB}"
+  source_schema: customer_app
+  user: "${POSTGRES_USER}"
+  password: "${POSTGRES_PASSWORD}"
+  sslmode: disable
+  jdbc_driver: org.postgresql.Driver
+  fetch_size: 10000
+
+spark:
+  app_name: lakehouse-pipeline
+  config:
+    spark.sql.extensions: io.delta.sql.DeltaSparkSessionExtension
+    spark.sql.catalog.spark_catalog: org.apache.spark.sql.delta.catalog.DeltaCatalog
+    spark.databricks.delta.schema.autoMerge.enabled: "false"
+    spark.sql.adaptive.enabled: "true"
+    spark.sql.parquet.datetimeRebaseModeInRead: CORRECTED
+    spark.sql.parquet.datetimeRebaseModeInWrite: CORRECTED
+    spark.sql.parquet.int96RebaseModeInRead: CORRECTED
+    spark.sql.parquet.int96RebaseModeInWrite: CORRECTED
+
+lakehouse:
+  format: delta
