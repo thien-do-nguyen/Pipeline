@@ -44,6 +44,8 @@ def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str
 def _expand_string(value: str) -> str:
     def replacement(match: re.Match[str]) -> str:
         variable, default = match.group(1), match.group(2)
+        if variable == "AZURE_STORAGE_HADOOP_AUTH_TYPE":
+            return _azure_storage_hadoop_auth_type(default)
         current = os.getenv(variable)
         if current is not None and current != "":
             return current
@@ -54,11 +56,21 @@ def _expand_string(value: str) -> str:
     return _ENV_PATTERN.sub(replacement, value)
 
 
+def _azure_storage_hadoop_auth_type(default: str | None = None) -> str:
+    value = os.getenv("AZURE_STORAGE_AUTH_TYPE") or default
+    if value is None or value == "":
+        raise ConfigError("Missing required environment variable: AZURE_STORAGE_AUTH_TYPE")
+    normalized = value.lower().replace("-", "_")
+    if normalized in {"account_key", "shared_key", "sharedkey"}:
+        return "SharedKey"
+    raise ConfigError(f"Unsupported AZURE_STORAGE_AUTH_TYPE: {value}")
+
+
 def _expand_environment(value: Any) -> Any:
     if isinstance(value, str):
         return _expand_string(value)
     if isinstance(value, Mapping):
-        return {str(key): _expand_environment(item) for key, item in value.items()}
+        return {_expand_string(str(key)): _expand_environment(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_expand_environment(item) for item in value]
     return value

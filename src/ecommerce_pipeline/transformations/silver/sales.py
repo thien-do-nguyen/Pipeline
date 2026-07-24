@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pyspark.sql import DataFrame
 
-from ecommerce_pipeline.contracts.silver_source_tables import SilverTableContract
+from ecommerce_pipeline.contracts.silver_tables import SilverTableContract
 from ecommerce_pipeline.transformations.silver.common import (
     clean_text,
     current_state,

@@ -62,10 +62,13 @@ seed-stream: env
 		$(if $(MAX_BATCHES),--max-batches $(MAX_BATCHES),)
 
 run-batch-local: env
-	$(VENV_PYTHON) -m ecommerce_pipeline.jobs.run_batch --env local --mode all
+	$(VENV_PYTHON) -m ecommerce_pipeline.jobs.run_batch --env configs/local.yaml --mode all
+
+run-batch-cloud:
+	$(VENV_PYTHON) -m ecommerce_pipeline.jobs.run_batch --env configs/azure.yaml --mode all
 
 validate validate-batch-local: env
-	$(VENV_PYTHON) -m ecommerce_pipeline.jobs.validate_batch --env local
+	$(VENV_PYTHON) -m ecommerce_pipeline.jobs.validate_batch --env $(CONFIG)
 
 format:
 	$(VENV_BIN)/ruff format src tests

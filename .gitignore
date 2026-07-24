@@ -2,27 +2,28 @@
 .env
 .idea/
 .vscode/
-.github/
 
 __pycache__/
-__init__.py
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 htmlcov/
+spark-warehouse/
+metastore_db/
+derby.log
+images/
+docs/
 
 build/
-tests/
 dist/
 *.egg-info/
 
 data/lakehouse/**
 !data/lakehouse/.gitkeep
-README.md
+logs/
 schema/dwhSchema.sql
 
 *.log
 *.zip
-

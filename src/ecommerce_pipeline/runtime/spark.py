@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 from pyspark.sql import SparkSession
 
 from ecommerce_pipeline.config.models import AppConfig
+
+SPARK_WAREHOUSE_CONFIG = "spark.sql.warehouse.dir"
 
 
 class SparkSessionBuilder:
@@ -36,6 +41,9 @@ class SparkSessionBuilder:
                 continue
             self.builder = self.builder.config(key, value)
 
+        if SPARK_WAREHOUSE_CONFIG not in self.config.spark.config:
+            warehouse = Path(tempfile.gettempdir(), self.config.application.name, "spark-warehouse")
+            self.builder = self.builder.config(SPARK_WAREHOUSE_CONFIG, warehouse.as_uri())
         self.builder = self.builder.config("spark.sql.session.timeZone", self.config.application.timezone)
 
         spark = self.builder.getOrCreate()

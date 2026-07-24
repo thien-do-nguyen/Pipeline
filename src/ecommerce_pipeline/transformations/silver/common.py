@@ -5,9 +5,9 @@ from collections.abc import Sequence
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
-from ecommerce_pipeline.contracts.silver_source_tables import SilverTableContract
+from ecommerce_pipeline.contracts.silver_tables import SilverTableContract
 
-SILVER_SCHEMA_VERSION = 4
+SILVER_SCHEMA_VERSION = 1
 
 DECIMAL_COLUMNS = {
     "unit_price",
@@ -83,16 +83,13 @@ def enforce_types(df: DataFrame) -> DataFrame:
 
 
 def current_state(df: DataFrame, contract: SilverTableContract) -> DataFrame:
-    required = {*contract.columns, "_batch_id", "_ingested_at", "_record_hash"}
+    required = {*contract.columns, "_event_id", "_operation", "_batch_id", "_record_hash"}
     missing = sorted(required - set(df.columns))
     if missing:
         raise ValueError(f"Missing Bronze columns for {contract.table_name}: {missing}")
     df = enforce_types(df)
     window = Window.partitionBy(*contract.primary_keys).orderBy(
-        F.col(contract.incremental_column).desc_nulls_last(),
-        F.col("_ingested_at").desc_nulls_last(),
-        F.col("_batch_id").desc_nulls_last(),
-        F.col("_record_hash").desc_nulls_last(),
+        F.col("_event_id").desc(),
     )
     columns = [F.col(name) for name in contract.columns]
     return (
@@ -100,7 +97,8 @@ def current_state(df: DataFrame, contract: SilverTableContract) -> DataFrame:
         .filter(F.col("_row_number") == 1)
         .select(
             *columns,
-            F.coalesce(F.col("_operation"), F.lit("UPSERT")).alias("_operation"),
+            F.col("_operation"),
+            F.col("_event_id").alias("_bronze_event_id"),
             F.col("_batch_id").alias("_bronze_batch_id"),
             F.current_timestamp().alias("_silver_updated_at"),
             F.lit(contract.table_name).alias("_source_table"),

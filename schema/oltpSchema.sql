@@ -3,11 +3,8 @@
 --   Learning/MVP Lean PostgreSQL schema for a customer commerce app.
 --
 -- Scope:
---   Schema only.
---   No triggers.
---   No views.
---   No functions.
---   No seed/test data.
+--   OLTP schema plus a transactional change-event log for JDBC batch ingestion.
+--   No views or seed/test data.
 --
 -- =====================================================
 
@@ -748,47 +745,102 @@ WHERE review_target = 'shop';
 
 
 -- =====================================================
--- 9. INDEXES FOR APP AND FUTURE DWH EXTRACTION
+-- 9. TRANSACTIONAL CHANGE-EVENT LOG
 -- =====================================================
 
--- Composite watermark indexes used by deterministic incremental extraction:
--- WHERE updated_at >= :lower_bound AND updated_at <= :upper_bound
--- ORDER BY updated_at, <primary_key>.
-CREATE INDEX idx_app_users_updated_id
-ON app_users(updated_at, user_id);
+CREATE TABLE change_events (
+    event_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    source_table TEXT NOT NULL,
+    operation VARCHAR(6) NOT NULL CHECK (operation IN ('INSERT', 'UPDATE', 'DELETE')),
+    primary_key JSONB NOT NULL,
+    row_data JSONB NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
-CREATE INDEX idx_user_addresses_updated_id
-ON user_addresses(updated_at, address_id);
+CREATE INDEX idx_change_events_source_event
+ON change_events(source_table, event_id);
 
-CREATE INDEX idx_shops_updated_id
-ON shops(updated_at, shop_id);
+CREATE FUNCTION capture_change_event()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    row_snapshot JSONB;
+BEGIN
+    row_snapshot := CASE WHEN TG_OP = 'DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END;
 
-CREATE INDEX idx_categories_updated_id
-ON categories(updated_at, category_id);
+    -- Optional trigger argument 2 lists sensitive columns that must not enter the event log.
+    IF TG_NARGS > 1 THEN
+        row_snapshot := row_snapshot - string_to_array(TG_ARGV[1], ',');
+    END IF;
 
-CREATE INDEX idx_products_updated_id
-ON products(updated_at, product_id);
+    INSERT INTO change_events (source_table, operation, primary_key, row_data)
+    VALUES (
+        TG_TABLE_NAME,
+        TG_OP,
+        jsonb_build_object(TG_ARGV[0], row_snapshot -> TG_ARGV[0]),
+        row_snapshot
+    );
 
-CREATE INDEX idx_product_variants_updated_id
-ON product_variants(updated_at, product_variant_id);
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
 
-CREATE INDEX idx_vouchers_updated_id
-ON vouchers(updated_at, voucher_id);
+CREATE TRIGGER capture_app_users_change
+AFTER INSERT OR UPDATE OR DELETE ON app_users
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('user_id', 'password_hash');
 
-CREATE INDEX idx_orders_updated_id
-ON orders(updated_at, order_id);
+CREATE TRIGGER capture_user_addresses_change
+AFTER INSERT OR UPDATE OR DELETE ON user_addresses
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('address_id');
 
-CREATE INDEX idx_order_items_updated_id
-ON order_items(updated_at, order_item_id);
+CREATE TRIGGER capture_shops_change
+AFTER INSERT OR UPDATE OR DELETE ON shops
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('shop_id');
 
-CREATE INDEX idx_order_vouchers_updated_id
-ON order_vouchers(updated_at, order_voucher_id);
+CREATE TRIGGER capture_categories_change
+AFTER INSERT OR UPDATE OR DELETE ON categories
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('category_id');
 
-CREATE INDEX idx_payments_updated_id
-ON payments(updated_at, payment_id);
+CREATE TRIGGER capture_products_change
+AFTER INSERT OR UPDATE OR DELETE ON products
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('product_id');
 
-CREATE INDEX idx_shipments_updated_id
-ON shipments(updated_at, shipment_id);
+CREATE TRIGGER capture_product_variants_change
+AFTER INSERT OR UPDATE OR DELETE ON product_variants
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('product_variant_id');
+
+CREATE TRIGGER capture_vouchers_change
+AFTER INSERT OR UPDATE OR DELETE ON vouchers
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('voucher_id');
+
+CREATE TRIGGER capture_orders_change
+AFTER INSERT OR UPDATE OR DELETE ON orders
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('order_id');
+
+CREATE TRIGGER capture_order_items_change
+AFTER INSERT OR UPDATE OR DELETE ON order_items
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('order_item_id');
+
+CREATE TRIGGER capture_order_vouchers_change
+AFTER INSERT OR UPDATE OR DELETE ON order_vouchers
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('order_voucher_id');
+
+CREATE TRIGGER capture_payments_change
+AFTER INSERT OR UPDATE OR DELETE ON payments
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('payment_id');
+
+CREATE TRIGGER capture_shipments_change
+AFTER INSERT OR UPDATE OR DELETE ON shipments
+FOR EACH ROW EXECUTE FUNCTION capture_change_event('shipment_id');
+
+
+-- =====================================================
+-- 10. APPLICATION QUERY INDEXES
+-- =====================================================
 
 CREATE INDEX idx_user_addresses_user ON user_addresses(user_id);
 
@@ -848,24 +900,6 @@ CREATE INDEX idx_reviews_customer ON reviews(customer_id);
 CREATE INDEX idx_reviews_shop ON reviews(shop_id);
 CREATE INDEX idx_reviews_product ON reviews(product_id);
 CREATE INDEX idx_reviews_status ON reviews(review_status);
-
-
--- =====================================================
--- CDC readiness
--- =====================================================
-
-ALTER TABLE app_users REPLICA IDENTITY FULL;
-ALTER TABLE user_addresses REPLICA IDENTITY FULL;
-ALTER TABLE shops REPLICA IDENTITY FULL;
-ALTER TABLE categories REPLICA IDENTITY FULL;
-ALTER TABLE products REPLICA IDENTITY FULL;
-ALTER TABLE product_variants REPLICA IDENTITY FULL;
-ALTER TABLE vouchers REPLICA IDENTITY FULL;
-ALTER TABLE orders REPLICA IDENTITY FULL;
-ALTER TABLE order_items REPLICA IDENTITY FULL;
-ALTER TABLE order_vouchers REPLICA IDENTITY FULL;
-ALTER TABLE payments REPLICA IDENTITY FULL;
-ALTER TABLE shipments REPLICA IDENTITY FULL;
 
 
 -- =====================================================

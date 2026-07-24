@@ -3,15 +3,6 @@ from __future__ import annotations
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from ecommerce_pipeline.config.models import AppConfig
-
-
-def read_silver(spark: SparkSession, config: AppConfig, table_name: str) -> DataFrame:
-    df = spark.read.format(config.lakehouse.format).load(config.lakehouse.table_path("silver", table_name))
-    if "_operation" in df.columns:
-        df = df.filter(F.col("_operation") != "DELETE")
-    return df
-
 
 def natural_hash(*columns: Column) -> Column:
     values = [F.coalesce(column.cast("string"), F.lit("")) for column in columns]

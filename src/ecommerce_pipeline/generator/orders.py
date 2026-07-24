@@ -8,6 +8,7 @@ from psycopg.types.json import Jsonb
 
 from .database import one_id
 from .models import RuntimeState, Variant, money
+from .vouchers import rotate_delete_marker_voucher
 
 PaymentStatus = Literal["paid", "pending", "failed"]
 OrderStatus = Literal["pending_payment", "confirmed", "processing", "shipped", "delivered", "completed", "cancelled"]
@@ -137,6 +138,7 @@ def apply_change_events(
     update_customer(cur, rng, state, changed_at)
     update_product_variant(cur, rng, state, changed_at)
     advance_order(cur, changed_at)
+    rotate_delete_marker_voucher(cur, changed_at)
 
 
 def update_customer(

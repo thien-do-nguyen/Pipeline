@@ -4,9 +4,6 @@ import argparse
 
 from pyspark.sql import SparkSession
 
-from ecommerce_pipeline.batch.build_gold import build_gold
-from ecommerce_pipeline.batch.build_silver import build_silver
-from ecommerce_pipeline.batch.extract_to_bronze import extract_all_to_bronze
 from ecommerce_pipeline.config.loader import load_config
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.control.batch_runs import (
@@ -16,6 +13,9 @@ from ecommerce_pipeline.control.batch_runs import (
     new_batch_id,
     write_batch_run_status,
 )
+from ecommerce_pipeline.ingestion.batch.extract_to_bronze import extract_all_to_bronze
+from ecommerce_pipeline.pipelines.build_gold import build_gold
+from ecommerce_pipeline.pipelines.build_silver import build_silver
 from ecommerce_pipeline.runtime.spark import build_spark
 
 
@@ -25,6 +25,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", default="bronze", choices=["bronze", "silver", "gold", "all"])
     parser.add_argument("--batch-id")
     parser.add_argument("--tables", nargs="*", help="Optional source table names to extract.")
+    parser.add_argument(
+        "--full-rebuild-silver",
+        action="store_true",
+        help="Explicitly rebuild Silver from complete Bronze history.",
+    )
+    parser.add_argument(
+        "--full-rebuild-gold",
+        action="store_true",
+        help="Explicitly rebuild Gold from complete Silver snapshots.",
+    )
     return parser.parse_args()
 
 
@@ -39,7 +49,7 @@ def run_mode(
         for result in bronze_results:
             print(f"bronze table={result.table_name} records={result.record_count} path={result.output_path}")
         write_batch_run_status(
-            config.lakehouse.base_path,
+            config.application.logs_path,
             batch_id,
             "RUNNING",
             config.application.timezone,
@@ -50,11 +60,17 @@ def run_mode(
 
     if args.mode in {"silver", "all"}:
         silver_tables = args.tables if args.mode == "silver" else None
-        outputs["silver"] = build_silver(spark, config, silver_tables)
+        outputs["silver"] = build_silver(
+            spark,
+            config,
+            silver_tables,
+            batch_id=batch_id,
+            full_rebuild=args.full_rebuild_silver,
+        )
         for path in outputs["silver"]:
             print(f"silver path={path}")
         write_batch_run_status(
-            config.lakehouse.base_path,
+            config.application.logs_path,
             batch_id,
             "RUNNING",
             config.application.timezone,
@@ -64,11 +80,16 @@ def run_mode(
         )
 
     if args.mode in {"gold", "all"}:
-        outputs["gold"] = build_gold(spark, config)
+        outputs["gold"] = build_gold(
+            spark,
+            config,
+            batch_id=batch_id,
+            full_rebuild=args.full_rebuild_gold,
+        )
         for path in outputs["gold"]:
             print(f"gold path={path}")
         write_batch_run_status(
-            config.lakehouse.base_path,
+            config.application.logs_path,
             batch_id,
             "RUNNING",
             config.application.timezone,
@@ -85,19 +106,23 @@ def main() -> None:
         raise SystemExit("--tables requires at least one table name")
     if args.tables and args.mode in {"gold", "all"}:
         raise SystemExit("--tables is supported only for bronze or silver mode")
+    if args.full_rebuild_silver and args.mode not in {"silver", "all"}:
+        raise SystemExit("--full-rebuild-silver requires --mode silver or --mode all")
+    if args.full_rebuild_gold and args.mode not in {"gold", "all"}:
+        raise SystemExit("--full-rebuild-gold requires --mode gold or --mode all")
     config = load_config(args.env)
     batch_id = args.batch_id or new_batch_id(config.application.timezone)
-    batch_run_path(config.lakehouse.base_path, batch_id)
+    batch_run_path(config.application.logs_path, batch_id)
     spark: SparkSession | None = None
-    with local_pipeline_lock(config.lakehouse.base_path, batch_id):
+    with local_pipeline_lock(config.application.logs_path, batch_id):
         try:
             spark = build_spark(config)
             write_batch_run_status(
-                config.lakehouse.base_path, batch_id, "RUNNING", config.application.timezone, spark=spark
+                config.application.logs_path, batch_id, "RUNNING", config.application.timezone, spark=spark
             )
             results, outputs = run_mode(spark, args, config, batch_id)
             summary_path = write_batch_run_status(
-                config.lakehouse.base_path,
+                config.application.logs_path,
                 batch_id,
                 "SUCCEEDED",
                 config.application.timezone,
@@ -107,9 +132,9 @@ def main() -> None:
             )
             print(f"batch_id={batch_id} summary={summary_path}")
         except Exception as exc:
-            if spark is not None or "://" not in config.lakehouse.base_path:
+            if spark is not None or "://" not in config.application.logs_path:
                 write_batch_run_status(
-                    config.lakehouse.base_path,
+                    config.application.logs_path,
                     batch_id,
                     "FAILED",
                     config.application.timezone,

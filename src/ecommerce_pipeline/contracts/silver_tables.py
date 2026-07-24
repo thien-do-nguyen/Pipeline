@@ -8,10 +8,9 @@ class SilverTableContract:
     table_name: str
     primary_keys: tuple[str, ...]
     columns: tuple[str, ...]
-    incremental_column: str = "updated_at"
 
 
-SOURCE_TABLES: dict[str, SilverTableContract] = {
+SILVER_TABLES: dict[str, SilverTableContract] = {
     "app_users": SilverTableContract(
         "app_users",
         ("user_id",),
@@ -211,13 +210,8 @@ SOURCE_TABLES: dict[str, SilverTableContract] = {
 }
 
 
-def get_contract(table_name: str) -> SilverTableContract:
+def get_silver_contract(table_name: str) -> SilverTableContract:
     try:
-        return SOURCE_TABLES[table_name]
+        return SILVER_TABLES[table_name]
     except KeyError as exc:
-        raise ValueError(f"Unknown silver table: {table_name}") from exc
-
-
-def get_table_contracts(table_names: list[str] | None = None) -> list[SilverTableContract]:
-    names = list(SOURCE_TABLES) if table_names is None else table_names
-    return [get_contract(name) for name in names]
+        raise ValueError(f"Unknown Silver table: {table_name}") from exc

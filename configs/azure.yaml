@@ -1,0 +1,13 @@
+environment: azure
+
+spark:
+  master: "local[*]"
+  config:
+    spark.sql.shuffle.partitions: "4"
+    spark.jars.packages: "org.postgresql:postgresql:42.7.3,org.apache.hadoop:hadoop-azure:3.3.4"
+    spark.databricks.delta.snapshotPartitions: "2"
+    spark.hadoop.fs.azure.account.auth.type.${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net: "${AZURE_STORAGE_HADOOP_AUTH_TYPE}"
+    spark.hadoop.fs.azure.account.key.${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net: "${AZURE_STORAGE_ACCOUNT_KEY}"
+
+lakehouse:
+  base_path: "abfss://${AZURE_CONTAINER}@${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net/lakehouse"

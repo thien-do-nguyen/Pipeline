@@ -21,6 +21,7 @@ class ApplicationConfig(FrozenConfigModel):
     name: str = Field(min_length=1)
     source_system: str = Field(min_length=1)
     timezone: str = Field(min_length=1)
+    logs_path: str = Field(default="logs", min_length=1)
 
     @field_validator("timezone")
     @classmethod
@@ -86,7 +87,7 @@ class LakehouseConfig(FrozenConfigModel):
     format: Literal["delta"] = "delta"
 
     def table_path(self, layer: str, table_name: str) -> str:
-        if layer not in {"bronze", "silver", "gold", "control"}:
+        if layer not in {"bronze", "silver", "gold"}:
             raise ValueError(f"Unsupported lakehouse layer: {layer}")
         for value, label in ((layer, "layer"), (table_name, "table_name")):
             if not _IDENTIFIER.fullmatch(value):

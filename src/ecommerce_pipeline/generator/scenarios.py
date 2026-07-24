@@ -62,5 +62,5 @@ def seed_continuous(
 
 def _now(timezone_name: str) -> datetime:
     # PostgreSQL columns are TIMESTAMP WITHOUT TIME ZONE. Convert from the
-    # configured business timezone and keep microseconds for reliable watermarks.
+    # Keep business timestamps realistic even though ingestion ordering uses event_id.
     return datetime.now(ZoneInfo(timezone_name)).replace(tzinfo=None)

@@ -4,6 +4,7 @@ application:
   name: azure-lakehouse-pipeline
   source_system: ecommerce
   timezone: Asia/Ho_Chi_Minh
+  logs_path: "logs"
 
 postgres:
   host: "${POSTGRES_HOST}"

@@ -28,7 +28,7 @@ def reset_source(cur: psycopg.Cursor[Any]) -> None:
     cur.execute(
         """
         TRUNCATE TABLE
-            reviews, refunds, returns, shipments, payments, order_vouchers,
+            change_events, reviews, refunds, returns, shipments, payments, order_vouchers,
             order_items, orders, cart_items, shopping_carts, vouchers,
             product_variants, products, categories, shops, user_addresses, app_users
         RESTART IDENTITY CASCADE
