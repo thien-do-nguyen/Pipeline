@@ -15,6 +15,52 @@ def _empty(spark: SparkSession, schema: str) -> DataFrame:
     return spark.createDataFrame([], schema)
 
 
+def _fact_dimensions(
+    spark: SparkSession,
+    customers: DataFrame,
+    items: DataFrame,
+    products: DataFrame,
+) -> dict[str, DataFrame]:
+    valid_from = datetime(2020, 1, 1)
+    valid_to = datetime(9999, 12, 31)
+    product_categories = {row["product_id"]: row["category_id"] for row in products.collect()}
+    item_rows = items.select("product_id", "product_variant_id", "shop_id").distinct().collect()
+    product_versions = [
+        (
+            row["product_variant_id"],
+            product_categories[row["product_id"]],
+            1_000 + row["product_variant_id"],
+            valid_from,
+            valid_to,
+        )
+        for row in item_rows
+    ]
+    shop_versions = [
+        (row["shop_id"], 2_000 + row["shop_id"], valid_from, valid_to)
+        for row in items.select("shop_id").distinct().collect()
+    ]
+    category_versions = [
+        (category_id, 3_000 + category_id, valid_from, valid_to)
+        for category_id in sorted(set(product_categories.values()))
+    ]
+    return {
+        "dim_customer": customers,
+        "dim_product": spark.createDataFrame(
+            product_versions,
+            """source_product_variant_id int, source_category_id int, product_key long,
+               effective_from timestamp, effective_to timestamp""",
+        ),
+        "dim_shop": spark.createDataFrame(
+            shop_versions,
+            "source_shop_id int, shop_key long, effective_from timestamp, effective_to timestamp",
+        ),
+        "dim_category": spark.createDataFrame(
+            category_versions,
+            "source_category_id int, category_key long, effective_from timestamp, effective_to timestamp",
+        ),
+    }
+
+
 def test_fact_allocations_reconcile_and_customer_join_is_temporal(spark: SparkSession) -> None:
     order_created = datetime(2026, 1, 15, 10, 30)
     snapshot = json.dumps(
@@ -96,7 +142,33 @@ def test_fact_allocations_reconcile_and_customer_join_is_temporal(spark: SparkSe
         ),
     }
 
-    fact = build_fact_sales(tables, customers)
+    dimensions = _fact_dimensions(spark, customers, items, products)
+    dimensions["dim_product"] = spark.createDataFrame(
+        [
+            (101, 3, 1101, datetime(2025, 1, 1), datetime(2026, 2, 1)),
+            (101, 3, 2101, datetime(2026, 2, 1), datetime(9999, 12, 31)),
+            (102, 3, 1102, datetime(2025, 1, 1), datetime(2026, 2, 1)),
+            (102, 3, 2102, datetime(2026, 2, 1), datetime(9999, 12, 31)),
+        ],
+        """source_product_variant_id int, source_category_id int, product_key long,
+           effective_from timestamp, effective_to timestamp""",
+    )
+    dimensions["dim_shop"] = spark.createDataFrame(
+        [
+            (2, 2202, datetime(2025, 1, 1), datetime(2026, 2, 1)),
+            (2, 3202, datetime(2026, 2, 1), datetime(9999, 12, 31)),
+        ],
+        "source_shop_id int, shop_key long, effective_from timestamp, effective_to timestamp",
+    )
+    dimensions["dim_category"] = spark.createDataFrame(
+        [
+            (3, 3303, datetime(2025, 1, 1), datetime(2026, 2, 1)),
+            (3, 4303, datetime(2026, 2, 1), datetime(9999, 12, 31)),
+        ],
+        "source_category_id int, category_key long, effective_from timestamp, effective_to timestamp",
+    )
+
+    fact = build_fact_sales(tables, dimensions)
     totals = fact.agg({"gross_sales_amount": "sum", "total_discount_amount": "sum", "net_sales_amount": "sum"}).first()
     rows = fact.orderBy("source_order_item_id").collect()
 
@@ -105,6 +177,9 @@ def test_fact_allocations_reconcile_and_customer_join_is_temporal(spark: SparkSe
     assert totals["sum(total_discount_amount)"] == Decimal("50.00")
     assert totals["sum(net_sales_amount)"] == Decimal("412.00")
     assert {row["customer_key"] for row in rows} == {701}
+    assert {row["product_key"] for row in rows} == {1101, 1102}
+    assert {row["shop_key"] for row in rows} == {2202}
+    assert {row["category_key"] for row in rows} == {3303}
     assert [row["order_discount_amount_allocated"] for row in rows] == [Decimal("10.00"), Decimal("30.00")]
     assert [row["shipping_amount_allocated"] for row in rows] == [Decimal("7.50"), Decimal("22.50")]
 
@@ -179,7 +254,10 @@ def test_fact_uses_first_customer_version_for_orders_before_scd2_history(spark: 
         ),
     }
 
-    fact = build_fact_sales(tables, customers)
+    fact = build_fact_sales(
+        tables,
+        _fact_dimensions(spark, customers, items, tables["products"]),
+    )
 
     assert fact.select("customer_key").first()["customer_key"] == 900
 
@@ -257,7 +335,10 @@ def test_fact_caps_total_discount_to_order_header_when_line_discounts_are_inform
     )
 
     row = (
-        build_fact_sales(tables, customers)
+        build_fact_sales(
+            tables,
+            _fact_dimensions(spark, customers, items, tables["products"]),
+        )
         .select("line_discount_amount", "total_discount_amount", "net_sales_amount")
         .first()
     )

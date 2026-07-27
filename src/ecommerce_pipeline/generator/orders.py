@@ -1,4 +1,5 @@
 import random
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal, cast
@@ -15,6 +16,19 @@ OrderStatus = Literal["pending_payment", "confirmed", "processing", "shipped", "
 ShipmentStatus = Literal["pending", "packed", "in_transit", "delivered", "cancelled"]
 AddressSnapshot = dict[str, object]
 OrderLine = tuple[Variant, int, Decimal, Decimal]
+
+
+@dataclass(frozen=True)
+class StreamChangeSummary:
+    customer_id: int
+    product_variant_id: int
+    product_id: int
+    shop_id: int
+    category_id: int
+    advanced_order_id: int | None
+    deleted_order_id: int | None
+    deleted_voucher_id: int | None
+    inserted_voucher_id: int
 
 
 def insert_order(
@@ -134,11 +148,26 @@ def apply_change_events(
     rng: random.Random,
     state: RuntimeState,
     changed_at: datetime,
-) -> None:
-    update_customer(cur, rng, state, changed_at)
-    update_product_variant(cur, rng, state, changed_at)
-    advance_order(cur, changed_at)
-    rotate_delete_marker_voucher(cur, changed_at)
+) -> StreamChangeSummary:
+    customer_id = update_customer(cur, rng, state, changed_at)
+    product_variant_id = update_product_variant(cur, rng, state, changed_at)
+    product_id = update_product(cur, rng, state, changed_at)
+    shop_id = update_shop(cur, rng, state, changed_at)
+    category_id = update_category(cur, rng, changed_at)
+    advanced_order_id = advance_order(cur, changed_at)
+    deleted_order_id = delete_baseline_order(cur, advanced_order_id)
+    deleted_voucher_id, inserted_voucher_id = rotate_delete_marker_voucher(cur, changed_at)
+    return StreamChangeSummary(
+        customer_id=customer_id,
+        product_variant_id=product_variant_id,
+        product_id=product_id,
+        shop_id=shop_id,
+        category_id=category_id,
+        advanced_order_id=advanced_order_id,
+        deleted_order_id=deleted_order_id,
+        deleted_voucher_id=deleted_voucher_id,
+        inserted_voucher_id=inserted_voucher_id,
+    )
 
 
 def update_customer(
@@ -146,7 +175,7 @@ def update_customer(
     rng: random.Random,
     state: RuntimeState,
     changed_at: datetime,
-) -> None:
+) -> int:
     user_id = rng.choice(state.user_ids)
     cur.execute(
         """
@@ -167,6 +196,7 @@ def update_customer(
         """,
         (f"{rng.randint(1, 999)} Nguyen Trai", changed_at, state.address_by_user[user_id]),
     )
+    return user_id
 
 
 def update_product_variant(
@@ -174,7 +204,7 @@ def update_product_variant(
     rng: random.Random,
     state: RuntimeState,
     changed_at: datetime,
-) -> None:
+) -> int:
     variant = rng.choice(state.variants)
     new_price = money(variant.unit_price * Decimal(str(rng.choice([0.98, 1.01, 1.03]))))
     cur.execute(
@@ -187,9 +217,69 @@ def update_product_variant(
         """,
         (new_price, rng.randint(-5, 20), changed_at, variant.product_variant_id),
     )
+    return variant.product_variant_id
 
 
-def advance_order(cur: psycopg.Cursor[Any], changed_at: datetime) -> None:
+def update_product(
+    cur: psycopg.Cursor[Any],
+    rng: random.Random,
+    state: RuntimeState,
+    changed_at: datetime,
+) -> int:
+    product_id = rng.choice(state.variants).product_id
+    cur.execute(
+        """
+        UPDATE products
+        SET is_featured = NOT is_featured,
+            updated_at = %s
+        WHERE product_id = %s
+        """,
+        (changed_at, product_id),
+    )
+    return product_id
+
+
+def update_shop(
+    cur: psycopg.Cursor[Any],
+    rng: random.Random,
+    state: RuntimeState,
+    changed_at: datetime,
+) -> int:
+    shop_id = rng.choice(sorted({variant.shop_id for variant in state.variants}))
+    cur.execute(
+        """
+        UPDATE shops
+        SET shop_name = CASE
+                WHEN shop_name LIKE '%% [stream]' THEN left(shop_name, length(shop_name) - length(' [stream]'))
+                ELSE shop_name || ' [stream]'
+            END,
+            updated_at = %s
+        WHERE shop_id = %s
+        """,
+        (changed_at, shop_id),
+    )
+    return shop_id
+
+
+def update_category(cur: psycopg.Cursor[Any], rng: random.Random, changed_at: datetime) -> int:
+    cur.execute("SELECT category_id FROM categories ORDER BY category_id")
+    rows = cur.fetchall()
+    if not rows:
+        raise RuntimeError("No categories available for continuous generation")
+    category_id = int(rng.choice(rows)["category_id"])
+    cur.execute(
+        """
+        UPDATE categories
+        SET is_active = NOT is_active,
+            updated_at = %s
+        WHERE category_id = %s
+        """,
+        (changed_at, category_id),
+    )
+    return category_id
+
+
+def advance_order(cur: psycopg.Cursor[Any], changed_at: datetime) -> int | None:
     cur.execute(
         """
         SELECT order_id, order_status
@@ -201,7 +291,7 @@ def advance_order(cur: psycopg.Cursor[Any], changed_at: datetime) -> None:
     )
     row = cur.fetchone()
     if row is None:
-        return
+        return None
 
     order_id = int(row["order_id"])
     next_status = _next_order_status(cast(OrderStatus, row["order_status"]))
@@ -246,6 +336,27 @@ def advance_order(cur: psycopg.Cursor[Any], changed_at: datetime) -> None:
             order_id,
         ),
     )
+    return order_id
+
+
+def delete_baseline_order(cur: psycopg.Cursor[Any], exclude_order_id: int | None) -> int | None:
+    cur.execute(
+        """
+        DELETE FROM orders
+        WHERE order_id = (
+            SELECT order_id
+            FROM orders
+            WHERE order_number ~ '^ORD-[0-9]{6}$'
+              AND (%s IS NULL OR order_id <> %s)
+            ORDER BY created_at, order_id
+            LIMIT 1
+        )
+        RETURNING order_id
+        """,
+        (exclude_order_id, exclude_order_id),
+    )
+    row = cur.fetchone()
+    return int(row["order_id"]) if row is not None else None
 
 
 def _address_snapshot(cur: psycopg.Cursor[Any], address_id: int) -> AddressSnapshot:

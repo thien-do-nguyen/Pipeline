@@ -12,7 +12,11 @@ from ecommerce_pipeline.config.models import (
 from ecommerce_pipeline.contracts.bronze_tables import BRONZE_TABLES, get_bronze_contract
 from ecommerce_pipeline.contracts.change_events import EventCursor
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
-from ecommerce_pipeline.ingestion.batch.bronze_operations import change_event_query
+from ecommerce_pipeline.ingestion.batch.bronze_operations import (
+    batch_upper_bound_query,
+    change_event_query,
+    jdbc_partition_count,
+)
 
 
 def _config() -> AppConfig:
@@ -43,7 +47,7 @@ def test_change_event_query_is_bounded_by_event_id() -> None:
     assert "jsonb_populate_record(NULL::customer_app.orders" in query
     assert "SELECT record.*" in query
     assert "e.event_id > 99 AND e.event_id <= 150" in query
-    assert "ORDER BY e.event_id" in query
+    assert "ORDER BY" not in query
     assert "e.operation AS _operation" in query
 
 
@@ -51,6 +55,25 @@ def test_initial_query_starts_after_zero() -> None:
     query = change_event_query(_config(), get_bronze_contract("vouchers"), None, 12)
 
     assert "e.event_id > 0 AND e.event_id <= 12" in query
+
+
+def test_upper_bound_caps_each_source_batch_after_the_cursor() -> None:
+    query = batch_upper_bound_query(
+        _config(),
+        get_bronze_contract("orders"),
+        EventCursor(last_event_id=99),
+    )
+
+    assert "source_table = 'orders' AND event_id > 99" in query
+    assert "ORDER BY event_id LIMIT 500000" in query
+
+
+def test_jdbc_partition_count_is_dynamic_and_source_throttled() -> None:
+    config = _config()
+
+    assert jdbc_partition_count(config, EventCursor(100), 50_100) == 1
+    assert jdbc_partition_count(config, EventCursor(100), 250_100) == 3
+    assert jdbc_partition_count(config, EventCursor(100), 900_100) == 4
 
 
 def test_query_without_events_preserves_the_source_schema() -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
@@ -30,16 +32,32 @@ def add_bronze_metadata(df: DataFrame, config: AppConfig, table_name: str, batch
     )
 
 
-def read_batch_upper_bound(reader: PostgresReader, config: AppConfig, contract: BronzeTableContract) -> int | None:
-    event_log = f"{config.postgres.source_schema}.{CHANGE_EVENT_TABLE}"
-    query = (
-        f"SELECT MAX(event_id) AS batch_upper_bound FROM {event_log} "
-        f"WHERE source_table = {_sql_literal(contract.table_name)}"
-    )
-    row = reader.read_query(query).first()
+def read_batch_upper_bound(
+    reader: PostgresReader,
+    config: AppConfig,
+    contract: BronzeTableContract,
+    cursor: EventCursor | None,
+) -> int | None:
+    row = reader.read_first(batch_upper_bound_query(config, contract, cursor))
     if row is None or row["batch_upper_bound"] is None:
         return None
     return int(row["batch_upper_bound"])
+
+
+def batch_upper_bound_query(
+    config: AppConfig,
+    contract: BronzeTableContract,
+    cursor: EventCursor | None,
+) -> str:
+    event_log = f"{config.postgres.source_schema}.{CHANGE_EVENT_TABLE}"
+    lower_bound = cursor.last_event_id if cursor else 0
+    return (
+        "SELECT MAX(event_id) AS batch_upper_bound FROM ("
+        f"SELECT event_id FROM {event_log} "
+        f"WHERE source_table = {_sql_literal(contract.table_name)} AND event_id > {lower_bound} "
+        f"ORDER BY event_id LIMIT {config.postgres.max_events_per_batch}"
+        ") bounded_events"
+    )
 
 
 def change_event_query(
@@ -60,8 +78,14 @@ def change_event_query(
         f"CROSS JOIN LATERAL jsonb_populate_record(NULL::{schema}.{contract.table_name}, e.row_data) record "
         f"WHERE e.source_table = {_sql_literal(contract.table_name)} "
         f"AND e.event_id > {lower_bound} AND e.event_id <= {batch_upper_bound} "
-        "ORDER BY e.event_id"
     )
+
+
+def jdbc_partition_count(config: AppConfig, cursor: EventCursor | None, batch_upper_bound: int) -> int:
+    lower_bound = cursor.last_event_id if cursor else 0
+    event_id_span = max(batch_upper_bound - lower_bound, 1)
+    required = math.ceil(event_id_span / config.postgres.target_events_per_partition)
+    return min(required, config.postgres.max_jdbc_partitions)
 
 
 def max_event_cursor(df: DataFrame) -> EventCursor | None:

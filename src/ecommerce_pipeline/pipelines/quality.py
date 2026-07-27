@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -8,6 +8,7 @@ from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
 from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter
+from ecommerce_pipeline.contracts.gold_tables import SCD2_DIMENSIONS, Scd2DimensionContract
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,7 @@ class GoldQualityChecker:
             metrics = self._collect_fact_metrics(fact)
             self._assert_fact_metrics(metrics, "fact_sales")
             self._assert_dimension_integrity(fact, check_uniqueness=True)
-            self._assert_customer_scd2()
+            self.validate_scd2(SCD2_DIMENSIONS)
             return self._assert_reconciliation(fact, orders, items, metrics)
 
     def run_incremental(self, fact: DataFrame, sources: Mapping[str, DataFrame]) -> GoldQualityReport:
@@ -98,6 +99,20 @@ class GoldQualityChecker:
             self._assert_fact_metrics(metrics, "fact_sales incremental")
             self._assert_dimension_integrity(fact, check_uniqueness=False)
             return self._assert_reconciliation(fact, orders, items, metrics)
+
+    def validate_scd2(self, table_names: Iterable[str]) -> None:
+        """Validate changed SCD2 tables before their Gold snapshot is published."""
+
+        names = tuple(dict.fromkeys(table_names))
+        unknown = sorted(set(names) - set(SCD2_DIMENSIONS))
+        if unknown:
+            raise ValueError(f"Unknown SCD2 dimensions: {unknown}")
+        if not names:
+            return
+        violations = [self._scd2_violations(name, SCD2_DIMENSIONS[name]) for name in names]
+        violation = self._union_all(violations).first()
+        if violation is not None:
+            raise ValueError(f"Invalid SCD2 history in gold.{violation['dimension']}: {violation['violation']}")
 
     @staticmethod
     @contextmanager
@@ -206,27 +221,32 @@ class GoldQualityChecker:
             .select(F.lit(f"Missing gold.{dimension} reference for {fact_key}").alias("violation"))
         )
 
-    def _assert_customer_scd2(self) -> None:
-        customers = self.lakehouse.read_table("gold", "dim_customer").filter(F.col("source_customer_id").isNotNull())
-        all_members = customers.select("source_customer_id").distinct()
-        current_counts = customers.filter("is_current").groupBy("source_customer_id").count()
+    def _scd2_violations(self, table_name: str, contract: Scd2DimensionContract) -> DataFrame:
+        dimension = self.lakehouse.read_table("gold", table_name).filter(F.col(contract.source_key).isNotNull())
+        all_members = dimension.select(contract.source_key).distinct()
+        current_counts = dimension.filter("is_current").groupBy(contract.source_key).count()
         invalid_current = (
-            all_members.join(current_counts, "source_customer_id", "left")
+            all_members.join(current_counts, contract.source_key, "left")
             .filter(F.coalesce(F.col("count"), F.lit(0)) != 1)
-            .select(F.lit("invalid current member count").alias("violation"))
+            .select(
+                F.lit(table_name).alias("dimension"),
+                F.lit("invalid current member count").alias("violation"),
+            )
         )
-        invalid_range = customers.filter(F.col("effective_from") >= F.col("effective_to")).select(
-            F.lit("invalid effective date range").alias("violation")
+        invalid_range = dimension.filter(F.col("effective_from") >= F.col("effective_to")).select(
+            F.lit(table_name).alias("dimension"),
+            F.lit("invalid effective date range").alias("violation"),
         )
-        history = Window.partitionBy("source_customer_id").orderBy("effective_from", "customer_key")
+        history = Window.partitionBy(contract.source_key).orderBy("effective_from", contract.surrogate_key)
         overlap = (
-            customers.withColumn("_previous_to", F.lag("effective_to").over(history))
+            dimension.withColumn("_previous_to", F.lag("effective_to").over(history))
             .filter(F.col("_previous_to").isNotNull() & (F.col("effective_from") < F.col("_previous_to")))
-            .select(F.lit("overlapping effective date range").alias("violation"))
+            .select(
+                F.lit(table_name).alias("dimension"),
+                F.lit("overlapping effective date range").alias("violation"),
+            )
         )
-        violation = self._union_all([invalid_current, invalid_range, overlap]).first()
-        if violation is not None:
-            raise ValueError(f"Invalid SCD2 history in gold.dim_customer: {violation['violation']}")
+        return self._union_all([invalid_current, invalid_range, overlap])
 
     def _assert_reconciliation(
         self,

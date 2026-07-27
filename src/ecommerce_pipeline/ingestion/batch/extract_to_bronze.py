@@ -19,6 +19,7 @@ from ecommerce_pipeline.ingestion.batch.bronze_operations import (
     bronze_batch_path,
     change_event_query,
     delta_table_exists,
+    jdbc_partition_count,
     max_event_cursor,
     read_batch_upper_bound,
     validate_change_events,
@@ -38,13 +39,12 @@ class BronzeExtractor:
         output_path = bronze_batch_path(self.config, table_name)
         table_exists = delta_table_exists(self.spark, output_path)
         previous = self._read_cursor(table_name, output_path, table_exists)
-        upper_bound = read_batch_upper_bound(self.reader, self.config, contract)
-        source_df = self._read_events(contract, previous, upper_bound).cache()
+        upper_bound = read_batch_upper_bound(self.reader, self.config, contract, previous)
+        source_df, record_count = self._materialize_events(contract, previous, upper_bound)
 
         try:
             validate_change_events(source_df, contract)
             current = max_event_cursor(source_df) or previous or EventCursor(0)
-            record_count = source_df.count()
             if record_count > 0 or not table_exists:
                 write_append_only(
                     self.spark,
@@ -76,10 +76,37 @@ class BronzeExtractor:
         cursor: EventCursor | None,
         upper_bound: int | None,
     ) -> DataFrame:
-        raw_df = self.reader.read_query(change_event_query(self.config, contract, cursor, upper_bound))
+        query = change_event_query(self.config, contract, cursor, upper_bound)
+        if upper_bound is None:
+            raw_df = self.reader.read_query(query)
+        else:
+            lower_bound = cursor.last_event_id if cursor else 0
+            raw_df = self.reader.read_partitioned_query(
+                query,
+                partition_column="_event_id",
+                lower_bound=lower_bound + 1,
+                upper_bound=upper_bound + 1,
+                num_partitions=jdbc_partition_count(self.config, cursor, upper_bound),
+            )
         if contract.excluded_columns:
             raw_df = raw_df.drop(*contract.excluded_columns)
         return add_bronze_metadata(raw_df, self.config, contract.table_name, self.batch_id)
+
+    def _materialize_events(
+        self,
+        contract: BronzeTableContract,
+        cursor: EventCursor | None,
+        upper_bound: int | None,
+    ) -> tuple[DataFrame, int]:
+        def materialize() -> tuple[DataFrame, int]:
+            source_df = self._read_events(contract, cursor, upper_bound).cache()
+            try:
+                return source_df, source_df.count()
+            except Exception:
+                source_df.unpersist()
+                raise
+
+        return self.reader.with_retry(materialize, operation=f"JDBC extraction for {contract.table_name}")
 
     def _read_cursor(self, table_name: str, output_path: str, table_exists: bool) -> EventCursor | None:
         if not table_exists:

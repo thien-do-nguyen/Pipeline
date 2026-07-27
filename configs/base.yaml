@@ -16,6 +16,14 @@ postgres:
   sslmode: disable
   jdbc_driver: org.postgresql.Driver
   fetch_size: 10000
+  query_timeout_seconds: 300
+  connect_timeout_seconds: 15
+  socket_timeout_seconds: 300
+  max_jdbc_partitions: 4
+  target_events_per_partition: 100000
+  max_events_per_batch: 500000
+  retry_attempts: 3
+  retry_initial_backoff_seconds: 2
 
 spark:
   app_name: lakehouse-pipeline

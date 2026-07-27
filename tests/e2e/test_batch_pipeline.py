@@ -9,6 +9,7 @@ from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter
 from ecommerce_pipeline.config.loader import load_config
 from ecommerce_pipeline.config.models import LakehouseConfig, SparkConfig
 from ecommerce_pipeline.control.batch_runs import new_batch_id
+from ecommerce_pipeline.control.gold_releases import GoldReleaseStore
 from ecommerce_pipeline.generator.models import SeedPlan
 from ecommerce_pipeline.generator.scenarios import seed_continuous, seed_once
 from ecommerce_pipeline.ingestion.batch.extract_to_bronze import extract_all_to_bronze
@@ -34,6 +35,12 @@ def test_postgres_to_gold_is_incremental_idempotent_and_reconciled(tmp_path: Pat
     test_config = base.model_copy(
         update={
             "lakehouse": LakehouseConfig(base_path=str(tmp_path / "lakehouse")),
+            "postgres": base.postgres.model_copy(
+                update={
+                    "max_jdbc_partitions": 4,
+                    "target_events_per_partition": 10,
+                }
+            ),
             "spark": SparkConfig(
                 master="local[2]",
                 app_name="batch-e2e-test",
@@ -50,8 +57,15 @@ def test_postgres_to_gold_is_incremental_idempotent_and_reconciled(tmp_path: Pat
         build_gold(spark, test_config)
         first_report = validate_batch_lakehouse(spark, test_config)
 
-        lakehouse = LakehouseAdapter(spark, test_config)
+        releases = GoldReleaseStore(spark, test_config)
+        release_before = releases.latest()
+        assert release_before is not None
+        assert not LakehouseAdapter(spark, test_config).table_exists("gold", "_publish_manifest")
+        lakehouse = releases.snapshot()
         customer_versions_before = lakehouse.read_table("gold", "dim_customer").count()
+        product_versions_before = lakehouse.read_table("gold", "dim_product").count()
+        shop_versions_before = lakehouse.read_table("gold", "dim_shop").count()
+        category_versions_before = lakehouse.read_table("gold", "dim_category").count()
         fact_before = lakehouse.read_table("gold", "fact_sales")
         fact_rows_before = fact_before.count()
         created_at_before = fact_before.agg({"created_at": "min"}).first()[0]
@@ -67,15 +81,34 @@ def test_postgres_to_gold_is_incremental_idempotent_and_reconciled(tmp_path: Pat
         seed_continuous("local", seed=99, orders_per_batch=2, interval_seconds=0, max_batches=1)
         third = extract_all_to_bronze(spark, test_config, new_batch_id(test_config.application.timezone))
         changed = {result.table_name: result.record_count for result in third}
-        assert changed["orders"] == 3  # two new orders and one status update
+        assert changed["orders"] == 4  # two inserts, one lifecycle update and one hard delete
         assert changed["app_users"] == 1
+        assert changed["user_addresses"] == 1
+        assert changed["products"] == 1
         assert changed["product_variants"] == 1
+        assert changed["shops"] == 1
+        assert changed["categories"] == 1
+        assert changed["vouchers"] == 2  # rotate the delete marker
+        assert changed["payments"] == 4
+        assert changed["shipments"] == 4
 
         build_silver(spark, test_config, batch_id=new_batch_id(test_config.application.timezone))
         build_gold(spark, test_config)
         final_report = validate_batch_lakehouse(spark, test_config)
-        assert final_report.gold.source_order_rows == first_report.gold.source_order_rows + 2
-        assert final_report.gold.fact_rows > first_report.gold.fact_rows
+        assert lakehouse.read_table("gold", "dim_customer").count() == customer_versions_before
+        assert lakehouse.read_table("gold", "fact_sales").count() == fact_rows_before
+
+        release_after = releases.latest()
+        assert release_after is not None
+        for table_name in ("dim_customer", "dim_product", "dim_shop", "dim_category"):
+            assert release_after.gold_versions[table_name] == release_before.gold_versions[table_name] + 1
+        assert release_after.gold_versions["fact_sales"] == release_before.gold_versions["fact_sales"] + 2
+
+        lakehouse = releases.snapshot()
+        assert final_report.gold.source_order_rows == first_report.gold.source_order_rows + 1
         assert lakehouse.read_table("gold", "dim_customer").count() == customer_versions_before + 1
+        assert lakehouse.read_table("gold", "dim_product").count() == product_versions_before + 2
+        assert lakehouse.read_table("gold", "dim_shop").count() == shop_versions_before + 1
+        assert lakehouse.read_table("gold", "dim_category").count() == category_versions_before + 1
     finally:
         spark.stop()

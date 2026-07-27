@@ -92,6 +92,20 @@ def test_invalid_port_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         load_config(local, base_path=base, dotenv_path=tmp_path / "missing.env")
 
 
+def test_postgres_jdbc_safety_defaults_are_validated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    base, local = _write_config_files(tmp_path)
+    _set_postgres_env(monkeypatch)
+
+    postgres = load_config(local, base_path=base, dotenv_path=tmp_path / "missing.env").postgres
+
+    assert postgres.max_jdbc_partitions == 4
+    assert postgres.max_events_per_batch == 500_000
+    assert postgres.retry_attempts == 3
+    assert "connectTimeout=15" in postgres.jdbc_url
+    assert "socketTimeout=300" in postgres.jdbc_url
+    assert "tcpKeepAlive=true" in postgres.jdbc_url
+
+
 def test_lakehouse_path_preserves_cloud_uri() -> None:
     config = LakehouseConfig(base_path="abfss://lakehouse@account.dfs.core.windows.net/ecommerce")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from time import perf_counter
 
 from pyspark.sql import SparkSession
 
@@ -8,7 +9,6 @@ from ecommerce_pipeline.config.loader import load_config
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.control.batch_runs import (
     BronzeTableResult,
-    batch_run_path,
     local_pipeline_lock,
     new_batch_id,
     write_batch_run_status,
@@ -39,12 +39,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_mode(
-    spark: SparkSession, args: argparse.Namespace, config: AppConfig, batch_id: str
+    spark: SparkSession,
+    args: argparse.Namespace,
+    config: AppConfig,
+    batch_id: str,
+    timings_ms: dict[str, int],
 ) -> tuple[list[BronzeTableResult], dict[str, list[str]]]:
     bronze_results: list[BronzeTableResult] = []
     outputs: dict[str, list[str]] = {}
     if args.mode in {"bronze", "all"}:
+        started = perf_counter()
         bronze_results = extract_all_to_bronze(spark, config, batch_id, args.tables)
+        timings_ms["bronze"] = round((perf_counter() - started) * 1000)
         outputs["bronze"] = [result.output_path for result in bronze_results]
         for result in bronze_results:
             print(f"bronze table={result.table_name} records={result.record_count} path={result.output_path}")
@@ -54,11 +60,12 @@ def run_mode(
             "RUNNING",
             config.application.timezone,
             results=bronze_results,
-            spark=spark,
             outputs=outputs,
+            timings_ms=timings_ms,
         )
 
     if args.mode in {"silver", "all"}:
+        started = perf_counter()
         silver_tables = args.tables if args.mode == "silver" else None
         outputs["silver"] = build_silver(
             spark,
@@ -67,6 +74,7 @@ def run_mode(
             batch_id=batch_id,
             full_rebuild=args.full_rebuild_silver,
         )
+        timings_ms["silver"] = round((perf_counter() - started) * 1000)
         for path in outputs["silver"]:
             print(f"silver path={path}")
         write_batch_run_status(
@@ -75,17 +83,19 @@ def run_mode(
             "RUNNING",
             config.application.timezone,
             results=bronze_results,
-            spark=spark,
             outputs=outputs,
+            timings_ms=timings_ms,
         )
 
     if args.mode in {"gold", "all"}:
+        started = perf_counter()
         outputs["gold"] = build_gold(
             spark,
             config,
             batch_id=batch_id,
             full_rebuild=args.full_rebuild_gold,
         )
+        timings_ms["gold"] = round((perf_counter() - started) * 1000)
         for path in outputs["gold"]:
             print(f"gold path={path}")
         write_batch_run_status(
@@ -94,8 +104,8 @@ def run_mode(
             "RUNNING",
             config.application.timezone,
             results=bronze_results,
-            spark=spark,
             outputs=outputs,
+            timings_ms=timings_ms,
         )
     return bronze_results, outputs
 
@@ -112,35 +122,43 @@ def main() -> None:
         raise SystemExit("--full-rebuild-gold requires --mode gold or --mode all")
     config = load_config(args.env)
     batch_id = args.batch_id or new_batch_id(config.application.timezone)
-    batch_run_path(config.application.logs_path, batch_id)
     spark: SparkSession | None = None
+    run_started = perf_counter()
+    timings_ms: dict[str, int] = {}
     with local_pipeline_lock(config.application.logs_path, batch_id):
         try:
+            spark_started = perf_counter()
             spark = build_spark(config)
+            timings_ms["spark_startup"] = round((perf_counter() - spark_started) * 1000)
             write_batch_run_status(
-                config.application.logs_path, batch_id, "RUNNING", config.application.timezone, spark=spark
+                config.application.logs_path,
+                batch_id,
+                "RUNNING",
+                config.application.timezone,
+                timings_ms=timings_ms,
             )
-            results, outputs = run_mode(spark, args, config, batch_id)
+            results, outputs = run_mode(spark, args, config, batch_id, timings_ms)
+            timings_ms["total"] = round((perf_counter() - run_started) * 1000)
             summary_path = write_batch_run_status(
                 config.application.logs_path,
                 batch_id,
                 "SUCCEEDED",
                 config.application.timezone,
                 results=results,
-                spark=spark,
                 outputs=outputs,
+                timings_ms=timings_ms,
             )
             print(f"batch_id={batch_id} summary={summary_path}")
         except Exception as exc:
-            if spark is not None or "://" not in config.application.logs_path:
-                write_batch_run_status(
-                    config.application.logs_path,
-                    batch_id,
-                    "FAILED",
-                    config.application.timezone,
-                    error=str(exc),
-                    spark=spark,
-                )
+            timings_ms["total"] = round((perf_counter() - run_started) * 1000)
+            write_batch_run_status(
+                config.application.logs_path,
+                batch_id,
+                "FAILED",
+                config.application.timezone,
+                error=str(exc),
+                timings_ms=timings_ms,
+            )
             raise
         finally:
             if spark is not None:

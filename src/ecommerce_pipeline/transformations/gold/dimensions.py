@@ -226,14 +226,25 @@ def build_dim_location(addresses: DataFrame, orders: DataFrame, spark: SparkSess
 
 
 def build_dim_shop(shops: DataFrame, spark: SparkSession) -> DataFrame:
+    attrs = natural_hash(
+        F.col("public_shop_id"),
+        F.col("shop_name"),
+        F.col("shop_slug"),
+        F.col("status"),
+    )
+    effective_from = F.coalesce(F.col("updated_at"), F.col("created_at"))
     rows = shops.select(
-        F.col("shop_id").cast("long").alias("shop_key"),
+        positive_hash_key(F.concat_ws("||", "shop_id", effective_from, attrs)).alias("shop_key"),
         F.col("shop_id").alias("source_shop_id"),
         F.col("public_shop_id").alias("public_shop_id"),
         "shop_name",
         "shop_slug",
         F.col("status").alias("shop_status"),
+        attrs.alias("attribute_hash"),
         F.col("created_at").alias("shop_created_at"),
+        effective_from.alias("effective_from"),
+        F.lit("9999-12-31").cast("timestamp").alias("effective_to"),
+        F.lit(True).alias("is_current"),
         F.current_timestamp().alias("created_at"),
         F.current_timestamp().alias("updated_at"),
     )
@@ -241,7 +252,9 @@ def build_dim_shop(shops: DataFrame, spark: SparkSession) -> DataFrame:
         """
         SELECT CAST(0 AS BIGINT) shop_key, CAST(NULL AS INT) source_shop_id, CAST(NULL AS STRING) public_shop_id,
                'Unknown Shop' shop_name, CAST(NULL AS STRING) shop_slug, 'unknown' shop_status,
-               CAST(NULL AS TIMESTAMP) shop_created_at, current_timestamp() created_at, current_timestamp() updated_at
+               CAST(NULL AS STRING) attribute_hash, CAST(NULL AS TIMESTAMP) shop_created_at,
+               TIMESTAMP '1970-01-01' effective_from, TIMESTAMP '9999-12-31' effective_to, TRUE is_current,
+               current_timestamp() created_at, current_timestamp() updated_at
         """
     )
     return unknown.unionByName(rows)
@@ -249,17 +262,38 @@ def build_dim_shop(shops: DataFrame, spark: SparkSession) -> DataFrame:
 
 def build_dim_category(categories: DataFrame, spark: SparkSession) -> DataFrame:
     parent = categories.select(
-        F.col("category_id").alias("parent_id"), F.col("category_name").alias("parent_category_name")
-    )
-    rows = categories.join(parent, categories.parent_category_id == parent.parent_id, "left").select(
-        F.col("category_id").cast("long").alias("category_key"),
-        F.col("category_id").alias("source_category_id"),
-        F.col("parent_category_id").alias("source_parent_category_id"),
-        F.col("category_name"),
-        F.col("slug").alias("category_slug"),
+        F.col("category_id").alias("parent_id"),
+        F.col("category_name").alias("parent_category_name"),
+        F.col("updated_at").alias("parent_updated_at"),
+    ).alias("parent")
+    current = categories.alias("category")
+    joined = current.join(parent, F.col("category.parent_category_id") == F.col("parent.parent_id"), "left")
+    attrs = natural_hash(
+        F.col("category.parent_category_id"),
+        F.col("category.category_name"),
+        F.col("category.slug"),
         F.col("parent_category_name"),
-        F.col("is_active"),
-        F.col("created_at").alias("category_created_at"),
+        F.col("category.is_active"),
+    )
+    effective_from = F.greatest(
+        F.coalesce(F.col("category.updated_at"), F.col("category.created_at")),
+        F.col("parent.parent_updated_at"),
+    )
+    rows = joined.select(
+        positive_hash_key(F.concat_ws("||", F.col("category.category_id"), effective_from, attrs)).alias(
+            "category_key"
+        ),
+        F.col("category.category_id").alias("source_category_id"),
+        F.col("category.parent_category_id").alias("source_parent_category_id"),
+        F.col("category.category_name").alias("category_name"),
+        F.col("category.slug").alias("category_slug"),
+        F.col("parent.parent_category_name"),
+        F.col("category.is_active"),
+        attrs.alias("attribute_hash"),
+        F.col("category.created_at").alias("category_created_at"),
+        effective_from.alias("effective_from"),
+        F.lit("9999-12-31").cast("timestamp").alias("effective_to"),
+        F.lit(True).alias("is_current"),
         F.current_timestamp().alias("created_at"),
         F.current_timestamp().alias("updated_at"),
     )
@@ -268,7 +302,8 @@ def build_dim_category(categories: DataFrame, spark: SparkSession) -> DataFrame:
         SELECT CAST(0 AS BIGINT) category_key, CAST(NULL AS INT) source_category_id,
                CAST(NULL AS INT) source_parent_category_id, 'Unknown Category' category_name,
                'unknown' category_slug, CAST(NULL AS STRING) parent_category_name, FALSE is_active,
-               CAST(NULL AS TIMESTAMP) category_created_at,
+               CAST(NULL AS STRING) attribute_hash, CAST(NULL AS TIMESTAMP) category_created_at,
+               TIMESTAMP '1970-01-01' effective_from, TIMESTAMP '9999-12-31' effective_to, TRUE is_current,
                current_timestamp() created_at, current_timestamp() updated_at
         """
     )
@@ -278,6 +313,8 @@ def build_dim_category(categories: DataFrame, spark: SparkSession) -> DataFrame:
 def build_dim_product(products: DataFrame, variants: DataFrame, spark: SparkSession) -> DataFrame:
     product_cols = products.select(
         "product_id",
+        F.col("shop_id").alias("source_shop_id"),
+        F.col("category_id").alias("source_category_id"),
         "public_product_id",
         "product_sku",
         "product_slug",
@@ -288,6 +325,7 @@ def build_dim_product(products: DataFrame, variants: DataFrame, spark: SparkSess
         F.col("attributes_json").alias("product_attributes_json"),
         F.col("images_json").alias("product_images_json"),
         F.col("created_at").alias("product_created_at"),
+        F.col("updated_at").alias("product_updated_at"),
     )
     variant_cols = variants.select(
         "product_variant_id",
@@ -306,11 +344,42 @@ def build_dim_product(products: DataFrame, variants: DataFrame, spark: SparkSess
         "weight_kg",
         F.col("images_json").alias("variant_images_json"),
         F.col("created_at").alias("variant_created_at"),
+        F.col("updated_at").alias("variant_updated_at"),
     )
-    rows = variant_cols.join(product_cols, "product_id", "left").select(
-        F.col("product_variant_id").cast("long").alias("product_key"),
+    joined = variant_cols.join(product_cols, "product_id", "left")
+    attrs = natural_hash(
+        F.col("product_id"),
+        F.col("source_shop_id"),
+        F.col("source_category_id"),
+        F.col("public_product_id"),
+        F.col("public_variant_id"),
+        F.col("product_sku"),
+        F.col("product_slug"),
+        F.col("product_name"),
+        F.col("brand"),
+        F.col("product_status"),
+        F.col("is_featured"),
+        F.col("variant_sku"),
+        F.col("variant_name"),
+        F.col("variant_status"),
+        F.col("variant_options_json"),
+        F.col("is_default_variant"),
+        F.col("currency"),
+        F.col("weight_kg"),
+        F.col("product_attributes_json"),
+        F.col("product_images_json"),
+        F.col("variant_images_json"),
+    )
+    effective_from = F.greatest(
+        F.coalesce(F.col("product_updated_at"), F.col("product_created_at")),
+        F.coalesce(F.col("variant_updated_at"), F.col("variant_created_at")),
+    )
+    rows = joined.select(
+        positive_hash_key(F.concat_ws("||", "product_variant_id", effective_from, attrs)).alias("product_key"),
         F.col("product_id").alias("source_product_id"),
         F.col("product_variant_id").alias("source_product_variant_id"),
+        "source_shop_id",
+        "source_category_id",
         "public_product_id",
         "public_variant_id",
         "product_sku",
@@ -335,13 +404,18 @@ def build_dim_product(products: DataFrame, variants: DataFrame, spark: SparkSess
         "variant_images_json",
         "product_created_at",
         "variant_created_at",
+        attrs.alias("attribute_hash"),
+        effective_from.alias("effective_from"),
+        F.lit("9999-12-31").cast("timestamp").alias("effective_to"),
+        F.lit(True).alias("is_current"),
         F.current_timestamp().alias("created_at"),
         F.current_timestamp().alias("updated_at"),
     )
     unknown = spark.sql(
         """
         SELECT CAST(0 AS BIGINT) product_key, CAST(NULL AS INT) source_product_id,
-               CAST(NULL AS INT) source_product_variant_id, CAST(NULL AS STRING) public_product_id,
+               CAST(NULL AS INT) source_product_variant_id, CAST(NULL AS INT) source_shop_id,
+               CAST(NULL AS INT) source_category_id, CAST(NULL AS STRING) public_product_id,
                CAST(NULL AS STRING) public_variant_id, 'unknown' product_sku, CAST(NULL AS STRING) product_slug,
                'Unknown Product' product_name, CAST(NULL AS STRING) brand, 'unknown' product_status, FALSE is_featured,
                'unknown' variant_sku, 'Unknown Variant' variant_name, 'unknown' variant_status,
@@ -351,6 +425,8 @@ def build_dim_product(products: DataFrame, variants: DataFrame, spark: SparkSess
                CAST(NULL AS DECIMAL(8,3)) weight_kg, CAST(NULL AS STRING) product_attributes_json,
                CAST(NULL AS STRING) product_images_json, CAST(NULL AS STRING) variant_images_json,
                CAST(NULL AS TIMESTAMP) product_created_at, CAST(NULL AS TIMESTAMP) variant_created_at,
+               CAST(NULL AS STRING) attribute_hash, TIMESTAMP '1970-01-01' effective_from,
+               TIMESTAMP '9999-12-31' effective_to, TRUE is_current,
                current_timestamp() created_at, current_timestamp() updated_at
         """
     )

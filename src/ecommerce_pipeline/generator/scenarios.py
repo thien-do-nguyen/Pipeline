@@ -50,12 +50,24 @@ def seed_continuous(
             with conn.cursor() as cur:
                 state = load_state(cur)
                 stamp = now.strftime("%Y%m%d%H%M%S%f")
+                inserted_order_ids: list[int] = []
                 for idx in range(1, plan.orders_per_batch + 1):
-                    insert_order(cur, rng, state, f"ORD-RT-{stamp}-{batch:04d}-{idx:03d}", now)
-                apply_change_events(cur, rng, state, now)
+                    inserted_order_ids.append(
+                        insert_order(cur, rng, state, f"ORD-RT-{stamp}-{batch:04d}-{idx:03d}", now)
+                    )
+                changes = apply_change_events(cur, rng, state, now)
             conn.commit()
 
-        print(f"batch={batch} orders={plan.orders_per_batch} changed_at={now.isoformat()}", flush=True)
+        print(
+            f"batch={batch} inserted_orders={inserted_order_ids} "
+            f"scd2_customer={changes.customer_id} scd2_product={changes.product_id} "
+            f"scd2_shop={changes.shop_id} scd2_category={changes.category_id} "
+            f"type1_product_variant={changes.product_variant_id} "
+            f"advanced_order={changes.advanced_order_id} deleted_order={changes.deleted_order_id} "
+            f"deleted_voucher={changes.deleted_voucher_id} inserted_voucher={changes.inserted_voucher_id} "
+            f"changed_at={now.isoformat()}",
+            flush=True,
+        )
         if plan.max_batches is None or batch < plan.max_batches:
             time.sleep(plan.interval_seconds)
 

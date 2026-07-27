@@ -12,14 +12,15 @@ from ecommerce_pipeline.control.batch_runs import (
 
 
 def test_batch_status_update_is_atomic_and_preserves_started_at(tmp_path: Path) -> None:
-    path = write_batch_run_status(str(tmp_path), "batch-1", "RUNNING")
+    path = write_batch_run_status(str(tmp_path), "batch-1", "RUNNING", timings_ms={"spark_startup": 100})
     assert Path(path).parent == tmp_path / "batch_runs"
     first = json.loads(Path(path).read_text(encoding="utf-8"))
-    write_batch_run_status(str(tmp_path), "batch-1", "SUCCEEDED")
+    write_batch_run_status(str(tmp_path), "batch-1", "SUCCEEDED", timings_ms={"spark_startup": 100, "gold": 250})
     final = json.loads(Path(path).read_text(encoding="utf-8"))
 
     assert final["status"] == "SUCCEEDED"
     assert final["started_at"] == first["started_at"]
+    assert final["timings_ms"] == {"spark_startup": 100, "gold": 250}
     assert not list(tmp_path.rglob("*.tmp"))
 
 

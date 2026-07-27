@@ -44,7 +44,7 @@ def seed_vouchers(cur: psycopg.Cursor[Any], now: datetime) -> list[int]:
     return voucher_ids
 
 
-def rotate_delete_marker_voucher(cur: psycopg.Cursor[Any], changed_at: datetime) -> None:
+def rotate_delete_marker_voucher(cur: psycopg.Cursor[Any], changed_at: datetime) -> tuple[int | None, int]:
     cur.execute(
         """
         DELETE FROM vouchers
@@ -53,18 +53,22 @@ def rotate_delete_marker_voucher(cur: psycopg.Cursor[Any], changed_at: datetime)
             FROM vouchers v
             LEFT JOIN order_vouchers ov ON ov.voucher_id = v.voucher_id
             WHERE v.voucher_code LIKE %s AND ov.voucher_id IS NULL
-            ORDER BY v.updated_at, v.voucher_id
-            LIMIT 1
+        ORDER BY v.updated_at, v.voucher_id
+        LIMIT 1
         )
+        RETURNING voucher_id
         """,
         (f"{DELETE_MARKER_PREFIX}%",),
     )
-    _insert_delete_marker_voucher(cur, changed_at, changed_at.strftime("%Y%m%d%H%M%S%f"))
+    deleted = cur.fetchone()
+    inserted_id = _insert_delete_marker_voucher(cur, changed_at, changed_at.strftime("%Y%m%d%H%M%S%f"))
+    return (int(deleted["voucher_id"]) if deleted is not None else None, inserted_id)
 
 
-def _insert_delete_marker_voucher(cur: psycopg.Cursor[Any], changed_at: datetime, suffix: str) -> None:
+def _insert_delete_marker_voucher(cur: psycopg.Cursor[Any], changed_at: datetime, suffix: str) -> int:
     code = f"{DELETE_MARKER_PREFIX}{suffix}"
-    cur.execute(
+    return one_id(
+        cur,
         """
         INSERT INTO vouchers (
             voucher_code, voucher_name, discount_type, discount_value,
@@ -72,6 +76,7 @@ def _insert_delete_marker_voucher(cur: psycopg.Cursor[Any], changed_at: datetime
             starts_at, ends_at, usage_limit, is_active, created_at, updated_at
         )
         VALUES (%s, %s, 'fixed', %s, NULL, 0, %s, %s, %s, 1, FALSE, %s, %s)
+        RETURNING voucher_id
         """,
         (
             code,

@@ -8,8 +8,8 @@ from pyspark.sql import functions as F
 from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter, latest_commit_metadata, latest_delta_version
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
+from ecommerce_pipeline.control.gold_releases import GoldReleaseStore
 from ecommerce_pipeline.ingestion.batch.bronze_operations import bronze_batch_path
-from ecommerce_pipeline.pipelines.build_gold import GOLD_PIPELINE_NAME
 from ecommerce_pipeline.pipelines.build_silver import SILVER_PIPELINE_NAME
 from ecommerce_pipeline.pipelines.quality import GoldQualityChecker, GoldQualityReport
 
@@ -102,20 +102,18 @@ def validate_batch_lakehouse(spark: SparkSession, config: AppConfig) -> BatchVal
                 silver_rows=silver_rows,
             )
         )
-    gold_progress = latest_commit_metadata(
-        spark,
-        config.lakehouse.table_path("gold", "fact_sales"),
-        pipeline=GOLD_PIPELINE_NAME,
-    )
-    gold_versions = None if gold_progress is None else gold_progress.get("silver_versions")
+    releases = GoldReleaseStore(spark, config)
+    release = releases.latest()
+    published_silver_versions = None if release is None else release.silver_versions
     current_silver_versions = {
         table_name: latest_delta_version(spark, config.lakehouse.table_path("silver", table_name))
         for table_name in SILVER_TABLES
     }
-    if gold_versions != current_silver_versions:
+    if published_silver_versions != current_silver_versions:
         raise ValueError(
             "Gold progress is not aligned with Silver: "
-            f"gold_versions={gold_versions}, silver_versions={current_silver_versions}"
+            f"published_silver_versions={published_silver_versions}, "
+            f"current_silver_versions={current_silver_versions}"
         )
-    gold_report = GoldQualityChecker(lakehouse).run()
+    gold_report = GoldQualityChecker(releases.snapshot()).run()
     return BatchValidationReport(tables=tuple(reports), gold=gold_report)

@@ -42,7 +42,15 @@ class PostgresConfig(FrozenConfigModel):
     source_schema: str
     jdbc_driver: str = Field(min_length=1)
     sslmode: str | None = None
-    fetch_size: int = Field(default=10000, ge=1)
+    fetch_size: int = Field(default=10000, ge=1, le=1_000_000)
+    query_timeout_seconds: int = Field(default=300, ge=1, le=86_400)
+    connect_timeout_seconds: int = Field(default=15, ge=1, le=300)
+    socket_timeout_seconds: int = Field(default=300, ge=1, le=86_400)
+    max_jdbc_partitions: int = Field(default=4, ge=1, le=32)
+    target_events_per_partition: int = Field(default=100_000, ge=1)
+    max_events_per_batch: int = Field(default=500_000, ge=1)
+    retry_attempts: int = Field(default=3, ge=1, le=10)
+    retry_initial_backoff_seconds: float = Field(default=2, ge=0, le=300)
 
     @field_validator("source_schema")
     @classmethod
@@ -54,7 +62,14 @@ class PostgresConfig(FrozenConfigModel):
     @property
     def jdbc_url(self) -> str:
         base = f"jdbc:postgresql://{self.host}:{self.port}/{self.database}"
-        return f"{base}?{urlencode({'sslmode': self.sslmode})}" if self.sslmode else base
+        parameters = {
+            "connectTimeout": self.connect_timeout_seconds,
+            "socketTimeout": self.socket_timeout_seconds,
+            "tcpKeepAlive": "true",
+        }
+        if self.sslmode:
+            parameters["sslmode"] = self.sslmode
+        return f"{base}?{urlencode(parameters)}"
 
     @property
     def password_value(self) -> str:
