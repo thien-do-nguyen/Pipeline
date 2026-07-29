@@ -13,4 +13,4 @@ spark:
     spark.hadoop.fs.azure.account.key.${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net: "${AZURE_STORAGE_ACCOUNT_KEY}"
 
 lakehouse:
-  base_path: "abfss://${AZURE_CONTAINER}@${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net/lakehousetest"
+  base_path: "abfss://${AZURE_CONTAINER}@${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net/lakehouse"

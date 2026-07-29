@@ -60,10 +60,7 @@ def seed_users(
     if len(users) != customers:
         raise RuntimeError(f"Expected {customers} inserted users, received {len(users)}")
 
-    address_params = [
-        (user_id, *values, now)
-        for user_id, values in zip(users, address_values, strict=True)
-    ]
+    address_params = [(user_id, *values, now) for user_id, values in zip(users, address_values, strict=True)]
     address_rows = many_returning(
         cur,
         """
