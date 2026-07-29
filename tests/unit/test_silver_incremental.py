@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from ecommerce_pipeline.adapters.lakehouse import DeltaTableState
+from ecommerce_pipeline.config.models import TableReference
 from ecommerce_pipeline.pipelines import build_silver as silver_module
 from ecommerce_pipeline.pipelines.build_silver import SilverBuilder
 
@@ -15,29 +16,24 @@ def _service() -> SilverBuilder:
     service.spark = Mock()
     service.config = SimpleNamespace(
         lakehouse=SimpleNamespace(
-            base_path="lakehouse",
-            format="delta",
-            table_path=lambda layer, table: f"lakehouse/{layer}/{table}",
+            table_reference=lambda layer, table: TableReference(f"lakehouse/{layer}/{table}", False),
         ),
     )
+    service.bronze_versions = {"orders": 25}
     service.lakehouse = Mock()
-    service.lakehouse.table_exists.return_value = True
     return service
 
 
 def _mock_progress(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    bronze_version: int = 25,
     silver_version: int | None = 10,
 ) -> None:
-    def table_state(_spark: object, path: str, *, pipeline: str) -> DeltaTableState:
-        if "/bronze/" in path:
-            return DeltaTableState(bronze_version, bronze_version, {"pipeline": pipeline})
+    def table_state(_spark: object, _reference: TableReference, *, pipeline: str) -> DeltaTableState:
         metadata = None if silver_version is None else {"last_processed_bronze_version": silver_version}
         return DeltaTableState(silver_version or 0, silver_version, metadata)
 
-    monkeypatch.setattr(silver_module, "delta_table_state", table_state)
+    monkeypatch.setattr(silver_module, "try_delta_table_state", table_state)
 
 
 def test_silver_processes_only_unapplied_delta_versions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -51,7 +47,7 @@ def test_silver_processes_only_unapplied_delta_versions(monkeypatch: pytest.Monk
 
     result = service.run_table("orders", batch_id="batch-1")
 
-    assert result == "lakehouse/silver/orders"
+    assert result == ("lakehouse/silver/orders", 11)
     service.read_changes.assert_called_once_with("orders", starting_version=11, ending_version=25)
     assert service.transform.call_args.args[1] is changes
     service.lakehouse.upsert_table.assert_called_once_with(
@@ -60,6 +56,7 @@ def test_silver_processes_only_unapplied_delta_versions(monkeypatch: pytest.Monk
         "orders",
         ("order_id",),
         delete_mode="hard",
+        target_exists=True,
     )
 
 
@@ -71,7 +68,7 @@ def test_silver_skips_transform_when_delta_version_is_current(monkeypatch: pytes
 
     result = service.run_table("orders", batch_id="batch-2")
 
-    assert result == "lakehouse/silver/orders"
+    assert result == ("lakehouse/silver/orders", 25)
     service.transform.assert_not_called()
     service._validate_schema_version.assert_not_called()
     service.lakehouse.upsert_table.assert_not_called()
@@ -84,5 +81,5 @@ def test_silver_recovers_missing_progress_by_rebuilding_once(monkeypatch: pytest
 
     result = service.run_table("orders", batch_id="batch-2")
 
-    assert result == "lakehouse/silver/orders"
+    assert result == ("lakehouse/silver/orders", 1)
     service._replace_from_snapshot.assert_called_once()

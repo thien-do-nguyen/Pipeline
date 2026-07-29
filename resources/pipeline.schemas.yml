@@ -1,0 +1,40 @@
+resources:
+  external_locations:
+    pipeline:
+      name: ecommerce-pipeline-${bundle.target}
+      url: abfss://${var.azure_storage_container}@${var.azure_storage_account}.dfs.core.windows.net/ecommerce-pipeline/${bundle.target}
+      credential_name: ${var.uc_storage_credential}
+      comment: ADLS Gen2 root for Unity Catalog governed external Delta tables.
+      read_only: false
+      enable_file_events: false
+      grants:
+        - principal: ${var.run_principal}
+          privileges:
+            - CREATE_EXTERNAL_TABLE
+            - READ_FILES
+            - WRITE_FILES
+
+  schemas:
+    bronze:
+      name: ${var.bronze_schema}
+      catalog_name: ${var.uc_catalog}
+      comment: Raw append-only PostgreSQL change events governed by Unity Catalog.
+      grants: &pipeline_schema_grants
+        - principal: ${var.run_principal}
+          privileges:
+            - USE_SCHEMA
+            - CREATE_TABLE
+            - SELECT
+            - MODIFY
+
+    silver:
+      name: ${var.silver_schema}
+      catalog_name: ${var.uc_catalog}
+      comment: Validated current-state ecommerce tables governed by Unity Catalog.
+      grants: *pipeline_schema_grants
+
+    gold:
+      name: ${var.gold_schema}
+      catalog_name: ${var.uc_catalog}
+      comment: Governed dimensional and fact tables stored as external Delta tables.
+      grants: *pipeline_schema_grants

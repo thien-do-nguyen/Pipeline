@@ -11,7 +11,10 @@ from ecommerce_pipeline.control.batch_runs import (
 )
 
 
-def test_batch_status_update_is_atomic_and_preserves_started_at(tmp_path: Path) -> None:
+def test_batch_status_update_is_atomic_and_preserves_started_at(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     path = write_batch_run_status(str(tmp_path), "batch-1", "RUNNING", timings_ms={"spark_startup": 100})
     assert Path(path).parent == tmp_path / "batch_runs"
     first = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -22,6 +25,11 @@ def test_batch_status_update_is_atomic_and_preserves_started_at(tmp_path: Path) 
     assert final["started_at"] == first["started_at"]
     assert final["timings_ms"] == {"spark_startup": 100, "gold": 250}
     assert not list(tmp_path.rglob("*.tmp"))
+    console = capsys.readouterr().out
+    assert "[batch] status=RUNNING id=batch-1 records=0" in console
+    assert "[batch] status=SUCCEEDED id=batch-1 records=0" in console
+    assert "batch_status=" not in console
+    assert '"tables"' not in console
 
 
 def test_local_lock_rejects_a_second_writer(tmp_path: Path) -> None:

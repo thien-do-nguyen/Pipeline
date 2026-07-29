@@ -1,28 +1,39 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from ecommerce_pipeline.adapters.lakehouse import (
+    DeltaTableState,
     delta_commit_metadata,
-    delta_table_state,
+    read_delta,
     set_delta_table_property,
+    try_delta_table_state,
 )
 from ecommerce_pipeline.adapters.postgres import PostgresReader
-from ecommerce_pipeline.config.models import AppConfig
+from ecommerce_pipeline.config.models import AppConfig, TableReference
 from ecommerce_pipeline.contracts.bronze_tables import BRONZE_TABLES, BronzeTableContract, get_bronze_contract
 from ecommerce_pipeline.contracts.change_events import EventCursor
 from ecommerce_pipeline.control.batch_runs import BronzeTableResult
 from ecommerce_pipeline.ingestion.batch.bronze_operations import (
     add_bronze_metadata,
-    bronze_batch_path,
     change_event_query,
     collect_change_event_stats,
-    delta_table_exists,
     jdbc_partition_count,
     read_batch_upper_bounds,
     write_append_only,
 )
+
+
+@dataclass(frozen=True)
+class _BronzeState:
+    table_name: str
+    reference: TableReference
+    delta_state: DeltaTableState | None
+    cursor: EventCursor | None
+    processed_version: int
 
 
 class BronzeExtractor:
@@ -32,37 +43,32 @@ class BronzeExtractor:
         self.batch_id = batch_id
         self.reader = PostgresReader(spark, config)
 
-    def run_table(self, table_name: str) -> BronzeTableResult:
-        return self.run([table_name])[0]
-
     def run(self, table_names: list[str]) -> list[BronzeTableResult]:
         states = [self._table_state(table_name) for table_name in table_names]
         upper_bounds = read_batch_upper_bounds(
             self.reader,
             self.config,
-            {table_name: previous for table_name, _, _, previous in states},
+            {state.table_name: state.cursor for state in states},
         )
-        return [
-            self._run_table(table_name, output_path, table_exists, previous, upper_bounds[table_name])
-            for table_name, output_path, table_exists, previous in states
-        ]
+        return [self._run_table(state, upper_bounds[state.table_name]) for state in states]
 
-    def _table_state(self, table_name: str) -> tuple[str, str, bool, EventCursor | None]:
-        output_path = bronze_batch_path(self.config, table_name)
-        table_exists = delta_table_exists(self.spark, output_path)
-        return table_name, output_path, table_exists, self._read_cursor(table_name, output_path, table_exists)
+    def _table_state(self, table_name: str) -> _BronzeState:
+        reference = self.config.lakehouse.table_reference("bronze", table_name)
+        state = try_delta_table_state(self.spark, reference, pipeline="postgres_to_bronze")
+        cursor, processed_version = self._read_cursor(table_name, reference, state)
+        return _BronzeState(table_name, reference, state, cursor, processed_version)
 
     def _run_table(
         self,
-        table_name: str,
-        output_path: str,
-        table_exists: bool,
-        previous: EventCursor | None,
+        state: _BronzeState,
         upper_bound: int | None,
     ) -> BronzeTableResult:
+        table_name = state.table_name
+        table_exists = state.delta_state is not None
+        previous = state.cursor
         contract = get_bronze_contract(table_name)
         if table_exists and upper_bound is None:
-            return self._result(table_name, output_path, previous, previous, None, 0, table_exists)
+            return self._result(state, previous, None, 0)
 
         source_df, record_count, last_event_id = self._materialize_events(contract, previous, upper_bound)
         try:
@@ -72,7 +78,7 @@ class BronzeExtractor:
                     self.spark,
                     source_df,
                     self.config,
-                    output_path,
+                    state.reference,
                     table_exists,
                     table_name=table_name,
                     batch_id=self.batch_id,
@@ -82,33 +88,32 @@ class BronzeExtractor:
             source_df.unpersist()
 
         return self._result(
-            table_name,
-            output_path,
-            previous,
+            state,
             current,
             upper_bound,
             record_count,
-            table_exists,
         )
 
     def _result(
         self,
-        table_name: str,
-        output_path: str,
-        previous: EventCursor | None,
+        state: _BronzeState,
         current: EventCursor | None,
         upper_bound: int | None,
         record_count: int,
-        table_exists: bool,
     ) -> BronzeTableResult:
+        table_exists = state.delta_state is not None
+        wrote_commit = record_count > 0 or not table_exists
+        physical_version = -1 if state.delta_state is None else max(state.delta_state.version, state.processed_version)
+        delta_version = physical_version + 1 if wrote_commit else state.processed_version
         return BronzeTableResult(
             batch_id=self.batch_id,
-            table_name=table_name,
-            output_path=output_path,
+            table_name=state.table_name,
+            output_path=state.reference.value,
             record_count=record_count,
             ingestion_type="incremental" if table_exists else "initial",
+            delta_version=delta_version,
             batch_upper_bound_event_id=upper_bound,
-            previous_event_id=previous.last_event_id if previous else None,
+            previous_event_id=state.cursor.last_event_id if state.cursor else None,
             current_event_id=current.last_event_id if current else None,
         )
 
@@ -151,19 +156,26 @@ class BronzeExtractor:
 
         return self.reader.with_retry(materialize, operation=f"JDBC extraction for {contract.table_name}")
 
-    def _read_cursor(self, table_name: str, output_path: str, table_exists: bool) -> EventCursor | None:
-        if not table_exists:
-            return None
-        metadata = delta_table_state(self.spark, output_path, pipeline="postgres_to_bronze").progress
+    def _read_cursor(
+        self,
+        table_name: str,
+        reference: TableReference,
+        state: DeltaTableState | None,
+    ) -> tuple[EventCursor | None, int]:
+        if state is None:
+            return None, -1
+        metadata = state.progress
         if metadata is None:
-            return self._migrate_legacy_cursor(table_name, output_path)
+            return self._migrate_legacy_cursor(table_name, reference), state.version + 1
         last_event_id = metadata.get("last_event_id")
         if not isinstance(last_event_id, int) or isinstance(last_event_id, bool) or last_event_id < 0:
             raise ValueError(f"Invalid Bronze Delta progress metadata for table: {table_name}")
-        return EventCursor(last_event_id)
+        if state.progress_version is None:
+            raise RuntimeError(f"Bronze progress version is missing for table: {table_name}")
+        return EventCursor(last_event_id), state.progress_version
 
-    def _migrate_legacy_cursor(self, table_name: str, output_path: str) -> EventCursor:
-        bronze = self.spark.read.format(self.config.lakehouse.format).load(output_path)
+    def _migrate_legacy_cursor(self, table_name: str, reference: TableReference) -> EventCursor:
+        bronze = read_delta(self.spark, reference)
         if "_event_id" not in bronze.columns:
             raise RuntimeError(
                 f"Bronze schema is outdated for {table_name}; rebuild Bronze before change-event ingestion"
@@ -180,7 +192,7 @@ class BronzeExtractor:
         with delta_commit_metadata(self.spark, metadata):
             set_delta_table_property(
                 self.spark,
-                output_path,
+                reference,
                 "pipeline.bronzeProgressMigration",
                 self.batch_id,
             )

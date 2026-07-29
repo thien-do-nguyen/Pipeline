@@ -41,13 +41,14 @@ class SparkSessionBuilder:
                 continue
             self.builder = self.builder.config(key, value)
 
-        if SPARK_WAREHOUSE_CONFIG not in self.config.spark.config:
+        if self.config.spark.master and SPARK_WAREHOUSE_CONFIG not in self.config.spark.config:
             warehouse = Path(tempfile.gettempdir(), self.config.application.name, "spark-warehouse")
             self.builder = self.builder.config(SPARK_WAREHOUSE_CONFIG, warehouse.as_uri())
         self.builder = self.builder.config("spark.sql.session.timeZone", self.config.application.timezone)
 
         spark = self.builder.getOrCreate()
-        spark.sparkContext.setLogLevel("WARN")
+        if self.config.spark.master:
+            spark.sparkContext.setLogLevel("WARN")
         return spark
 
 

@@ -10,8 +10,6 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 
 dependencies = [
-    "pyspark==3.5.2",
-    "delta-spark==3.2.0",
     "pydantic>=2.9,<3",
     "psycopg[binary]>=3.2,<4",
     "PyYAML>=6,<7",
@@ -24,7 +22,15 @@ ecommerce-batch = "ecommerce_pipeline.jobs.run_batch:main"
 ecommerce-validate = "ecommerce_pipeline.jobs.validate_batch:main"
 
 [project.optional-dependencies]
+local = [
+    "pyspark==3.5.2",
+    "delta-spark==3.2.0",
+]
 dev = [
+    "setuptools>=70",
+    "wheel",
+    "pyspark==3.5.2",
+    "delta-spark==3.2.0",
     "pytest>=8,<10",
     "pytest-cov>=5,<8",
     "ruff>=0.9,<1",

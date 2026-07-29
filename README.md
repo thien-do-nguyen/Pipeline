@@ -1,6 +1,6 @@
-# E-commerce Lakehouse Pipeline — Batch Local
+# E-commerce Lakehouse Pipeline — Local và Azure Databricks
 
-Repo này là phiên bản hoàn chỉnh của **giai đoạn batch chạy ở local** trong lộ trình xây dựng Azure Lakehouse:
+Repo này chạy batch pipeline trên Spark local hoặc Azure Databricks:
 
 ```text
 PostgreSQL OLTP
@@ -15,12 +15,12 @@ Silver Delta (one current row per source PK)
 Gold Delta (star schema + fact_sales)
       │ quality checks → atomic release marker in fact_sales/_delta_log
       ▼
-Local analytics-ready Lakehouse
+Analytics-ready Lakehouse
 ```
 
-Spark/JDBC compute chạy local; Lakehouse có thể đặt trên local filesystem hoặc ADLS Gen2. Phạm vi hiện tại chưa gồm
-ADF, Event Hubs, Debezium/Kafka, Unity Catalog hay Power BI. Business rules được tách khỏi infrastructure để có thể
-tái sử dụng cho luồng CDC ở phase tiếp theo.
+Spark/JDBC compute có thể chạy local hoặc trên Databricks. Local dùng filesystem; cloud dùng external Delta tables
+trên StorageV2/ADLS Gen2 do project sở hữu. Unity Catalog quản lý metadata, permissions, lineage và governance.
+Power BI có thể đọc Gold qua Databricks SQL; ADF, Event Hubs và Debezium/Kafka chưa nằm trong phạm vi hiện tại.
 
 ## 1. Những tính chất pipeline bảo đảm
 
@@ -36,6 +36,10 @@ tái sử dụng cho luồng CDC ở phase tiếp theo.
 - Silver đọc Change Data Feed theo các Bronze Delta version chưa xử lý, chọn event mới nhất theo source PK và
   merge SCD1 vào Delta.
 - Silver lưu `_bronze_event_id`; Bronze version đã xử lý nằm trong commit metadata của Silver `_delta_log`.
+- Một batch truyền Bronze Delta versions trực tiếp sang Silver và Silver versions trực tiếp sang Gold, tránh đọc
+  lại history của 12 bảng ở layer kế tiếp.
+- Nếu toàn bộ Bronze tables không có event mới, `--mode all` kết thúc ngay sau Bronze và không scan metadata
+  Silver/Gold.
 - Gold đọc Silver CDF, lan truyền affected IDs qua các dependency và chỉ dựng lại dimension members/order facts
   bị ảnh hưởng.
 - Gold có 10 dimensions và `fact_sales` ở grain một dòng cho mỗi `order_item`.
@@ -57,7 +61,8 @@ tái sử dụng cho luồng CDC ở phase tiếp theo.
 azure-lakehouse-pipeline/
 ├── configs/
 │   ├── base.yaml                 # cấu hình chung, dùng env placeholders
-│   └── local.yaml                # Spark local + filesystem lakehouse
+│   ├── local.yaml                # Spark local + filesystem lakehouse
+│   └── azure.yaml                # Databricks + Unity Catalog
 ├── schema/
 │   ├── oltpSchema.sql            # PostgreSQL source schema
 │   └── dwhSchema.sql             # physical reference cho Gold star schema
@@ -121,22 +126,22 @@ POSTGRES_PASSWORD=admin
 
 Không commit `.env`. Trên Azure, các giá trị này sẽ được inject từ Key Vault/secret scope thay vì sửa code.
 
-Nếu muốn ghi lakehouse lên Azure Data Lake Storage Gen2 bằng account key, thêm các biến:
+Cloud target dùng external Delta tables trong catalog `dbw_tk1_student_dev_sea`, với base schema names
+`ecommerce_bronze`, `ecommerce_silver`, `ecommerce_gold`. Bundle tạo schema và task lấy tên trực tiếp từ schema
+resources. Target `dev` tự thêm prefix theo user; target `prod` giữ base names. Parquet và `_delta_log` nằm dưới
+`abfss://lakehouse@sttk1lakeheming01.dfs.core.windows.net/ecommerce-pipeline/<target>/`. External Location dùng
+Access Connector managed identity, nên Spark không cần storage account key.
 
-```dotenv
-AZURE_STORAGE_ACCOUNT=yourstorageaccount
-AZURE_CONTAINER=lakehouse
-AZURE_STORAGE_AUTH_TYPE=account_key
-AZURE_STORAGE_ACCOUNT_KEY=<from-key-vault-or-set-here>
+Không đặt password PostgreSQL vào bundle. Tạo Databricks secret scope với một secret:
+
+```text
+scope: ecommerce-pipeline
+keys:
+  postgres-password
 ```
 
-Chạy với Azure overlay:
-
-```bash
-CONFIG=configs/azure.yaml make run-batch-local
-```
-
-`configs/azure.yaml` sẽ dựng path dạng `abfss://<container>@<account>.dfs.core.windows.net/lakehouse` và cấu hình Hadoop ABFS bằng `SharedKey`.
+`POSTGRES_PASSWORD` trong `.env` chỉ phục vụ generator và pipeline local; target `run-batch-cloud` không truyền
+password này lên Databricks.
 
 JDBC ingestion được giới hạn trong `configs/base.yaml` để không gây burst connection lên PostgreSQL:
 
@@ -405,23 +410,70 @@ dim_product = snapshot.read_table("gold", "dim_product")
 ```
 
 Không dùng `spark.read.load(.../gold/...)` trực tiếp cho consumer vì cách đó đọc physical latest version, bao gồm
-cả candidate chưa publish. Lakehouse cũ có `_publish_manifest` vẫn được đọc để tương thích; Gold run tiếp theo sẽ
-tạo marker native trong `fact_sales/_delta_log`, sau đó thư mục legacy có thể được xóa thủ công.
+cả candidate chưa publish. Gold release chỉ dùng marker native trong `fact_sales/_delta_log`; pipeline không tạo
+thêm bảng điều phối.
 
-## 9. Mapping sang Azure ở phase tiếp theo
+## 9. Chạy trên Azure Databricks
 
-| Local hiện tại | Azure sau này |
-|---|---|
-| PostgreSQL container | Azure Database for PostgreSQL Flexible Server |
-| Spark local | Spark local; chỉ Lakehouse đặt trên ADLS Gen2 |
-| `data/lakehouse` | ADLS Gen2 `abfss://...` |
-| Delta progress trong `_delta_log`; JSON run status | Delta log trong ADLS; JSON run status nhỏ ngoài Lakehouse |
-| `.env` | Key Vault / Databricks secret scope |
-| Makefile orchestration | ADF hoặc Databricks Workflows |
-| local Delta paths | Unity Catalog external/managed tables |
+Yêu cầu:
 
-Máy local vẫn thực hiện JDBC và Spark compute; Azure chỉ chịu chi phí ADLS Gen2. Layer boundaries giữ adapters và
-control logic tách khỏi các DataFrame transformations dùng chung cho batch/CDC.
+- Databricks CLI đã đăng nhập bằng profile `ecommerce-dev`.
+- Databricks workspace truy cập được Azure PostgreSQL qua network/firewall.
+- Existing catalog `dbw_tk1_student_dev_sea` và quyền `USE CATALOG`, `CREATE SCHEMA` cho deployment identity.
+- Unity Catalog storage credential riêng dùng Azure Databricks Access Connector; không dùng workspace default
+  credential cho StorageV2 account bên ngoài.
+- Managed identity của Access Connector có `Storage Blob Data Contributor` trên container dữ liệu và
+  `Storage Blob Delegator` trên Storage Account.
+- Secret scope `ecommerce-pipeline` có key `postgres-password`.
+- `.env.cloud` có cấu hình kết nối PostgreSQL và các giá trị theo môi trường Databricks/Unity Catalog/Storage
+  được liệt kê trong `.env.cloud.example`. `Makefile` chỉ kiểm tra rồi truyền các giá trị này vào bundle.
+- Mật khẩu PostgreSQL không lưu trong `.env.cloud`; job đọc key `postgres-password` từ Databricks secret scope.
+
+Tạo file cloud riêng để không ghi đè cấu hình PostgreSQL local:
+
+```bash
+cp .env.cloud.example .env.cloud
+```
+
+Tạo secret một lần (CLI sẽ yêu cầu nhập giá trị bí mật):
+
+```bash
+databricks secrets create-scope ecommerce-pipeline
+databricks secrets put-secret ecommerce-pipeline postgres-password
+```
+
+Validate bundle, build wheel, deploy job rồi chạy và chờ kết quả:
+
+```bash
+make run-batch-cloud
+```
+
+Target này không chạy Spark trên laptop. Laptop chỉ đóng gói wheel và upload artifact; toàn bộ JDBC ingestion và
+Bronze/Silver/Gold chạy trên existing compute `ecommerce-lakehouse-dev`
+(`0729-012731-0heucyp7`). Bundle không tạo hoặc xóa compute. Mỗi deploy tạo dynamic wheel version để existing
+compute không tái sử dụng package cũ có cùng version.
+YAML chỉ tồn tại một bản trong `configs/`; bundle đồng bộ thư mục này lên workspace và truyền đường dẫn tuyệt đối
+`--base-config`/`--env` cho wheel task.
+
+Cloud target này dùng namespace Unity Catalog mới và deterministic external paths, không đọc thư mục ABFSS
+`lakehousetest` cũ. Lần chạy đầu tạo external tables và nạp lại từ `change_events`; cần bảo đảm event history chưa
+bị purge. Nếu cần giữ physical Delta history cũ, hãy migrate/register dữ liệu đó trước khi chuyển target.
+
+Lệnh in URL của run. Mở URL đó để xem Spark UI, stdout/stderr, executor logs và stack trace trong lúc job chạy.
+Console chỉ in summary ngắn theo layer và trạng thái batch; JSON đầy đủ gồm từng table, output, timings và error
+được giữ tại
+`/Workspace/Users/2251120184@ut.edu.vn/ecommerce-pipeline/logs` và vẫn còn sau khi compute terminate. Databricks
+không dùng file lock vì Job đã đặt `max_concurrent_runs: 1`; local pipeline vẫn dùng `logs/_pipeline.lock`. Log
+driver/executor chính được giữ trong Databricks Job run. Muốn xem thêm log debug của Databricks CLI:
+
+```bash
+make run-batch-cloud DATABRICKS_FLAGS=--debug
+```
+
+Job đặt `max_concurrent_runs: 1` để giữ mô hình một writer của pipeline. Spark/Delta có sẵn trong Databricks Runtime,
+vì vậy wheel cloud không đóng gói `pyspark` hoặc `delta-spark`; pipeline dùng PostgreSQL JDBC driver tích hợp trong
+Runtime 16.4 thay vì cài thêm Maven library. Task lấy password PostgreSQL bằng `dbutils.secrets`; quyền ADLS đến từ
+Unity Catalog managed identity/storage credential, không dùng account key trong code.
 
 ## 10. Giới hạn có chủ đích của batch JDBC
 
@@ -444,7 +496,8 @@ control logic tách khỏi các DataFrame transformations dùng chung cho batch/
 
 **Port 5432 đang được dùng**: đổi `POSTGRES_PORT` trong `.env`, sau đó chạy lại `make pg-reset`.
 
-**Spark không tải được JAR**: lần đầu cần internet để tải Delta Lake và PostgreSQL JDBC artifacts. Kiểm tra proxy/firewall của Maven Central.
+**Spark local không tải được JAR**: lần đầu chạy local cần internet để tải Delta Lake và PostgreSQL JDBC artifacts.
+Kiểm tra proxy/firewall của Maven Central. Databricks Runtime 16.4 dùng driver tích hợp và không thực hiện bước này.
 
 **Muốn chạy lại sạch Lakehouse nhưng giữ PostgreSQL**:
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from time import perf_counter
 
@@ -11,6 +11,7 @@ from ecommerce_pipeline.adapters.lakehouse import (
     LakehouseAdapter,
     delta_table_state,
     latest_delta_version,
+    read_delta,
 )
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.gold_tables import GOLD_TABLES, SCD2_DIMENSIONS
@@ -47,16 +48,18 @@ class GoldBuilder:
         spark: SparkSession,
         config: AppConfig,
         timings_ms: dict[str, int] | None = None,
+        silver_versions: Mapping[str, int] | None = None,
     ) -> None:
         self.spark = spark
         self.config = config
         self.lakehouse = LakehouseAdapter(spark, config)
         self.releases = GoldReleaseStore(spark, config)
         self.timings_ms = timings_ms
+        self.silver_versions = None if silver_versions is None else dict(silver_versions)
 
     def run(self, *, batch_id: str = "standalone", full_rebuild: bool = False) -> list[str]:
         with self._timed("gold.metadata"):
-            current_versions = self._silver_versions()
+            current_versions = self._current_silver_versions()
             previous_release = self.releases.latest()
         previous_versions = None if previous_release is None else previous_release.silver_versions
         if full_rebuild or previous_versions is None:
@@ -69,9 +72,6 @@ class GoldBuilder:
         self._validate_progress(previous_versions, current_versions)
         changed_tables = {name for name, version in current_versions.items() if version > previous_versions[name]}
         if not changed_tables:
-            if previous_release is not None and previous_release.legacy:
-                with self._timed("gold.publish"):
-                    self._publish(current_versions, batch_id)
             return self._paths()
 
         self._validate_scd2_schemas()
@@ -331,12 +331,21 @@ class GoldBuilder:
             "vouchers": vouchers,
         }
 
+    def _current_silver_versions(self) -> dict[str, int]:
+        if self.silver_versions is not None:
+            if set(self.silver_versions) != set(SILVER_TABLES):
+                missing = sorted(set(SILVER_TABLES) - set(self.silver_versions))
+                extra = sorted(set(self.silver_versions) - set(SILVER_TABLES))
+                raise ValueError(f"Invalid propagated Silver versions: missing={missing}, extra={extra}")
+            return self.silver_versions
+        return self._silver_versions()
+
     def _silver_versions(self) -> dict[str, int]:
         versions: dict[str, int] = {}
         for table_name in SILVER_TABLES:
             state = delta_table_state(
                 self.spark,
-                self.config.lakehouse.table_path("silver", table_name),
+                self.config.lakehouse.table_reference("silver", table_name),
                 pipeline="bronze_to_silver",
             )
             if state.progress_version is None:
@@ -356,7 +365,7 @@ class GoldBuilder:
         gold_versions = {
             table_name: latest_delta_version(
                 self.spark,
-                self.config.lakehouse.table_path("gold", table_name),
+                self.config.lakehouse.table_reference("gold", table_name),
             )
             for table_name in GOLD_TABLES
         }
@@ -367,12 +376,14 @@ class GoldBuilder:
         )
 
     def _read_changes(self, table_name: str, starting_version: int, ending_version: int) -> DataFrame:
-        return (
-            self.spark.read.format(self.config.lakehouse.format)
-            .option("readChangeFeed", "true")
-            .option("startingVersion", starting_version)
-            .option("endingVersion", ending_version)
-            .load(self.config.lakehouse.table_path("silver", table_name))
+        return read_delta(
+            self.spark,
+            self.config.lakehouse.table_reference("silver", table_name),
+            options={
+                "readChangeFeed": "true",
+                "startingVersion": starting_version,
+                "endingVersion": ending_version,
+            },
         )
 
     def _read_sources(self) -> dict[str, DataFrame]:
@@ -492,7 +503,7 @@ class GoldBuilder:
         return not contract.required_columns <= columns
 
     def _paths(self) -> list[str]:
-        return [self.config.lakehouse.table_path("gold", name) for name in GOLD_TABLES]
+        return [self.config.lakehouse.table_reference("gold", name).value for name in GOLD_TABLES]
 
     @contextmanager
     def _timed(self, name: str) -> Iterator[None]:
@@ -503,9 +514,8 @@ class GoldBuilder:
             self._record_elapsed(name, started)
 
     def _record_elapsed(self, name: str, started: float) -> None:
-        timings_ms = getattr(self, "timings_ms", None)
-        if timings_ms is not None:
-            timings_ms[name] = round((perf_counter() - started) * 1000)
+        if self.timings_ms is not None:
+            self.timings_ms[name] = round((perf_counter() - started) * 1000)
 
 
 def build_gold(
@@ -515,5 +525,9 @@ def build_gold(
     batch_id: str = "standalone",
     full_rebuild: bool = False,
     timings_ms: dict[str, int] | None = None,
+    silver_versions: Mapping[str, int] | None = None,
 ) -> list[str]:
-    return GoldBuilder(spark, config, timings_ms).run(batch_id=batch_id, full_rebuild=full_rebuild)
+    return GoldBuilder(spark, config, timings_ms, silver_versions).run(
+        batch_id=batch_id,
+        full_rebuild=full_rebuild,
+    )

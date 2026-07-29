@@ -4,7 +4,6 @@ application:
   name: azure-lakehouse-pipeline
   source_system: ecommerce
   timezone: Asia/Ho_Chi_Minh
-  logs_path: "logs"
 
 postgres:
   host: "${POSTGRES_HOST}"
@@ -28,8 +27,6 @@ postgres:
 spark:
   app_name: lakehouse-pipeline
   config:
-    spark.sql.extensions: io.delta.sql.DeltaSparkSessionExtension
-    spark.sql.catalog.spark_catalog: org.apache.spark.sql.delta.catalog.DeltaCatalog
     spark.databricks.delta.schema.autoMerge.enabled: "false"
     spark.sql.adaptive.enabled: "true"
     spark.sql.maxPlanStringLength: "524288"
@@ -37,6 +34,3 @@ spark:
     spark.sql.parquet.datetimeRebaseModeInWrite: CORRECTED
     spark.sql.parquet.int96RebaseModeInRead: CORRECTED
     spark.sql.parquet.int96RebaseModeInWrite: CORRECTED
-
-lakehouse:
-  format: delta

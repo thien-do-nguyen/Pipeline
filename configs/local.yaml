@@ -1,11 +1,19 @@
 environment: local
 
+application:
+  logs_path: "logs"
+
 spark:
   master: "local[*]"
+  configure_delta_package: true
+  stop_session: true
   config:
+    spark.sql.extensions: io.delta.sql.DeltaSparkSessionExtension
+    spark.sql.catalog.spark_catalog: org.apache.spark.sql.delta.catalog.DeltaCatalog
     spark.sql.shuffle.partitions: "4"
     spark.jars.packages: org.postgresql:postgresql:42.7.3
     spark.ui.enabled: "false"
+    spark.ui.showConsoleProgress: "false"
     spark.driver.bindAddress: "127.0.0.1"
     spark.driver.host: "127.0.0.1"
     spark.databricks.delta.snapshotPartitions: "2"
