@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
+AddressSnapshot = dict[str, object]
+
 
 def money(value: float | int | Decimal) -> Decimal:
     return Decimal(str(value)).quantize(Decimal("0.01"))
@@ -46,6 +48,7 @@ class Variant:
 class RuntimeState:
     user_ids: list[int]
     address_by_user: dict[int, int]
+    address_snapshot_by_user: dict[int, AddressSnapshot]
     variants: list[Variant]
     user_created_at: dict[int, datetime]
     voucher_ids: list[int] = field(default_factory=list)
@@ -61,6 +64,8 @@ class RuntimeState:
             require_positive("user_id", user_id)
             if user_id not in self.address_by_user:
                 raise ValueError(f"missing address for user_id={user_id}")
+            if user_id not in self.address_snapshot_by_user:
+                raise ValueError(f"missing address snapshot for user_id={user_id}")
             if user_id not in self.user_created_at:
                 raise ValueError(f"missing created_at for user_id={user_id}")
         for address_id in self.address_by_user.values():

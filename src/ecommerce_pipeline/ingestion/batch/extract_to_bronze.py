@@ -5,8 +5,7 @@ from pyspark.sql import functions as F
 
 from ecommerce_pipeline.adapters.lakehouse import (
     delta_commit_metadata,
-    ensure_change_data_feed,
-    latest_commit_metadata,
+    delta_table_state,
     set_delta_table_property,
 )
 from ecommerce_pipeline.adapters.postgres import PostgresReader
@@ -18,11 +17,10 @@ from ecommerce_pipeline.ingestion.batch.bronze_operations import (
     add_bronze_metadata,
     bronze_batch_path,
     change_event_query,
+    collect_change_event_stats,
     delta_table_exists,
     jdbc_partition_count,
-    max_event_cursor,
-    read_batch_upper_bound,
-    validate_change_events,
+    read_batch_upper_bounds,
     write_append_only,
 )
 
@@ -35,16 +33,40 @@ class BronzeExtractor:
         self.reader = PostgresReader(spark, config)
 
     def run_table(self, table_name: str) -> BronzeTableResult:
-        contract = get_bronze_contract(table_name)
+        return self.run([table_name])[0]
+
+    def run(self, table_names: list[str]) -> list[BronzeTableResult]:
+        states = [self._table_state(table_name) for table_name in table_names]
+        upper_bounds = read_batch_upper_bounds(
+            self.reader,
+            self.config,
+            {table_name: previous for table_name, _, _, previous in states},
+        )
+        return [
+            self._run_table(table_name, output_path, table_exists, previous, upper_bounds[table_name])
+            for table_name, output_path, table_exists, previous in states
+        ]
+
+    def _table_state(self, table_name: str) -> tuple[str, str, bool, EventCursor | None]:
         output_path = bronze_batch_path(self.config, table_name)
         table_exists = delta_table_exists(self.spark, output_path)
-        previous = self._read_cursor(table_name, output_path, table_exists)
-        upper_bound = read_batch_upper_bound(self.reader, self.config, contract, previous)
-        source_df, record_count = self._materialize_events(contract, previous, upper_bound)
+        return table_name, output_path, table_exists, self._read_cursor(table_name, output_path, table_exists)
 
+    def _run_table(
+        self,
+        table_name: str,
+        output_path: str,
+        table_exists: bool,
+        previous: EventCursor | None,
+        upper_bound: int | None,
+    ) -> BronzeTableResult:
+        contract = get_bronze_contract(table_name)
+        if table_exists and upper_bound is None:
+            return self._result(table_name, output_path, previous, previous, None, 0, table_exists)
+
+        source_df, record_count, last_event_id = self._materialize_events(contract, previous, upper_bound)
         try:
-            validate_change_events(source_df, contract)
-            current = max_event_cursor(source_df) or previous or EventCursor(0)
+            current = EventCursor(last_event_id) if last_event_id is not None else previous or EventCursor(0)
             if record_count > 0 or not table_exists:
                 write_append_only(
                     self.spark,
@@ -59,6 +81,26 @@ class BronzeExtractor:
         finally:
             source_df.unpersist()
 
+        return self._result(
+            table_name,
+            output_path,
+            previous,
+            current,
+            upper_bound,
+            record_count,
+            table_exists,
+        )
+
+    def _result(
+        self,
+        table_name: str,
+        output_path: str,
+        previous: EventCursor | None,
+        current: EventCursor | None,
+        upper_bound: int | None,
+        record_count: int,
+        table_exists: bool,
+    ) -> BronzeTableResult:
         return BronzeTableResult(
             batch_id=self.batch_id,
             table_name=table_name,
@@ -97,11 +139,12 @@ class BronzeExtractor:
         contract: BronzeTableContract,
         cursor: EventCursor | None,
         upper_bound: int | None,
-    ) -> tuple[DataFrame, int]:
-        def materialize() -> tuple[DataFrame, int]:
+    ) -> tuple[DataFrame, int, int | None]:
+        def materialize() -> tuple[DataFrame, int, int | None]:
             source_df = self._read_events(contract, cursor, upper_bound).cache()
             try:
-                return source_df, source_df.count()
+                stats = collect_change_event_stats(source_df, contract)
+                return source_df, stats.record_count, stats.last_event_id
             except Exception:
                 source_df.unpersist()
                 raise
@@ -111,8 +154,7 @@ class BronzeExtractor:
     def _read_cursor(self, table_name: str, output_path: str, table_exists: bool) -> EventCursor | None:
         if not table_exists:
             return None
-        ensure_change_data_feed(self.spark, output_path)
-        metadata = latest_commit_metadata(self.spark, output_path, pipeline="postgres_to_bronze")
+        metadata = delta_table_state(self.spark, output_path, pipeline="postgres_to_bronze").progress
         if metadata is None:
             return self._migrate_legacy_cursor(table_name, output_path)
         last_event_id = metadata.get("last_event_id")
@@ -156,4 +198,4 @@ def extract_all_to_bronze(
     if unknown:
         raise ValueError(f"Unknown source tables: {unknown}")
     extractor = BronzeExtractor(spark, config, batch_id)
-    return [extractor.run_table(table_name) for table_name in tables]
+    return extractor.run(tables)

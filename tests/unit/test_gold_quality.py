@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from decimal import Decimal
 from typing import cast
+from unittest.mock import Mock, patch
 
 import pytest
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 
 from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter
-from ecommerce_pipeline.pipelines.quality import GoldQualityChecker
+from ecommerce_pipeline.pipelines.quality import GoldQualityChecker, _FactMetrics
 
 FACT_SCHEMA = """
     source_order_id int,
@@ -62,12 +63,20 @@ def _valid_row() -> tuple[object, ...]:
     )
 
 
+def _fact_metrics(checker: GoldQualityChecker, fact: DataFrame) -> _FactMetrics:
+    frame = checker._fact_metrics_frame(fact)
+    row = frame.first()
+    assert row is not None
+    return checker._fact_metrics_from_row(row)
+
+
 def test_fact_quality_rules_share_one_metrics_aggregation(spark: SparkSession) -> None:
     fact = spark.createDataFrame([_valid_row()], FACT_SCHEMA)
+    checker = _checker()
 
-    metrics = _checker()._collect_fact_metrics(fact)
+    metrics = _fact_metrics(checker, fact)
 
-    _checker()._assert_fact_metrics(metrics, "fact_sales")
+    checker._assert_fact_metrics(metrics, "fact_sales")
     assert metrics.rows == 1
     assert metrics.gross_sales_total == "100.00"
     assert metrics.discount_total == "10.00"
@@ -78,11 +87,12 @@ def test_fact_metrics_detect_duplicate_source_key(spark: SparkSession) -> None:
     first = _valid_row()
     duplicate_source_key = (*first[:2], 102, *first[3:])
     fact = spark.createDataFrame([first, duplicate_source_key], FACT_SCHEMA)
+    checker = _checker()
 
-    metrics = _checker()._collect_fact_metrics(fact)
+    metrics = _fact_metrics(checker, fact)
 
     with pytest.raises(ValueError, match="source_order_id"):
-        _checker()._assert_fact_metrics(metrics, "fact_sales")
+        checker._assert_fact_metrics(metrics, "fact_sales")
 
 
 def test_fact_metrics_detect_invalid_amount_and_unresolved_key(spark: SparkSession) -> None:
@@ -90,13 +100,14 @@ def test_fact_metrics_detect_invalid_amount_and_unresolved_key(spark: SparkSessi
     values[3] = 0
     values[14] = 0
     fact = spark.createDataFrame([tuple(values)], FACT_SCHEMA)
+    checker = _checker()
 
-    metrics = _checker()._collect_fact_metrics(fact)
+    metrics = _fact_metrics(checker, fact)
 
     assert metrics.invalid_amount_rows == 1
     assert metrics.unresolved_key_rows == 1
     with pytest.raises(ValueError, match="quantity or monetary"):
-        _checker()._assert_fact_metrics(metrics, "fact_sales")
+        checker._assert_fact_metrics(metrics, "fact_sales")
 
 
 def test_quality_cache_releases_only_entries_it_owns(spark: SparkSession) -> None:
@@ -111,3 +122,27 @@ def test_quality_cache_releases_only_entries_it_owns(spark: SparkSession) -> Non
         assert caller_owned.is_cached
     finally:
         caller_owned.unpersist()
+
+
+def test_incremental_quality_does_not_recache_materialized_fact() -> None:
+    checker = _checker()
+    fact = Mock(is_cached=False)
+    orders = Mock(is_cached=True)
+    items = Mock(is_cached=True)
+    metrics = Mock()
+    report = Mock()
+    with (
+        patch.object(checker, "_collect_quality_metrics", return_value=(metrics, 1, 1)),
+        patch.object(checker, "_assert_fact_metrics"),
+        patch.object(checker, "_assert_dimension_integrity"),
+        patch.object(checker, "_assert_reconciliation", return_value=report),
+    ):
+        result = checker.run_incremental(
+            fact,
+            {"orders": orders, "order_items": items},
+            fact_is_materialized=True,
+        )
+
+    assert result is report
+    fact.cache.assert_not_called()
+    fact.unpersist.assert_not_called()

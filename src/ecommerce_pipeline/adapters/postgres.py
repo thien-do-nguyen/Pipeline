@@ -49,10 +49,10 @@ class PostgresReader:
             .load()
         )
 
-    def read_first(self, query: str) -> Row | None:
-        """Execute a small control query with bounded exponential retry."""
+    def read_all(self, query: str) -> list[Row]:
+        """Collect a bounded control query with one JDBC connection."""
 
-        return self.with_retry(lambda: self.read_query(query).first(), operation="JDBC control query")
+        return self.with_retry(lambda: self.read_query(query).collect(), operation="JDBC control query")
 
     def with_retry(self, action: Callable[[], T], *, operation: str) -> T:
         attempts = self.config.postgres.retry_attempts

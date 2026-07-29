@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -22,6 +22,23 @@ def one_id(cur: psycopg.Cursor[Any], query: str, params: tuple[Any, ...]) -> int
     if row is None:
         raise RuntimeError("INSERT ... RETURNING did not return a row")
     return int(next(iter(row.values())))
+
+
+def many_returning(
+    cur: psycopg.Cursor[Any],
+    query: str,
+    params: Iterable[tuple[Any, ...]],
+) -> list[dict[str, Any]]:
+    """Execute parameter sets through psycopg pipeline mode and collect one row per set."""
+
+    cur.executemany(query, params, returning=True)
+    rows: list[dict[str, Any]] = []
+    for result in cur.results():
+        row = result.fetchone()
+        if row is None:
+            raise RuntimeError("Batch INSERT ... RETURNING did not return a row")
+        rows.append(dict(row))
+    return rows
 
 
 def reset_source(cur: psycopg.Cursor[Any]) -> None:

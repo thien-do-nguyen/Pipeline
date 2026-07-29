@@ -181,6 +181,16 @@ make seed CUSTOMERS=100 ORDERS=500 SEED=42
 ```
 
 Generator tạo user, address, shop, catalog, voucher, order, order item, payment và shipment. Cùng `SEED` sẽ tạo cùng phân phối dữ liệu.
+User/address được gửi bằng Psycopg pipeline; order được commit theo chunk và in tiến độ để tránh một transaction lớn khi
+seed PostgreSQL qua mạng. Có thể điều chỉnh kích thước chunk:
+
+```bash
+make seed CUSTOMERS=10000 ORDERS=50000 SEED_BATCH_SIZE=1000
+```
+
+`make seed` luôn reset dữ liệu trước khi chạy. Sau baseline, mỗi chunk order được commit độc lập; nếu một chunk lỗi,
+chạy lại lệnh sẽ reset và tạo lại dữ liệu deterministic.
+
 Mỗi batch của `seed-stream` chủ động tạo đủ các trường hợp để quan sát pipeline:
 
 - Insert order cùng order items, voucher áp dụng (nếu có), payment và shipment.

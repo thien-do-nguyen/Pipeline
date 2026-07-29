@@ -1,6 +1,7 @@
 import random
 import time
 from datetime import datetime, timedelta
+from time import perf_counter
 from zoneinfo import ZoneInfo
 
 from ecommerce_pipeline.config.loader import load_config
@@ -11,20 +12,45 @@ from .models import SeedPlan, StreamPlan
 from .orders import apply_change_events, insert_order
 
 
-def seed_once(config_path: str, plan: SeedPlan, seed: int, reset: bool) -> None:
+def seed_once(
+    config_path: str,
+    plan: SeedPlan,
+    seed: int,
+    reset: bool,
+    *,
+    batch_size: int = 1_000,
+) -> None:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be greater than 0")
     rng = random.Random(seed)
     config = load_config(config_path)
     now = _now(config.application.timezone)
+    started = perf_counter()
 
     with connect(config.postgres) as conn:
         with conn.cursor() as cur:
             if reset:
                 reset_source(cur)
             state = seed_baseline(cur, rng, plan.customers, now)
-            for idx in range(1, plan.orders + 1):
-                created_at = now - timedelta(days=rng.randint(0, 90), minutes=rng.randint(0, 1440))
-                insert_order(cur, rng, state, f"ORD-{idx:06d}", created_at)
         conn.commit()
+        print(
+            f"seed baseline customers={plan.customers} elapsed_seconds={perf_counter() - started:.1f}",
+            flush=True,
+        )
+
+        completed = 0
+        while completed < plan.orders:
+            chunk_end = min(completed + batch_size, plan.orders)
+            with conn.cursor() as cur, conn.pipeline():
+                for idx in range(completed + 1, chunk_end + 1):
+                    created_at = now - timedelta(days=rng.randint(0, 90), minutes=rng.randint(0, 1440))
+                    insert_order(cur, rng, state, f"ORD-{idx:06d}", created_at)
+            conn.commit()
+            completed = chunk_end
+            print(
+                f"seed orders={completed}/{plan.orders} elapsed_seconds={perf_counter() - started:.1f}",
+                flush=True,
+            )
 
 
 def seed_continuous(

@@ -6,13 +6,11 @@ from pyspark.sql import functions as F
 from ecommerce_pipeline.adapters.lakehouse import (
     LakehouseAdapter,
     delta_commit_metadata,
-    ensure_change_data_feed,
-    latest_commit_metadata,
-    latest_delta_version,
+    delta_table_state,
 )
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES, SilverTableContract, get_silver_contract
-from ecommerce_pipeline.ingestion.batch.bronze_operations import bronze_batch_path, delta_table_exists
+from ecommerce_pipeline.ingestion.batch.bronze_operations import bronze_batch_path
 from ecommerce_pipeline.transformations.silver.common import SILVER_SCHEMA_VERSION
 from ecommerce_pipeline.transformations.silver.customers import supports_customer_table, transform_customer_table
 from ecommerce_pipeline.transformations.silver.sales import supports_sales_table, transform_sales_table
@@ -42,22 +40,25 @@ class SilverBuilder:
     def run_table(self, table_name: str, *, batch_id: str, full_rebuild: bool = False) -> str:
         contract = get_silver_contract(table_name)
         bronze_path = bronze_batch_path(self.config, table_name)
-        if not delta_table_exists(self.spark, bronze_path):
-            raise RuntimeError(f"Bronze Delta table is missing for table: {table_name}")
-        current_bronze_version = latest_delta_version(self.spark, bronze_path)
+        bronze_state = delta_table_state(self.spark, bronze_path, pipeline="postgres_to_bronze")
+        current_bronze_version = (
+            bronze_state.version if bronze_state.progress_version is None else bronze_state.progress_version
+        )
         table_exists = self.lakehouse.table_exists("silver", table_name)
-        if table_exists:
-            ensure_change_data_feed(self.spark, self.silver_path(table_name))
 
         if full_rebuild or not table_exists:
             self._replace_from_snapshot(contract, current_bronze_version, batch_id)
             return self.silver_path(table_name)
 
-        previous_bronze_version = self._read_processed_version(table_name)
+        silver_state = delta_table_state(
+            self.spark,
+            self.silver_path(table_name),
+            pipeline=SILVER_PIPELINE_NAME,
+        )
+        previous_bronze_version = self._processed_version(table_name, silver_state.progress)
         if previous_bronze_version is None:
             self._replace_from_snapshot(contract, current_bronze_version, batch_id)
             return self.silver_path(table_name)
-        self._validate_schema_version(table_name)
         if previous_bronze_version > current_bronze_version:
             raise RuntimeError(
                 f"Silver progress is ahead of Bronze for {table_name}: "
@@ -66,6 +67,7 @@ class SilverBuilder:
         if previous_bronze_version == current_bronze_version:
             return self.silver_path(table_name)
 
+        self._validate_schema_version(table_name)
         changes = self.read_changes(
             table_name,
             starting_version=previous_bronze_version + 1,
@@ -106,12 +108,8 @@ class SilverBuilder:
             .drop("_change_type", "_commit_version", "_commit_timestamp")
         )
 
-    def _read_processed_version(self, table_name: str) -> int | None:
-        metadata = latest_commit_metadata(
-            self.spark,
-            self.silver_path(table_name),
-            pipeline=SILVER_PIPELINE_NAME,
-        )
+    @staticmethod
+    def _processed_version(table_name: str, metadata: dict[str, object] | None) -> int | None:
         if metadata is None:
             return None
         value = metadata.get("last_processed_bronze_version")

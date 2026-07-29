@@ -13,7 +13,7 @@ from ecommerce_pipeline.contracts.bronze_tables import BRONZE_TABLES, get_bronze
 from ecommerce_pipeline.contracts.change_events import EventCursor
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
 from ecommerce_pipeline.ingestion.batch.bronze_operations import (
-    batch_upper_bound_query,
+    batch_upper_bounds_query,
     change_event_query,
     jdbc_partition_count,
 )
@@ -57,15 +57,19 @@ def test_initial_query_starts_after_zero() -> None:
     assert "e.event_id > 0 AND e.event_id <= 12" in query
 
 
-def test_upper_bound_caps_each_source_batch_after_the_cursor() -> None:
-    query = batch_upper_bound_query(
+def test_upper_bound_query_captures_all_sources_in_one_snapshot() -> None:
+    query = batch_upper_bounds_query(
         _config(),
-        get_bronze_contract("orders"),
-        EventCursor(last_event_id=99),
+        {
+            "orders": EventCursor(last_event_id=99),
+            "vouchers": None,
+        },
     )
 
-    assert "source_table = 'orders' AND event_id > 99" in query
-    assert "ORDER BY event_id LIMIT 500000" in query
+    assert "('orders', 99), ('vouchers', 0)" in query
+    assert "events.source_table = cursors.source_table" in query
+    assert "events.event_id > cursors.last_event_id" in query
+    assert "ORDER BY events.event_id LIMIT 500000" in query
 
 
 def test_jdbc_partition_count_is_dynamic_and_source_throttled() -> None:

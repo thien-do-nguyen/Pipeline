@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter, latest_commit_metadata, latest_delta_version
+from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter, delta_table_state
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
 from ecommerce_pipeline.control.gold_releases import GoldReleaseStore
@@ -33,23 +33,29 @@ class BatchValidationReport:
 def validate_batch_lakehouse(spark: SparkSession, config: AppConfig) -> BatchValidationReport:
     lakehouse = LakehouseAdapter(spark, config)
     reports: list[LayerTableReport] = []
+    current_silver_versions: dict[str, int] = {}
     for table_name, contract in SILVER_TABLES.items():
         bronze_path = bronze_batch_path(config, table_name)
+        silver_path = config.lakehouse.table_path("silver", table_name)
         bronze = spark.read.format(config.lakehouse.format).load(bronze_path)
         silver = lakehouse.read_table("silver", table_name)
-        bronze_version = latest_delta_version(spark, bronze_path)
-        silver_progress = latest_commit_metadata(
+        bronze_state = delta_table_state(spark, bronze_path, pipeline="postgres_to_bronze")
+        silver_state = delta_table_state(
             spark,
-            config.lakehouse.table_path("silver", table_name),
+            silver_path,
             pipeline=SILVER_PIPELINE_NAME,
         )
+        bronze_version = (
+            bronze_state.version if bronze_state.progress_version is None else bronze_state.progress_version
+        )
+        silver_progress = silver_state.progress
         silver_version = None if silver_progress is None else silver_progress.get("last_processed_bronze_version")
         if not isinstance(silver_version, int) or isinstance(silver_version, bool) or silver_version != bronze_version:
             raise ValueError(
                 f"Silver progress is not aligned with Bronze for {table_name}: "
                 f"bronze_version={bronze_version}, silver_version={silver_version}"
             )
-        bronze_progress = latest_commit_metadata(spark, bronze_path, pipeline="postgres_to_bronze")
+        bronze_progress = bronze_state.progress
         last_event_id = None if bronze_progress is None else bronze_progress.get("last_event_id")
         if not isinstance(last_event_id, int) or isinstance(last_event_id, bool):
             raise ValueError(f"Bronze Delta progress metadata is invalid for {table_name}")
@@ -102,18 +108,19 @@ def validate_batch_lakehouse(spark: SparkSession, config: AppConfig) -> BatchVal
                 silver_rows=silver_rows,
             )
         )
+        if silver_state.progress_version is None:
+            raise ValueError(f"Silver Delta progress metadata is missing for {table_name}")
+        current_silver_versions[table_name] = silver_state.progress_version
     releases = GoldReleaseStore(spark, config)
     release = releases.latest()
     published_silver_versions = None if release is None else release.silver_versions
-    current_silver_versions = {
-        table_name: latest_delta_version(spark, config.lakehouse.table_path("silver", table_name))
-        for table_name in SILVER_TABLES
-    }
     if published_silver_versions != current_silver_versions:
         raise ValueError(
             "Gold progress is not aligned with Silver: "
             f"published_silver_versions={published_silver_versions}, "
             f"current_silver_versions={current_silver_versions}"
         )
-    gold_report = GoldQualityChecker(releases.snapshot()).run()
+    if release is None:
+        raise RuntimeError("Gold has no published release")
+    gold_report = GoldQualityChecker(lakehouse.with_gold_versions(release.gold_versions)).run()
     return BatchValidationReport(tables=tuple(reports), gold=gold_report)

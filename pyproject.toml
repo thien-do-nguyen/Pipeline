@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 
 dependencies = [
-    "pyspark==3.5.8",
+    "pyspark==3.5.2",
     "delta-spark==3.2.0",
     "pydantic>=2.9,<3",
     "psycopg[binary]>=3.2,<4",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -13,6 +14,16 @@ from pyspark.sql import functions as F
 from ecommerce_pipeline.config.models import AppConfig
 
 DELTA_COMMIT_METADATA_KEY = "spark.databricks.delta.commitInfo.userMetadata"
+PROGRESS_HISTORY_FALLBACK_LIMIT = 100
+
+
+@dataclass(frozen=True)
+class DeltaTableState:
+    """Latest physical version and latest bounded pipeline commit."""
+
+    version: int
+    progress_version: int | None
+    progress: dict[str, object] | None
 
 
 @contextmanager
@@ -39,30 +50,31 @@ def latest_delta_version(spark: SparkSession, path: str) -> int:
     return int(row["version"])
 
 
-def latest_commit_metadata(
+def delta_table_state(
     spark: SparkSession,
     path: str,
     *,
     pipeline: str,
-) -> dict[str, object] | None:
-    """Read the newest progress marker written by a specific pipeline."""
+) -> DeltaTableState:
+    """Read one commit normally and use a bounded maintenance fallback."""
 
     from delta.tables import DeltaTable
 
-    row = (
-        DeltaTable.forPath(spark, path)
-        .history()
-        .where(F.get_json_object(F.col("userMetadata"), "$.pipeline") == F.lit(pipeline))
-        .orderBy(F.col("version").desc())
-        .select("userMetadata")
-        .first()
-    )
-    if row is None or row["userMetadata"] is None:
-        return None
-    payload = json.loads(row["userMetadata"])
-    if not isinstance(payload, dict):
-        raise ValueError(f"Invalid Delta commit metadata at {path}")
-    return payload
+    delta = DeltaTable.forPath(spark, path)
+    latest = delta.history(1).select("version", "userMetadata").first()
+    if latest is None:
+        raise RuntimeError(f"Delta history is empty: {path}")
+    latest_version = int(latest["version"])
+    progress = _pipeline_metadata(latest["userMetadata"], pipeline)
+    if progress is not None:
+        return DeltaTableState(latest_version, latest_version, progress)
+
+    rows = delta.history(PROGRESS_HISTORY_FALLBACK_LIMIT).select("version", "userMetadata").collect()
+    for row in rows:
+        progress = _pipeline_metadata(row["userMetadata"], pipeline)
+        if progress is not None:
+            return DeltaTableState(latest_version, int(row["version"]), progress)
+    return DeltaTableState(latest_version, None, None)
 
 
 def delta_table_properties(spark: SparkSession, path: str) -> dict[str, str]:
@@ -74,14 +86,6 @@ def delta_table_properties(spark: SparkSession, path: str) -> dict[str, str]:
     if row is None:
         raise RuntimeError(f"Delta table detail is empty: {path}")
     return {str(key): str(value) for key, value in (row["properties"] or {}).items()}
-
-
-def ensure_change_data_feed(spark: SparkSession, path: str) -> None:
-    """Enable CDF once; future Bronze commits can then be read by Delta version."""
-
-    properties = delta_table_properties(spark, path)
-    if str(properties.get("delta.enableChangeDataFeed", "false")).lower() != "true":
-        set_delta_table_property(spark, path, "delta.enableChangeDataFeed", "true")
 
 
 def set_delta_table_property(spark: SparkSession, path: str, key: str, value: str) -> None:
@@ -203,11 +207,11 @@ class LakehouseAdapter:
         elif uses_operation_delete:
             delete_condition = "source.`_operation` = 'DELETE'"
 
-        owned_cache = delete_keys is not None
+        owned_cache = not changes.is_cached
         if owned_cache:
-            changes = changes.cache()
+            changes = changes.localCheckpoint(eager=True) if layer == "gold" else changes.cache()
         try:
-            if owned_cache and changes.isEmpty():
+            if changes.isEmpty():
                 return
             merge = DeltaTable.forPath(self.spark, path).alias("target").merge(changes.alias("source"), join_condition)
             if delete_condition is not None:
@@ -279,7 +283,7 @@ class LakehouseAdapter:
             attribute_hash=attribute_hash,
             initial_effective_from=initial_effective_from,
             type1_columns=type1_columns,
-        ).cache()
+        ).localCheckpoint(eager=True)
         delta = DeltaTable.forPath(self.spark, path)
         try:
             if staged.isEmpty():
@@ -384,3 +388,15 @@ def _delta_sql_identifier(path: str) -> str:
 
 def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _pipeline_metadata(raw: str | None, pipeline: str) -> dict[str, object] | None:
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload if payload.get("pipeline") == pipeline else None

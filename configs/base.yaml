@@ -13,7 +13,7 @@ postgres:
   source_schema: customer_app
   user: "${POSTGRES_USER}"
   password: "${POSTGRES_PASSWORD}"
-  sslmode: disable
+  sslmode: prefer
   jdbc_driver: org.postgresql.Driver
   fetch_size: 10000
   query_timeout_seconds: 300
@@ -32,6 +32,7 @@ spark:
     spark.sql.catalog.spark_catalog: org.apache.spark.sql.delta.catalog.DeltaCatalog
     spark.databricks.delta.schema.autoMerge.enabled: "false"
     spark.sql.adaptive.enabled: "true"
+    spark.sql.maxPlanStringLength: "524288"
     spark.sql.parquet.datetimeRebaseModeInRead: CORRECTED
     spark.sql.parquet.datetimeRebaseModeInWrite: CORRECTED
     spark.sql.parquet.int96RebaseModeInRead: CORRECTED

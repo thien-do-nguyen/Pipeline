@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from time import perf_counter
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from ecommerce_pipeline.adapters.lakehouse import (
     LakehouseAdapter,
-    ensure_change_data_feed,
+    delta_table_state,
     latest_delta_version,
 )
 from ecommerce_pipeline.config.models import AppConfig
@@ -40,35 +42,54 @@ FACT_SOURCE_TABLES = {
 
 
 class GoldBuilder:
-    def __init__(self, spark: SparkSession, config: AppConfig) -> None:
+    def __init__(
+        self,
+        spark: SparkSession,
+        config: AppConfig,
+        timings_ms: dict[str, int] | None = None,
+    ) -> None:
         self.spark = spark
         self.config = config
         self.lakehouse = LakehouseAdapter(spark, config)
         self.releases = GoldReleaseStore(spark, config)
+        self.timings_ms = timings_ms
 
     def run(self, *, batch_id: str = "standalone", full_rebuild: bool = False) -> list[str]:
-        current_versions = self._silver_versions()
-        previous_release = self.releases.latest()
+        with self._timed("gold.metadata"):
+            current_versions = self._silver_versions()
+            previous_release = self.releases.latest()
         previous_versions = None if previous_release is None else previous_release.silver_versions
         if full_rebuild or previous_versions is None:
-            self._run_full()
-            self._publish(current_versions, batch_id)
-            return self._paths()
-
-        self._validate_progress(previous_versions, current_versions)
-        self._validate_scd2_schemas()
-        changed_tables = {name for name, version in current_versions.items() if version > previous_versions[name]}
-        if not changed_tables:
-            if previous_release is not None and previous_release.legacy:
+            with self._timed("gold.full_build"):
+                self._run_full()
+            with self._timed("gold.publish"):
                 self._publish(current_versions, batch_id)
             return self._paths()
 
+        self._validate_progress(previous_versions, current_versions)
+        changed_tables = {name for name, version in current_versions.items() if version > previous_versions[name]}
+        if not changed_tables:
+            if previous_release is not None and previous_release.legacy:
+                with self._timed("gold.publish"):
+                    self._publish(current_versions, batch_id)
+            return self._paths()
+
+        self._validate_scd2_schemas()
         changes = {
             name: self._read_changes(name, previous_versions[name] + 1, current_versions[name])
             for name in changed_tables
         }
-        self._run_incremental(changes)
-        self._publish(current_versions, batch_id)
+        owned_cache = [dataframe for dataframe in changes.values() if not dataframe.is_cached]
+        for dataframe in owned_cache:
+            dataframe.cache()
+        try:
+            with self._timed("gold.incremental"):
+                self._run_incremental(changes)
+            with self._timed("gold.publish"):
+                self._publish(current_versions, batch_id)
+        finally:
+            for dataframe in owned_cache:
+                dataframe.unpersist()
         return self._paths()
 
     def _run_full(self) -> None:
@@ -109,6 +130,20 @@ class GoldBuilder:
         GoldQualityChecker(self.lakehouse).run(tables)
 
     def _run_incremental(self, changes: dict[str, DataFrame]) -> None:
+        changed_order_ids = self._ids_if_changed(changes, "orders", "order_id")
+        affected_order_ids = self._affected_order_ids(changes).localCheckpoint(eager=True)
+        try:
+            self._apply_incremental(changes, changed_order_ids, affected_order_ids)
+        finally:
+            affected_order_ids.unpersist()
+
+    def _apply_incremental(
+        self,
+        changes: dict[str, DataFrame],
+        changed_order_ids: DataFrame,
+        affected_order_ids: DataFrame,
+    ) -> None:
+        dimensions_started = perf_counter()
         changed_tables = set(changes)
         changed_scd2: list[str] = []
         if "app_users" in changes:
@@ -116,9 +151,6 @@ class GoldBuilder:
             users = self._filter_current("app_users", "user_id", user_ids)
             self._merge_scd2("dim_customer", build_dim_customer(users, self.spark))
             changed_scd2.append("dim_customer")
-
-        changed_order_ids = self._ids_if_changed(changes, "orders", "order_id")
-        affected_order_ids = self._affected_order_ids(changes)
 
         if "orders" in changes:
             orders = self._filter_current("orders", "order_id", changed_order_ids)
@@ -189,15 +221,22 @@ class GoldBuilder:
             )
 
         GoldQualityChecker(self.lakehouse).validate_scd2(changed_scd2)
+        self._record_elapsed("gold.dimensions", dimensions_started)
 
         if changed_tables & FACT_SOURCE_TABLES:
+            fact_started = perf_counter()
             fact_sources = self._fact_scope(affected_order_ids)
             fact_sources["orders"] = fact_sources["orders"].cache()
             fact_sources["order_items"] = fact_sources["order_items"].cache()
             fact_dimensions = self._fact_dimension_scope(fact_sources)
-            facts = build_fact_sales(fact_sources, fact_dimensions).cache()
             fact_keys = ["source_order_id", "source_order_item_id"]
+            facts: DataFrame | None = None
             try:
+                # Quality rules and Delta MERGE both consume this dataframe.
+                # Cut its join/window lineage once instead of embedding that
+                # large plan into every downstream aggregate and merge command.
+                with self._timed("gold.fact_materialize"):
+                    facts = build_fact_sales(fact_sources, fact_dimensions).localCheckpoint(eager=True)
                 existing_facts = self._filter_gold(
                     "fact_sales",
                     "source_order_id",
@@ -209,18 +248,26 @@ class GoldBuilder:
                     fact_keys,
                     "left_anti",
                 )
-                GoldQualityChecker(self.lakehouse).run_incremental(facts, fact_sources)
-                self.lakehouse.upsert_table(
-                    facts,
-                    "gold",
-                    "fact_sales",
-                    fact_keys,
-                    delete_keys=stale_fact_keys,
-                )
+                with self._timed("gold.fact_quality"):
+                    GoldQualityChecker(self.lakehouse).run_incremental(
+                        facts,
+                        fact_sources,
+                        fact_is_materialized=True,
+                    )
+                with self._timed("gold.fact_merge"):
+                    self.lakehouse.upsert_table(
+                        facts,
+                        "gold",
+                        "fact_sales",
+                        fact_keys,
+                        delete_keys=stale_fact_keys,
+                    )
             finally:
-                facts.unpersist()
+                if facts is not None:
+                    facts.unpersist()
                 fact_sources["orders"].unpersist()
                 fact_sources["order_items"].unpersist()
+            self._record_elapsed("gold.fact_total", fact_started)
 
     def _affected_order_ids(self, changes: dict[str, DataFrame]) -> DataFrame:
         frames = [
@@ -287,11 +334,14 @@ class GoldBuilder:
     def _silver_versions(self) -> dict[str, int]:
         versions: dict[str, int] = {}
         for table_name in SILVER_TABLES:
-            path = self.config.lakehouse.table_path("silver", table_name)
-            if not self.lakehouse.table_exists("silver", table_name):
-                raise RuntimeError(f"Silver Delta table is missing for table: {table_name}")
-            ensure_change_data_feed(self.spark, path)
-            versions[table_name] = latest_delta_version(self.spark, path)
+            state = delta_table_state(
+                self.spark,
+                self.config.lakehouse.table_path("silver", table_name),
+                pipeline="bronze_to_silver",
+            )
+            if state.progress_version is None:
+                raise RuntimeError(f"Silver progress metadata is missing for table: {table_name}")
+            versions[table_name] = state.progress_version
         return versions
 
     @staticmethod
@@ -444,6 +494,19 @@ class GoldBuilder:
     def _paths(self) -> list[str]:
         return [self.config.lakehouse.table_path("gold", name) for name in GOLD_TABLES]
 
+    @contextmanager
+    def _timed(self, name: str) -> Iterator[None]:
+        started = perf_counter()
+        try:
+            yield
+        finally:
+            self._record_elapsed(name, started)
+
+    def _record_elapsed(self, name: str, started: float) -> None:
+        timings_ms = getattr(self, "timings_ms", None)
+        if timings_ms is not None:
+            timings_ms[name] = round((perf_counter() - started) * 1000)
+
 
 def build_gold(
     spark: SparkSession,
@@ -451,5 +514,6 @@ def build_gold(
     *,
     batch_id: str = "standalone",
     full_rebuild: bool = False,
+    timings_ms: dict[str, int] | None = None,
 ) -> list[str]:
-    return GoldBuilder(spark, config).run(batch_id=batch_id, full_rebuild=full_rebuild)
+    return GoldBuilder(spark, config, timings_ms).run(batch_id=batch_id, full_rebuild=full_rebuild)

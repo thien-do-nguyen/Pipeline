@@ -14,12 +14,12 @@ from .vouchers import seed_vouchers
 
 def seed_baseline(cur: psycopg.Cursor[Any], rng: random.Random, customers: int, now: datetime) -> RuntimeState:
     categories = _seed_categories(cur)
-    users, addresses, user_created_at = seed_users(cur, rng, customers, now)
+    users, addresses, address_snapshots, user_created_at = seed_users(cur, rng, customers, now)
     shops = _seed_shops(cur, now)
     variants = _seed_products(cur, rng, shops, categories, now)
     vouchers = seed_vouchers(cur, now)
     _seed_carts(cur, rng, users, variants, now)
-    return RuntimeState(users, addresses, variants, user_created_at, vouchers)
+    return RuntimeState(users, addresses, address_snapshots, variants, user_created_at, vouchers)
 
 
 def load_state(cur: psycopg.Cursor[Any]) -> RuntimeState:
@@ -28,8 +28,16 @@ def load_state(cur: psycopg.Cursor[Any]) -> RuntimeState:
     users = [int(row["user_id"]) for row in user_rows]
     user_created_at = {int(row["user_id"]): row["created_at"] for row in user_rows}
 
-    cur.execute("SELECT user_id, address_id FROM user_addresses WHERE is_default_shipping = TRUE")
-    addresses = {int(row["user_id"]): int(row["address_id"]) for row in cur.fetchall()}
+    cur.execute(
+        """
+        SELECT user_id, address_id, to_jsonb(a) AS snapshot
+        FROM user_addresses a
+        WHERE is_default_shipping = TRUE
+        """
+    )
+    address_rows = cur.fetchall()
+    addresses = {int(row["user_id"]): int(row["address_id"]) for row in address_rows}
+    address_snapshots = {int(row["user_id"]): dict(row["snapshot"]) for row in address_rows}
 
     cur.execute(
         """
@@ -60,7 +68,7 @@ def load_state(cur: psycopg.Cursor[Any]) -> RuntimeState:
 
     if not users or not addresses or not variants:
         raise RuntimeError("Run bootstrap first before continuous generation.")
-    return RuntimeState(users, addresses, variants, user_created_at, vouchers)
+    return RuntimeState(users, addresses, address_snapshots, variants, user_created_at, vouchers)
 
 
 def _seed_categories(cur: psycopg.Cursor[Any]) -> list[int]:

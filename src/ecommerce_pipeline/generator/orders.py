@@ -8,13 +8,12 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from .database import one_id
-from .models import RuntimeState, Variant, money
+from .models import AddressSnapshot, RuntimeState, Variant, money
 from .vouchers import rotate_delete_marker_voucher
 
 PaymentStatus = Literal["paid", "pending", "failed"]
 OrderStatus = Literal["pending_payment", "confirmed", "processing", "shipped", "delivered", "completed", "cancelled"]
 ShipmentStatus = Literal["pending", "packed", "in_transit", "delivered", "cancelled"]
-AddressSnapshot = dict[str, object]
 OrderLine = tuple[Variant, int, Decimal, Decimal]
 
 
@@ -66,7 +65,7 @@ def insert_order(
     total = subtotal + shipping + tax_total - total_discount
     payment_status: PaymentStatus = rng.choice(["paid", "paid", "paid", "pending", "failed"])
     order_status = "confirmed" if payment_status == "paid" else "pending_payment"
-    address_snapshot = _address_snapshot(cur, address_id)
+    address_snapshot = state.address_snapshot_by_user[customer_id]
 
     order_id = one_id(
         cur,
@@ -357,14 +356,6 @@ def delete_baseline_order(cur: psycopg.Cursor[Any], exclude_order_id: int | None
     )
     row = cur.fetchone()
     return int(row["order_id"]) if row is not None else None
-
-
-def _address_snapshot(cur: psycopg.Cursor[Any], address_id: int) -> AddressSnapshot:
-    cur.execute("SELECT row_to_json(a) AS snapshot FROM user_addresses a WHERE address_id = %s", (address_id,))
-    row = cur.fetchone()
-    if row is None:
-        raise RuntimeError(f"Missing address_id={address_id}")
-    return cast(AddressSnapshot, row["snapshot"])
 
 
 def _next_order_status(status: OrderStatus) -> OrderStatus:

@@ -94,6 +94,7 @@ def run_mode(
             config,
             batch_id=batch_id,
             full_rebuild=args.full_rebuild_gold,
+            timings_ms=timings_ms,
         )
         timings_ms["gold"] = round((perf_counter() - started) * 1000)
         for path in outputs["gold"]:

@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from ecommerce_pipeline.adapters.lakehouse import DeltaTableState
 from ecommerce_pipeline.pipelines import build_silver as silver_module
 from ecommerce_pipeline.pipelines.build_silver import SilverBuilder
 
@@ -30,11 +31,13 @@ def _mock_progress(
     bronze_version: int = 25,
     silver_version: int | None = 10,
 ) -> None:
-    monkeypatch.setattr(silver_module, "delta_table_exists", lambda *args: True)
-    monkeypatch.setattr(silver_module, "ensure_change_data_feed", lambda *args: None)
-    monkeypatch.setattr(silver_module, "latest_delta_version", lambda *args: bronze_version)
-    metadata = None if silver_version is None else {"last_processed_bronze_version": silver_version}
-    monkeypatch.setattr(silver_module, "latest_commit_metadata", lambda *args, **kwargs: metadata)
+    def table_state(_spark: object, path: str, *, pipeline: str) -> DeltaTableState:
+        if "/bronze/" in path:
+            return DeltaTableState(bronze_version, bronze_version, {"pipeline": pipeline})
+        metadata = None if silver_version is None else {"last_processed_bronze_version": silver_version}
+        return DeltaTableState(silver_version or 0, silver_version, metadata)
+
+    monkeypatch.setattr(silver_module, "delta_table_state", table_state)
 
 
 def test_silver_processes_only_unapplied_delta_versions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -70,7 +73,7 @@ def test_silver_skips_transform_when_delta_version_is_current(monkeypatch: pytes
 
     assert result == "lakehouse/silver/orders"
     service.transform.assert_not_called()
-    service._validate_schema_version.assert_called_once_with("orders")
+    service._validate_schema_version.assert_not_called()
     service.lakehouse.upsert_table.assert_not_called()
 
 

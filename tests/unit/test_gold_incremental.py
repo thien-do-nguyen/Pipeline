@@ -15,7 +15,14 @@ def _builder() -> GoldBuilder:
     builder._publish = Mock()
     builder._validate_progress = Mock()
     builder._validate_scd2_schemas = Mock()
-    builder._read_changes = Mock(side_effect=lambda table, start, end: (table, start, end))
+
+    def read_changes(_table: str, _start: int, _end: int) -> Mock:
+        changes = Mock()
+        changes.is_cached = False
+        changes.cache.return_value = changes
+        return changes
+
+    builder._read_changes = Mock(side_effect=read_changes)
     builder.releases = Mock()
     return builder
 
@@ -46,7 +53,9 @@ def test_gold_reads_only_changed_silver_version_ranges() -> None:
     builder.run(batch_id="batch-2")
 
     builder._read_changes.assert_called_once_with("payments", 4, 4)
-    builder._run_incremental.assert_called_once_with({"payments": ("payments", 4, 4)})
+    incremental_changes = builder._run_incremental.call_args.args[0]
+    assert set(incremental_changes) == {"payments"}
+    incremental_changes["payments"].unpersist.assert_called_once_with()
     builder._publish.assert_called_once_with(current, "batch-2")
 
 
@@ -106,3 +115,21 @@ def test_gold_filter_can_map_different_id_column_names(spark: SparkSession) -> N
     )
 
     assert [row["category_id"] for row in children.collect()] == [2]
+
+
+def test_incremental_checkpoints_reused_affected_order_ids() -> None:
+    builder = object.__new__(GoldBuilder)
+    changed_order_ids = Mock()
+    affected_plan = Mock()
+    affected_ids = Mock()
+    affected_plan.localCheckpoint.return_value = affected_ids
+    builder._ids_if_changed = Mock(return_value=changed_order_ids)
+    builder._affected_order_ids = Mock(return_value=affected_plan)
+    builder._apply_incremental = Mock()
+    changes = {"orders": Mock()}
+
+    builder._run_incremental(changes)
+
+    affected_plan.localCheckpoint.assert_called_once_with(eager=True)
+    builder._apply_incremental.assert_called_once_with(changes, changed_order_ids, affected_ids)
+    affected_ids.unpersist.assert_called_once_with()

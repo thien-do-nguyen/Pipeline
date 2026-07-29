@@ -12,6 +12,7 @@ CONFIG ?= configs/local.yaml
 SEED ?= 42
 CUSTOMERS ?= 100
 ORDERS ?= 500
+SEED_BATCH_SIZE ?= 100
 ORDERS_PER_BATCH ?= 5
 INTERVAL_SECONDS ?= 5
 MAX_BATCHES ?=
@@ -50,6 +51,7 @@ seed: env
 		--seed $(SEED) \
 		--customers $(CUSTOMERS) \
 		--orders $(ORDERS) \
+		--batch-size $(SEED_BATCH_SIZE) \
 		--reset
 
 seed-stream: env

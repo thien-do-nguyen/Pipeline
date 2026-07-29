@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -12,6 +13,12 @@ from ecommerce_pipeline.contracts.bronze_tables import BronzeTableContract
 from ecommerce_pipeline.contracts.change_events import ChangeOperation, EventCursor
 
 CHANGE_EVENT_TABLE = "change_events"
+
+
+@dataclass(frozen=True)
+class ChangeEventStats:
+    record_count: int
+    last_event_id: int | None
 
 
 def bronze_batch_path(config: AppConfig, table_name: str) -> str:
@@ -32,32 +39,49 @@ def add_bronze_metadata(df: DataFrame, config: AppConfig, table_name: str, batch
     )
 
 
-def read_batch_upper_bound(
+def read_batch_upper_bounds(
     reader: PostgresReader,
     config: AppConfig,
-    contract: BronzeTableContract,
-    cursor: EventCursor | None,
-) -> int | None:
-    row = reader.read_first(batch_upper_bound_query(config, contract, cursor))
-    if row is None or row["batch_upper_bound"] is None:
-        return None
-    return int(row["batch_upper_bound"])
+    cursors: dict[str, EventCursor | None],
+) -> dict[str, int | None]:
+    """Capture all table high-water marks in one PostgreSQL control query."""
+
+    if not cursors:
+        return {}
+    rows = reader.read_all(batch_upper_bounds_query(config, cursors))
+    bounds = {
+        str(row["source_table"]): (None if row["batch_upper_bound"] is None else int(row["batch_upper_bound"]))
+        for row in rows
+    }
+    missing = sorted(set(cursors) - set(bounds))
+    if missing:
+        raise RuntimeError(f"PostgreSQL did not return batch upper bounds for: {missing}")
+    return bounds
 
 
-def batch_upper_bound_query(
+def batch_upper_bounds_query(
     config: AppConfig,
-    contract: BronzeTableContract,
-    cursor: EventCursor | None,
+    cursors: dict[str, EventCursor | None],
 ) -> str:
-    event_log = f"{config.postgres.source_schema}.{CHANGE_EVENT_TABLE}"
-    lower_bound = cursor.last_event_id if cursor else 0
-    return (
-        "SELECT MAX(event_id) AS batch_upper_bound FROM ("
-        f"SELECT event_id FROM {event_log} "
-        f"WHERE source_table = {_sql_literal(contract.table_name)} AND event_id > {lower_bound} "
-        f"ORDER BY event_id LIMIT {config.postgres.max_events_per_batch}"
-        ") bounded_events"
+    if not cursors:
+        raise ValueError("At least one source cursor is required")
+    values = ", ".join(
+        f"({_sql_literal(table_name)}, {cursor.last_event_id if cursor else 0})"
+        for table_name, cursor in cursors.items()
     )
+    event_log = f"{config.postgres.source_schema}.{CHANGE_EVENT_TABLE}"
+    query = (
+        "SELECT cursors.source_table, ("
+        "SELECT MAX(event_id) FROM ("
+        f"SELECT events.event_id FROM {event_log} events "
+        "WHERE events.source_table = cursors.source_table "
+        "AND events.event_id > cursors.last_event_id "
+        f"ORDER BY events.event_id LIMIT {config.postgres.max_events_per_batch}"
+        ") bounded_events"
+        ") AS batch_upper_bound "
+        f"FROM (VALUES {values}) AS cursors(source_table, last_event_id)"
+    )
+    return query
 
 
 def change_event_query(
@@ -86,13 +110,6 @@ def jdbc_partition_count(config: AppConfig, cursor: EventCursor | None, batch_up
     event_id_span = max(batch_upper_bound - lower_bound, 1)
     required = math.ceil(event_id_span / config.postgres.target_events_per_partition)
     return min(required, config.postgres.max_jdbc_partitions)
-
-
-def max_event_cursor(df: DataFrame) -> EventCursor | None:
-    row = df.agg(F.max("_event_id").alias("last_event_id")).first()
-    if row is None or row["last_event_id"] is None:
-        return None
-    return EventCursor(last_event_id=int(row["last_event_id"]))
 
 
 def delta_table_exists(spark: SparkSession, path: str) -> bool:
@@ -128,7 +145,9 @@ def write_append_only(
         writer.save(output_path)
 
 
-def validate_change_events(df: DataFrame, contract: BronzeTableContract) -> None:
+def collect_change_event_stats(df: DataFrame, contract: BronzeTableContract) -> ChangeEventStats:
+    """Validate and measure a cached JDBC batch with one Spark action."""
+
     required = {*contract.primary_keys, "_event_id", "_operation", "_event_occurred_at"}
     missing = sorted(required - set(df.columns))
     if missing:
@@ -141,8 +160,19 @@ def validate_change_events(df: DataFrame, contract: BronzeTableContract) -> None
     )
     for key in contract.primary_keys:
         invalid_condition = invalid_condition | F.col(key).isNull()
-    if df.filter(invalid_condition).take(1):
+    row = df.agg(
+        F.count(F.lit(1)).alias("record_count"),
+        F.max("_event_id").alias("last_event_id"),
+        F.sum(F.when(invalid_condition, F.lit(1)).otherwise(F.lit(0))).alias("invalid_count"),
+    ).first()
+    if row is None:
+        raise RuntimeError(f"Change-event metrics are unavailable for: {contract.table_name}")
+    if int(row["invalid_count"] or 0):
         raise ValueError(f"Invalid change event for source table: {contract.table_name}")
+    return ChangeEventStats(
+        record_count=int(row["record_count"]),
+        last_event_id=None if row["last_event_id"] is None else int(row["last_event_id"]),
+    )
 
 
 def _empty_change_event_query(schema: str, contract: BronzeTableContract) -> str:

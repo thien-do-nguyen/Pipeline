@@ -4,7 +4,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from pyspark.sql import DataFrame, Window
+from pyspark.sql import DataFrame, Row, Window
 from pyspark.sql import functions as F
 
 from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter
@@ -83,22 +83,47 @@ class GoldQualityChecker:
         orders = sources["orders"]
         items = sources["order_items"]
         with self._cached_for_quality(fact, orders, items):
-            metrics = self._collect_fact_metrics(fact)
+            metrics, source_order_rows, source_item_rows = self._collect_quality_metrics(fact, orders, items)
             self._assert_fact_metrics(metrics, "fact_sales")
             self._assert_dimension_integrity(fact, check_uniqueness=True)
             self.validate_scd2(SCD2_DIMENSIONS)
-            return self._assert_reconciliation(fact, orders, items, metrics)
+            return self._assert_reconciliation(
+                fact,
+                orders,
+                items,
+                metrics,
+                source_order_rows,
+                source_item_rows,
+            )
 
-    def run_incremental(self, fact: DataFrame, sources: Mapping[str, DataFrame]) -> GoldQualityReport:
-        """Validate only the bounded fact rows rebuilt by the current micro-batch."""
+    def run_incremental(
+        self,
+        fact: DataFrame,
+        sources: Mapping[str, DataFrame],
+        *,
+        fact_is_materialized: bool = False,
+    ) -> GoldQualityReport:
+        """Validate only the bounded fact rows rebuilt by the current micro-batch.
+
+        ``fact_is_materialized`` avoids creating a second cache when the caller
+        already cut and materialized the fact lineage.
+        """
 
         orders = sources["orders"]
         items = sources["order_items"]
-        with self._cached_for_quality(fact, orders, items):
-            metrics = self._collect_fact_metrics(fact)
+        cache_inputs = (orders, items) if fact_is_materialized else (fact, orders, items)
+        with self._cached_for_quality(*cache_inputs):
+            metrics, source_order_rows, source_item_rows = self._collect_quality_metrics(fact, orders, items)
             self._assert_fact_metrics(metrics, "fact_sales incremental")
             self._assert_dimension_integrity(fact, check_uniqueness=False)
-            return self._assert_reconciliation(fact, orders, items, metrics)
+            return self._assert_reconciliation(
+                fact,
+                orders,
+                items,
+                metrics,
+                source_order_rows,
+                source_item_rows,
+            )
 
     def validate_scd2(self, table_names: Iterable[str]) -> None:
         """Validate changed SCD2 tables before their Gold snapshot is published."""
@@ -130,7 +155,27 @@ class GoldQualityChecker:
             for dataframe in owned:
                 dataframe.unpersist()
 
-    def _collect_fact_metrics(self, fact: DataFrame) -> _FactMetrics:
+    def _collect_quality_metrics(
+        self,
+        fact: DataFrame,
+        orders: DataFrame,
+        items: DataFrame,
+    ) -> tuple[_FactMetrics, int, int]:
+        row = (
+            self._fact_metrics_frame(fact)
+            .crossJoin(orders.agg(F.count(F.lit(1)).alias("source_order_rows")))
+            .crossJoin(items.agg(F.count(F.lit(1)).alias("source_item_rows")))
+            .first()
+        )
+        if row is None:
+            raise ValueError("Gold quality metrics are unavailable")
+        return (
+            self._fact_metrics_from_row(row),
+            int(row["source_order_rows"]),
+            int(row["source_item_rows"]),
+        )
+
+    def _fact_metrics_frame(self, fact: DataFrame) -> DataFrame:
         invalid_amount = F.col("quantity").isNull() | (F.col("quantity") <= 0)
         for name in self.MONETARY_COLUMNS:
             invalid_amount = invalid_amount | F.col(name).isNull() | (F.col(name) < 0)
@@ -139,7 +184,7 @@ class GoldQualityChecker:
         for key in self.REQUIRED_NON_UNKNOWN_KEYS:
             unresolved_key = unresolved_key | F.col(key).isNull() | (F.col(key) == 0)
 
-        row = fact.agg(
+        return fact.agg(
             F.count(F.lit(1)).alias("rows"),
             F.countDistinct(F.struct("source_order_id", "source_order_item_id")).alias("distinct_source_keys"),
             F.countDistinct(F.struct("sales_key")).alias("distinct_sales_keys"),
@@ -150,9 +195,10 @@ class GoldQualityChecker:
             F.sum("tax_amount").alias("tax"),
             F.sum("shipping_amount_allocated").alias("shipping"),
             F.sum("net_sales_amount").alias("net"),
-        ).first()
-        if row is None:
-            raise ValueError("Gold fact metrics are unavailable")
+        )
+
+    @staticmethod
+    def _fact_metrics_from_row(row: Row) -> _FactMetrics:
         return _FactMetrics(
             rows=int(row["rows"]),
             distinct_source_keys=int(row["distinct_source_keys"]),
@@ -178,48 +224,68 @@ class GoldQualityChecker:
             raise ValueError("Gold fact contains unresolved required dimension keys")
 
     def _assert_dimension_integrity(self, fact: DataFrame, *, check_uniqueness: bool) -> None:
-        dimensions = {
-            name: self.lakehouse.read_table("gold", name).select(key) for name, (key, _) in self.DIMENSION_KEYS.items()
-        }
-        dimensions["dim_location"] = self.lakehouse.read_table("gold", "dim_location").select("location_key")
-
-        violations: list[DataFrame] = []
-        if check_uniqueness:
-            for name, keys in dimensions.items():
-                key = keys.columns[0]
-                violations.append(
-                    keys.groupBy(key)
-                    .count()
-                    .filter(F.col("count") > 1)
-                    .select(F.lit(f"Duplicate key in gold.{name}: ['{key}']").alias("violation"))
+        references = [
+            (dimension, dimension_key, fact_key) for dimension, (dimension_key, fact_key) in self.DIMENSION_KEYS.items()
+        ]
+        references.extend(
+            [
+                ("dim_location", "location_key", "ship_to_location_key"),
+                ("dim_location", "location_key", "bill_to_location_key"),
+            ]
+        )
+        dimension_contracts = {dimension: dimension_key for dimension, dimension_key, _ in references}
+        dimension_members = self._union_all(
+            [
+                self.lakehouse.read_table("gold", dimension).select(
+                    F.lit(dimension).alias("dimension"),
+                    F.col(dimension_key).cast("string").alias("key"),
                 )
+                for dimension, dimension_key in dimension_contracts.items()
+            ]
+        )
+        dimension_keys = dimension_members.distinct()
+        fact_keys = fact.select(
+            F.explode(
+                F.array(
+                    *[
+                        F.struct(
+                            F.lit(dimension).alias("dimension"),
+                            F.col(fact_key).cast("string").alias("key"),
+                            F.lit(fact_key).alias("fact_key"),
+                        )
+                        for dimension, _, fact_key in references
+                    ]
+                )
+            ).alias("reference")
+        ).select("reference.*")
+        missing = fact_keys.join(dimension_keys, ["dimension", "key"], "left_anti").select(
+            F.concat(
+                F.lit("Missing gold."),
+                F.col("dimension"),
+                F.lit(" reference for "),
+                F.col("fact_key"),
+            ).alias("violation")
+        )
 
-        for dimension, (dimension_key, fact_key) in self.DIMENSION_KEYS.items():
-            violations.append(self._missing_reference(fact, dimensions[dimension], dimension, dimension_key, fact_key))
-        for fact_key in ("ship_to_location_key", "bill_to_location_key"):
+        violations = [missing]
+        if check_uniqueness:
             violations.append(
-                self._missing_reference(fact, dimensions["dim_location"], "dim_location", "location_key", fact_key)
+                dimension_members.groupBy("dimension", "key")
+                .count()
+                .filter(F.col("count") > 1)
+                .select(
+                    F.concat(
+                        F.lit("Duplicate key in gold."),
+                        F.col("dimension"),
+                        F.lit(": "),
+                        F.col("key"),
+                    ).alias("violation")
+                )
             )
 
         violation = self._union_all(violations).first()
         if violation is not None:
             raise ValueError(str(violation["violation"]))
-
-    @staticmethod
-    def _missing_reference(
-        fact: DataFrame,
-        dimension_keys: DataFrame,
-        dimension: str,
-        dimension_key: str,
-        fact_key: str,
-    ) -> DataFrame:
-        references = dimension_keys.select(F.col(dimension_key).alias(fact_key)).distinct()
-        return (
-            fact.select(fact_key)
-            .distinct()
-            .join(references, fact_key, "left_anti")
-            .select(F.lit(f"Missing gold.{dimension} reference for {fact_key}").alias("violation"))
-        )
 
     def _scd2_violations(self, table_name: str, contract: Scd2DimensionContract) -> DataFrame:
         dimension = self.lakehouse.read_table("gold", table_name).filter(F.col(contract.source_key).isNotNull())
@@ -254,16 +320,9 @@ class GoldQualityChecker:
         orders: DataFrame,
         items: DataFrame,
         metrics: _FactMetrics,
+        source_order_rows: int,
+        source_item_rows: int,
     ) -> GoldQualityReport:
-        counts = (
-            orders.agg(F.count(F.lit(1)).alias("source_order_rows"))
-            .crossJoin(items.agg(F.count(F.lit(1)).alias("source_item_rows")))
-            .first()
-        )
-        if counts is None:
-            raise ValueError("Source row counts are unavailable")
-        source_order_rows = int(counts["source_order_rows"])
-        source_item_rows = int(counts["source_item_rows"])
         if source_item_rows != metrics.rows:
             raise ValueError(f"Fact row count mismatch: source_items={source_item_rows}, fact_rows={metrics.rows}")
 
