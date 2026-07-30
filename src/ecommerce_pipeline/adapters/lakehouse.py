@@ -5,13 +5,18 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlparse
 
+from pyspark.errors import AnalysisException
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.readwriter import DataFrameWriter
 
-from ecommerce_pipeline.config.models import AppConfig
+from ecommerce_pipeline.config.models import AppConfig, TableReference
+
+if TYPE_CHECKING:
+    from delta.tables import DeltaTable
 
 DELTA_COMMIT_METADATA_KEY = "spark.databricks.delta.commitInfo.userMetadata"
 PROGRESS_HISTORY_FALLBACK_LIMIT = 100
@@ -41,29 +46,25 @@ def delta_commit_metadata(spark: SparkSession, metadata: dict[str, object]) -> I
             spark.conf.set(DELTA_COMMIT_METADATA_KEY, previous)
 
 
-def latest_delta_version(spark: SparkSession, path: str) -> int:
-    from delta.tables import DeltaTable
-
-    row = DeltaTable.forPath(spark, path).history(1).select("version").first()
+def latest_delta_version(spark: SparkSession, reference: TableReference | str) -> int:
+    row = _delta_table(spark, reference).history(1).select("version").first()
     if row is None:
-        raise RuntimeError(f"Delta history is empty: {path}")
+        raise RuntimeError(f"Delta history is empty: {_reference(reference).value}")
     return int(row["version"])
 
 
 def delta_table_state(
     spark: SparkSession,
-    path: str,
+    reference: TableReference | str,
     *,
     pipeline: str,
 ) -> DeltaTableState:
     """Read one commit normally and use a bounded maintenance fallback."""
 
-    from delta.tables import DeltaTable
-
-    delta = DeltaTable.forPath(spark, path)
+    delta = _delta_table(spark, reference)
     latest = delta.history(1).select("version", "userMetadata").first()
     if latest is None:
-        raise RuntimeError(f"Delta history is empty: {path}")
+        raise RuntimeError(f"Delta history is empty: {_reference(reference).value}")
     latest_version = int(latest["version"])
     progress = _pipeline_metadata(latest["userMetadata"], pipeline)
     if progress is not None:
@@ -77,21 +78,63 @@ def delta_table_state(
     return DeltaTableState(latest_version, None, None)
 
 
-def delta_table_properties(spark: SparkSession, path: str) -> dict[str, str]:
+def try_delta_table_state(
+    spark: SparkSession,
+    reference: TableReference | str,
+    *,
+    pipeline: str,
+) -> DeltaTableState | None:
+    """Read existence and progress with one Delta history request."""
+
+    try:
+        return delta_table_state(spark, reference, pipeline=pipeline)
+    except AnalysisException as exc:
+        if _is_missing_delta_table(exc):
+            return None
+        raise
+
+
+def delta_table_properties(spark: SparkSession, reference: TableReference | str) -> dict[str, str]:
     """Read the current Delta table properties without scanning table data or history."""
 
-    from delta.tables import DeltaTable
-
-    row = DeltaTable.forPath(spark, path).detail().select("properties").first()
+    row = _delta_table(spark, reference).detail().select("properties").first()
     if row is None:
-        raise RuntimeError(f"Delta table detail is empty: {path}")
+        raise RuntimeError(f"Delta table detail is empty: {_reference(reference).value}")
     return {str(key): str(value) for key, value in (row["properties"] or {}).items()}
 
 
-def set_delta_table_property(spark: SparkSession, path: str, key: str, value: str) -> None:
+def set_delta_table_property(
+    spark: SparkSession,
+    reference: TableReference | str,
+    key: str,
+    value: str,
+) -> None:
     spark.sql(
-        f"ALTER TABLE {_delta_sql_identifier(path)} SET TBLPROPERTIES ({_sql_literal(key)} = {_sql_literal(value)})"
+        f"ALTER TABLE {_sql_identifier(reference)} SET TBLPROPERTIES ({_sql_literal(key)} = {_sql_literal(value)})"
     )
+
+
+def read_delta(
+    spark: SparkSession,
+    reference: TableReference | str,
+    *,
+    options: Mapping[str, bool | float | int | str | None] | None = None,
+) -> DataFrame:
+    reader = spark.read.format("delta")
+    for key, value in (options or {}).items():
+        reader = reader.option(key, value)
+    resolved = _reference(reference)
+    return reader.table(resolved.value) if resolved.is_catalog else reader.load(resolved.value)
+
+
+def write_delta(writer: DataFrameWriter, reference: TableReference | str) -> None:
+    resolved = _reference(reference)
+    if resolved.is_catalog:
+        if resolved.storage_path is not None:
+            writer = writer.option("path", resolved.storage_path)
+        writer.saveAsTable(resolved.value)
+    else:
+        writer.save(resolved.value)
 
 
 class LakehouseAdapter:
@@ -114,34 +157,36 @@ class LakehouseAdapter:
         return LakehouseAdapter(self.spark, self.config, gold_versions=versions)
 
     def read_table(self, layer: str, table_name: str) -> DataFrame:
-        path = self.config.lakehouse.table_path(layer, table_name)
-        reader = self.spark.read.format(self.config.lakehouse.format)
+        reference = self.config.lakehouse.table_reference(layer, table_name)
+        options: dict[str, bool | float | int | str | None] = {}
         if layer == "gold" and self.gold_versions is not None:
             version = self.gold_versions.get(table_name)
             if version is None:
                 raise ValueError(f"Gold table is not part of the published snapshot: {table_name}")
-            reader = reader.option("versionAsOf", version)
-        return reader.load(path)
+            options["versionAsOf"] = version
+        return read_delta(self.spark, reference, options=options)
 
     def table_exists(self, layer: str, table_name: str) -> bool:
         from delta.tables import DeltaTable
 
-        return DeltaTable.isDeltaTable(self.spark, self.config.lakehouse.table_path(layer, table_name))
+        reference = self.config.lakehouse.table_reference(layer, table_name)
+        if reference.is_catalog:
+            return self.spark.catalog.tableExists(reference.value)
+        return DeltaTable.isDeltaTable(self.spark, reference.value)
 
     def write_table(
         self,
         df: DataFrame,
         layer: str,
         table_name: str,
-        mode: str = "overwrite",
         *,
         enable_change_data_feed: bool = False,
     ) -> None:
-        path = self.config.lakehouse.table_path(layer, table_name)
-        writer = df.write.format(self.config.lakehouse.format).mode(mode).option("overwriteSchema", "true")
+        reference = self.config.lakehouse.table_reference(layer, table_name)
+        writer = df.write.format("delta").mode("overwrite").option("overwriteSchema", "true")
         if enable_change_data_feed:
             writer = writer.option("delta.enableChangeDataFeed", "true")
-        writer.save(path)
+        write_delta(writer, reference)
 
     def upsert_table(
         self,
@@ -153,6 +198,7 @@ class LakehouseAdapter:
         delete_not_matched_by_source: bool = False,
         *,
         delete_keys: DataFrame | None = None,
+        target_exists: bool | None = None,
     ) -> None:
         if not merge_keys:
             raise ValueError("merge_keys must not be empty")
@@ -163,14 +209,13 @@ class LakehouseAdapter:
             if missing_delete_keys:
                 raise ValueError(f"Missing delete keys for {layer}.{table_name}: {missing_delete_keys}")
 
-        path = self.config.lakehouse.table_path(layer, table_name)
-
-        from delta.tables import DeltaTable
+        reference = self.config.lakehouse.table_reference(layer, table_name)
 
         source_columns = set(df.columns)
         uses_operation_delete = delete_mode == "hard" and "_operation" in source_columns
 
-        if not DeltaTable.isDeltaTable(self.spark, path):
+        exists = self.table_exists(layer, table_name) if target_exists is None else target_exists
+        if not exists:
             if uses_operation_delete:
                 df = df.filter(F.coalesce(F.col("_operation") != F.lit("DELETE"), F.lit(True)))
             self.write_table(df, layer, table_name)
@@ -213,7 +258,7 @@ class LakehouseAdapter:
         try:
             if changes.isEmpty():
                 return
-            merge = DeltaTable.forPath(self.spark, path).alias("target").merge(changes.alias("source"), join_condition)
+            merge = _delta_table(self.spark, reference).alias("target").merge(changes.alias("source"), join_condition)
             if delete_condition is not None:
                 merge = merge.whenMatchedDelete(condition=delete_condition)
             not_delete = None if delete_condition is None else f"NOT ({delete_condition})"
@@ -247,14 +292,12 @@ class LakehouseAdapter:
         *,
         replace: bool = False,
     ) -> None:
-        from delta.tables import DeltaTable
-
-        path = self.config.lakehouse.table_path(layer, table_name)
+        reference = self.config.lakehouse.table_reference(layer, table_name)
         if initial_effective_from not in df.columns:
             raise ValueError(
                 f"Missing initial effective date column for {layer}.{table_name}: {initial_effective_from}"
             )
-        if replace or not DeltaTable.isDeltaTable(self.spark, path):
+        if replace or not self.table_exists(layer, table_name):
             initial = df.withColumn(
                 "effective_from",
                 F.when(
@@ -284,7 +327,7 @@ class LakehouseAdapter:
             initial_effective_from=initial_effective_from,
             type1_columns=type1_columns,
         ).localCheckpoint(eager=True)
-        delta = DeltaTable.forPath(self.spark, path)
+        delta = _delta_table(self.spark, reference)
         try:
             if staged.isEmpty():
                 return
@@ -381,6 +424,26 @@ def _stage_scd2_changes(
     )
 
 
+def _reference(reference: TableReference | str) -> TableReference:
+    return reference if isinstance(reference, TableReference) else TableReference(reference, False)
+
+
+def _delta_table(spark: SparkSession, reference: TableReference | str) -> DeltaTable:
+    from delta.tables import DeltaTable
+
+    resolved = _reference(reference)
+    if resolved.is_catalog:
+        return DeltaTable.forName(spark, resolved.value)
+    return DeltaTable.forPath(spark, resolved.value)
+
+
+def _sql_identifier(reference: TableReference | str) -> str:
+    resolved = _reference(reference)
+    if resolved.is_catalog:
+        return ".".join(f"`{part.replace('`', '``')}`" for part in resolved.value.split("."))
+    return _delta_sql_identifier(resolved.value)
+
+
 def _delta_sql_identifier(path: str) -> str:
     normalized = path if urlparse(path).scheme else Path(path).resolve().as_uri()
     return f"delta.`{normalized.replace('`', '``')}`"
@@ -400,3 +463,19 @@ def _pipeline_metadata(raw: str | None, pipeline: str) -> dict[str, object] | No
     if not isinstance(payload, dict):
         return None
     return payload if payload.get("pipeline") == pipeline else None
+
+
+def _is_missing_delta_table(exc: AnalysisException) -> bool:
+    get_condition = getattr(exc, "getCondition", None)
+    get_error_class = getattr(exc, "getErrorClass", None)
+    condition = get_condition() if callable(get_condition) else None
+    if condition is None and callable(get_error_class):
+        condition = get_error_class()
+    if condition in {
+        "TABLE_OR_VIEW_NOT_FOUND",
+        "DELTA_MISSING_DELTA_TABLE",
+        "PATH_NOT_FOUND",
+    }:
+        return True
+    message = str(exc)
+    return "is not a Delta table" in message or "Path does not exist" in message

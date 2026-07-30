@@ -1,5 +1,6 @@
 .venv/
 .env
+.env.cloud
 .idea/
 .vscode/
 
@@ -19,6 +20,7 @@ docs/
 build/
 dist/
 *.egg-info/
+.databricks/
 
 data/lakehouse/**
 !data/lakehouse/.gitkeep

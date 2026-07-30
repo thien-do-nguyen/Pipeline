@@ -14,7 +14,8 @@ from ecommerce_pipeline.config.models import AppConfig
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Z][A-Z0-9_]*)(?::-([^}]*))?\}")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_BASE_CONFIG = PROJECT_ROOT / "configs" / "base.yaml"
+PROJECT_CONFIG_DIR = PROJECT_ROOT / "configs"
+DEFAULT_BASE_CONFIG = PROJECT_CONFIG_DIR / "base.yaml"
 
 
 class ConfigError(ValueError):
@@ -44,8 +45,6 @@ def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str
 def _expand_string(value: str) -> str:
     def replacement(match: re.Match[str]) -> str:
         variable, default = match.group(1), match.group(2)
-        if variable == "AZURE_STORAGE_HADOOP_AUTH_TYPE":
-            return _azure_storage_hadoop_auth_type(default)
         current = os.getenv(variable)
         if current is not None and current != "":
             return current
@@ -54,16 +53,6 @@ def _expand_string(value: str) -> str:
         raise ConfigError(f"Missing required environment variable: {variable}")
 
     return _ENV_PATTERN.sub(replacement, value)
-
-
-def _azure_storage_hadoop_auth_type(default: str | None = None) -> str:
-    value = os.getenv("AZURE_STORAGE_AUTH_TYPE") or default
-    if value is None or value == "":
-        raise ConfigError("Missing required environment variable: AZURE_STORAGE_AUTH_TYPE")
-    normalized = value.lower().replace("-", "_")
-    if normalized in {"account_key", "shared_key", "sharedkey"}:
-        return "SharedKey"
-    raise ConfigError(f"Unsupported AZURE_STORAGE_AUTH_TYPE: {value}")
 
 
 def _expand_environment(value: Any) -> Any:
@@ -80,7 +69,7 @@ def _resolve_overlay(environment_or_path: str | Path) -> Path:
     candidate = Path(environment_or_path)
     if candidate.suffix.lower() in {".yaml", ".yml"}:
         return candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
-    return PROJECT_ROOT / "configs" / f"{candidate}.yaml"
+    return PROJECT_CONFIG_DIR / f"{candidate}.yaml"
 
 
 def load_config(

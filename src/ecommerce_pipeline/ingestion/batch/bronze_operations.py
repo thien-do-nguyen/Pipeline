@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from ecommerce_pipeline.adapters.lakehouse import delta_commit_metadata
+from ecommerce_pipeline.adapters.lakehouse import delta_commit_metadata, write_delta
 from ecommerce_pipeline.adapters.postgres import PostgresReader
-from ecommerce_pipeline.config.models import AppConfig
+from ecommerce_pipeline.config.models import AppConfig, TableReference
 from ecommerce_pipeline.contracts.bronze_tables import BronzeTableContract
 from ecommerce_pipeline.contracts.change_events import ChangeOperation, EventCursor
 
@@ -19,10 +19,6 @@ CHANGE_EVENT_TABLE = "change_events"
 class ChangeEventStats:
     record_count: int
     last_event_id: int | None
-
-
-def bronze_batch_path(config: AppConfig, table_name: str) -> str:
-    return "/".join((config.lakehouse.base_path.rstrip("/"), "bronze", "batch", table_name))
 
 
 def add_bronze_metadata(df: DataFrame, config: AppConfig, table_name: str, batch_id: str) -> DataFrame:
@@ -112,19 +108,11 @@ def jdbc_partition_count(config: AppConfig, cursor: EventCursor | None, batch_up
     return min(required, config.postgres.max_jdbc_partitions)
 
 
-def delta_table_exists(spark: SparkSession, path: str) -> bool:
-    try:
-        from delta.tables import DeltaTable
-    except ImportError as exc:
-        raise RuntimeError("Cần cài đặt thư viện delta-spark để ghi/merge Delta.") from exc
-    return DeltaTable.isDeltaTable(spark, path)
-
-
 def write_append_only(
     spark: SparkSession,
     df: DataFrame,
     config: AppConfig,
-    output_path: str,
+    reference: TableReference,
     table_exists: bool,
     *,
     table_name: str,
@@ -138,11 +126,11 @@ def write_append_only(
         "batch_id": batch_id,
         "last_event_id": cursor.last_event_id,
     }
-    writer = df.write.format(config.lakehouse.format).mode(mode).option("mergeSchema", "true")
+    writer = df.write.format("delta").mode(mode).option("mergeSchema", "true")
     if not table_exists:
         writer = writer.option("delta.enableChangeDataFeed", "true")
     with delta_commit_metadata(spark, metadata):
-        writer.save(output_path)
+        write_delta(writer, reference)
 
 
 def collect_change_event_stats(df: DataFrame, contract: BronzeTableContract) -> ChangeEventStats:

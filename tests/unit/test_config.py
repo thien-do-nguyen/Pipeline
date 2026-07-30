@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from ecommerce_pipeline.config import loader
 from ecommerce_pipeline.config.loader import ConfigError, load_config
 from ecommerce_pipeline.config.models import LakehouseConfig
 
@@ -26,7 +27,6 @@ spark:
     shared: base
 lakehouse:
   base_path: data/base
-  format: delta
 environment: base
 """
 
@@ -109,20 +109,36 @@ def test_postgres_jdbc_safety_defaults_are_validated(tmp_path: Path, monkeypatch
 def test_lakehouse_path_preserves_cloud_uri() -> None:
     config = LakehouseConfig(base_path="abfss://lakehouse@account.dfs.core.windows.net/ecommerce")
 
-    assert config.table_path("silver", "orders") == (
+    assert config.table_reference("silver", "orders").value == (
         "abfss://lakehouse@account.dfs.core.windows.net/ecommerce/silver/orders"
     )
+    assert config.table_reference("bronze", "orders").value.endswith("/bronze/batch/orders")
 
 
-def test_azure_config_uses_adls_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_azure_config_uses_unity_catalog_identifiers(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_postgres_env(monkeypatch)
-    monkeypatch.setenv("AZURE_STORAGE_ACCOUNT", "acct")
-    monkeypatch.setenv("AZURE_CONTAINER", "lakehouse")
-    monkeypatch.setenv("AZURE_STORAGE_AUTH_TYPE", "account_key")
-    monkeypatch.setenv("AZURE_STORAGE_ACCOUNT_KEY", "secret-key")
+    monkeypatch.setenv("DATABRICKS_CATALOG", "catalog")
+    monkeypatch.setenv("DATABRICKS_BRONZE_SCHEMA", "bronze")
+    monkeypatch.setenv("DATABRICKS_SILVER_SCHEMA", "silver")
+    monkeypatch.setenv("DATABRICKS_GOLD_SCHEMA", "gold")
+    monkeypatch.setenv(
+        "DATABRICKS_EXTERNAL_STORAGE_ROOT",
+        "abfss://lakehouse@storage.dfs.core.windows.net/ecommerce/dev",
+    )
 
     config = load_config("azure", dotenv_path=Path("/tmp/missing.env"))
 
-    assert config.lakehouse.base_path == "abfss://lakehouse@acct.dfs.core.windows.net/lakehouse"
-    assert config.spark.config["spark.hadoop.fs.azure.account.auth.type.acct.dfs.core.windows.net"] == "SharedKey"
-    assert config.spark.config["spark.hadoop.fs.azure.account.key.acct.dfs.core.windows.net"] == "secret-key"
+    reference = config.lakehouse.table_reference("silver", "orders")
+    assert reference.value == "catalog.silver.orders"
+    assert reference.is_catalog is True
+    assert reference.storage_path == ("abfss://lakehouse@storage.dfs.core.windows.net/ecommerce/dev/silver/orders")
+    assert config.application.logs_path == ("/Workspace/Users/2251120184@ut.edu.vn/ecommerce-pipeline/logs")
+    assert config.spark.master is None
+    assert config.spark.configure_delta_package is False
+    assert config.spark.stop_session is False
+    assert not any(key.startswith("spark.hadoop.fs.azure.account") for key in config.spark.config)
+
+
+def test_default_configs_have_one_project_source() -> None:
+    assert loader.PROJECT_CONFIG_DIR == loader.PROJECT_ROOT / "configs"
+    assert loader.DEFAULT_BASE_CONFIG == loader.PROJECT_CONFIG_DIR / "base.yaml"

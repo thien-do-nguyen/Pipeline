@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter
 from ecommerce_pipeline.config.loader import load_config
 from ecommerce_pipeline.config.models import LakehouseConfig, SparkConfig
 from ecommerce_pipeline.control.batch_runs import new_batch_id
@@ -60,7 +59,6 @@ def test_postgres_to_gold_is_incremental_idempotent_and_reconciled(tmp_path: Pat
         releases = GoldReleaseStore(spark, test_config)
         release_before = releases.latest()
         assert release_before is not None
-        assert not LakehouseAdapter(spark, test_config).table_exists("gold", "_publish_manifest")
         lakehouse = releases.snapshot()
         customer_versions_before = lakehouse.read_table("gold", "dim_customer").count()
         product_versions_before = lakehouse.read_table("gold", "dim_product").count()

@@ -5,11 +5,10 @@ from dataclasses import asdict, dataclass
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter, delta_table_state
+from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter, delta_table_state, read_delta
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
 from ecommerce_pipeline.control.gold_releases import GoldReleaseStore
-from ecommerce_pipeline.ingestion.batch.bronze_operations import bronze_batch_path
 from ecommerce_pipeline.pipelines.build_silver import SILVER_PIPELINE_NAME
 from ecommerce_pipeline.pipelines.quality import GoldQualityChecker, GoldQualityReport
 
@@ -35,9 +34,9 @@ def validate_batch_lakehouse(spark: SparkSession, config: AppConfig) -> BatchVal
     reports: list[LayerTableReport] = []
     current_silver_versions: dict[str, int] = {}
     for table_name, contract in SILVER_TABLES.items():
-        bronze_path = bronze_batch_path(config, table_name)
-        silver_path = config.lakehouse.table_path("silver", table_name)
-        bronze = spark.read.format(config.lakehouse.format).load(bronze_path)
+        bronze_path = config.lakehouse.table_reference("bronze", table_name)
+        silver_path = config.lakehouse.table_reference("silver", table_name)
+        bronze = read_delta(spark, bronze_path)
         silver = lakehouse.read_table("silver", table_name)
         bronze_state = delta_table_state(spark, bronze_path, pipeline="postgres_to_bronze")
         silver_state = delta_table_state(

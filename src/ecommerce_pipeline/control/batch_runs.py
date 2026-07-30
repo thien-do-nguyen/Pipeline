@@ -22,6 +22,7 @@ class BronzeTableResult:
     output_path: str
     record_count: int
     ingestion_type: str
+    delta_version: int
     batch_upper_bound_event_id: int | None = None
     previous_event_id: int | None = None
     current_event_id: int | None = None
@@ -89,7 +90,31 @@ def write_batch_run_status(
     if error:
         payload["error"] = error
     _write_json_atomic(output_path, payload)
+    if existing.get("status") != status or error:
+        _print_batch_status(payload, output_path)
     return output_path
+
+
+def _print_batch_status(payload: dict[str, object], output_path: str) -> None:
+    status = str(payload["status"])
+    parts = [
+        "[batch]",
+        f"status={status}",
+        f"id={payload['batch_id']}",
+        f"records={payload['total_records']}",
+    ]
+    timings = payload.get("timings_ms")
+    if isinstance(timings, dict):
+        total_ms = timings.get("total")
+        if isinstance(total_ms, int):
+            parts.append(f"elapsed={total_ms / 1000:.2f}s")
+    if status == "SUCCEEDED":
+        parts.append(f"summary={output_path}")
+    error = payload.get("error")
+    if isinstance(error, str):
+        compact_error = " ".join(error.split())
+        parts.append(f"error={compact_error[:300]}")
+    print(" ".join(parts), flush=True)
 
 
 def _validate_safe_name(value: str, label: str) -> None:

@@ -1,0 +1,43 @@
+resources:
+  jobs:
+    ecommerce_pipeline:
+      name: ecommerce-lakehouse-pipeline
+      max_concurrent_runs: 1
+      run_as:
+        user_name: ${var.run_principal}
+
+      tasks:
+        - task_key: run_pipeline
+          existing_cluster_id: 0729-012731-0heucyp7
+          python_wheel_task:
+            package_name: ecommerce_pipeline
+            entry_point: ecommerce-batch
+            parameters:
+              - --env
+              - ${workspace.file_path}/configs/azure.yaml
+              - --base-config
+              - ${workspace.file_path}/configs/base.yaml
+              - --mode
+              - all
+              - --postgres-host
+              - ${var.postgres_host}
+              - --postgres-port
+              - ${var.postgres_port}
+              - --postgres-database
+              - ${var.postgres_database}
+              - --postgres-user
+              - ${var.postgres_user}
+              - --uc-catalog
+              - ${var.uc_catalog}
+              - --bronze-schema
+              - ${resources.schemas.bronze.name}
+              - --silver-schema
+              - ${resources.schemas.silver.name}
+              - --gold-schema
+              - ${resources.schemas.gold.name}
+              - --external-storage-root
+              - ${resources.external_locations.pipeline.url}
+              - --secret-scope
+              - ${var.secret_scope}
+          libraries:
+            - whl: ../dist/*.whl

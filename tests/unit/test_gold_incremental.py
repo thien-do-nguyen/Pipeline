@@ -9,6 +9,8 @@ from ecommerce_pipeline.pipelines.build_gold import GoldBuilder
 
 def _builder() -> GoldBuilder:
     builder = object.__new__(GoldBuilder)
+    builder.silver_versions = None
+    builder.timings_ms = None
     builder._paths = Mock(return_value=["gold/fact_sales"])
     builder._run_full = Mock()
     builder._run_incremental = Mock()

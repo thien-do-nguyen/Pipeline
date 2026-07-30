@@ -8,23 +8,9 @@ from ecommerce_pipeline.contracts.gold_tables import GOLD_TABLES
 from ecommerce_pipeline.control.gold_releases import (
     GOLD_PIPELINE_NAME,
     RELEASE_SCHEMA_VERSION,
-    _decode_versions,
     _release_from_json,
     _validate_versions,
 )
-
-
-def test_manifest_versions_round_trip() -> None:
-    versions = {name: index for index, name in enumerate(GOLD_TABLES)}
-
-    assert (
-        _decode_versions(
-            json.dumps(versions),
-            "gold_versions",
-            expected=set(GOLD_TABLES),
-        )
-        == versions
-    )
 
 
 @pytest.mark.parametrize(
@@ -34,12 +20,12 @@ def test_manifest_versions_round_trip() -> None:
         {"fact_sales": True},
     ],
 )
-def test_manifest_rejects_invalid_delta_versions(versions: dict[str, int]) -> None:
+def test_release_marker_rejects_invalid_delta_versions(versions: dict[str, int]) -> None:
     with pytest.raises(ValueError, match="Invalid Gold release versions"):
         _validate_versions(versions, "gold_versions")
 
 
-def test_manifest_requires_the_complete_gold_table_set() -> None:
+def test_release_marker_requires_the_complete_gold_table_set() -> None:
     with pytest.raises(ValueError, match="table set mismatch"):
         _validate_versions({"fact_sales": 1}, "gold_versions", expected=set(GOLD_TABLES))
 

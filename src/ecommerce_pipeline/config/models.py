@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from dataclasses import dataclass
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from psycopg.conninfo import make_conninfo
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -94,20 +94,65 @@ class SparkConfig(FrozenConfigModel):
     master: str | None = None
     app_name: str = Field(min_length=1)
     configure_delta_package: bool = True
+    stop_session: bool = True
     config: dict[str, str] = Field(default_factory=dict)
 
 
-class LakehouseConfig(FrozenConfigModel):
-    base_path: str = Field(min_length=1)
-    format: Literal["delta"] = "delta"
+@dataclass(frozen=True)
+class TableReference:
+    value: str
+    is_catalog: bool
+    storage_path: str | None = None
 
-    def table_path(self, layer: str, table_name: str) -> str:
+
+class LakehouseConfig(FrozenConfigModel):
+    base_path: str | None = Field(default=None, min_length=1)
+    catalog: str | None = Field(default=None, min_length=1)
+    schemas: dict[str, str] = Field(default_factory=dict)
+    external_root: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_storage_mode(self) -> LakehouseConfig:
+        using_paths = self.base_path is not None
+        using_catalog = self.catalog is not None
+        if using_paths == using_catalog:
+            raise ValueError("Configure exactly one of lakehouse.base_path or lakehouse.catalog")
+        if using_catalog:
+            if not _IDENTIFIER.fullmatch(self.catalog or ""):
+                raise ValueError("lakehouse.catalog must be a safe Unity Catalog identifier")
+            if set(self.schemas) != {"bronze", "silver", "gold"}:
+                raise ValueError("lakehouse.schemas must define exactly bronze, silver, and gold")
+            for layer, schema in self.schemas.items():
+                if not _IDENTIFIER.fullmatch(schema):
+                    raise ValueError(f"Unsafe Unity Catalog schema for {layer}: {schema}")
+        elif self.schemas:
+            raise ValueError("lakehouse.schemas is only valid with lakehouse.catalog")
+        if self.external_root is not None and not using_catalog:
+            raise ValueError("lakehouse.external_root requires lakehouse.catalog")
+        return self
+
+    def table_reference(self, layer: str, table_name: str) -> TableReference:
         if layer not in {"bronze", "silver", "gold"}:
             raise ValueError(f"Unsupported lakehouse layer: {layer}")
         for value, label in ((layer, "layer"), (table_name, "table_name")):
             if not _IDENTIFIER.fullmatch(value):
                 raise ValueError(f"Unsafe {label}: {value}")
-        return "/".join((self.base_path.rstrip("/"), layer, table_name))
+        if self.catalog is not None:
+            return TableReference(
+                value=f"{self.catalog}.{self.schemas[layer]}.{table_name}",
+                is_catalog=True,
+                storage_path=(
+                    None
+                    if self.external_root is None
+                    else "/".join((self.external_root.rstrip("/"), layer, table_name))
+                ),
+            )
+        assert self.base_path is not None
+        parts = [self.base_path.rstrip("/"), layer]
+        if layer == "bronze":
+            parts.append("batch")
+        parts.append(table_name)
+        return TableReference(value="/".join(parts), is_catalog=False)
 
 
 class AppConfig(FrozenConfigModel):

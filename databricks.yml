@@ -1,0 +1,49 @@
+bundle:
+  name: azure-lakehouse-pipeline
+  engine: direct
+
+include:
+  - resources/*.yml
+
+artifacts:
+  default:
+    type: whl
+    path: .
+    dynamic_version: true
+    build: .venv/bin/python -m build --wheel --no-isolation
+
+variables:
+  postgres_host:
+    description: Azure PostgreSQL hostname reachable from Databricks.
+  postgres_port:
+    description: Azure PostgreSQL port.
+  postgres_database:
+    description: PostgreSQL database name.
+  postgres_user:
+    description: PostgreSQL user name.
+  run_principal:
+    description: Databricks user or service principal that runs the pipeline job.
+  uc_catalog:
+    description: Existing Unity Catalog catalog for governed external Delta tables.
+  uc_storage_credential:
+    description: Existing Unity Catalog storage credential backed by an Azure managed identity.
+  azure_storage_account:
+    description: StorageV2 account that owns the Delta data files.
+  azure_storage_container:
+    description: ADLS Gen2 container that owns the Delta data files.
+  bronze_schema:
+    description: Unity Catalog schema for Bronze tables.
+  silver_schema:
+    description: Unity Catalog schema for Silver tables.
+  gold_schema:
+    description: Unity Catalog schema for Gold tables.
+  secret_scope:
+    description: Databricks secret scope containing the PostgreSQL password.
+
+targets:
+  dev:
+    default: true
+    mode: development
+
+  prod:
+    mode: production
