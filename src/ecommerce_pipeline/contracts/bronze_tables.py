@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+BRONZE_SCHEMA_VERSION = 1
+
 
 @dataclass(frozen=True)
 class BronzeTableContract:

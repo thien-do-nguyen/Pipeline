@@ -1,19 +1,22 @@
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from pyspark.sql import SparkSession
 
+from ecommerce_pipeline.contracts.gold_tables import GOLD_TABLES
 from ecommerce_pipeline.control.gold_releases import GoldRelease
+from ecommerce_pipeline.pipelines import build_gold as gold_module
 from ecommerce_pipeline.pipelines.build_gold import GoldBuilder
 
 
 def _builder() -> GoldBuilder:
     builder = object.__new__(GoldBuilder)
-    builder.silver_versions = None
+    builder.silver_manifest = None
     builder.timings_ms = None
     builder._paths = Mock(return_value=["gold/fact_sales"])
-    builder._run_full = Mock()
-    builder._run_incremental = Mock()
+    builder._run_full = Mock(return_value=frozenset(GOLD_TABLES))
+    builder._run_incremental = Mock(return_value=frozenset({"fact_sales"}))
     builder._publish = Mock()
     builder._validate_progress = Mock()
     builder._validate_scd2_schemas = Mock()
@@ -30,7 +33,11 @@ def _builder() -> GoldBuilder:
 
 
 def _release(silver_versions: dict[str, int]) -> GoldRelease:
-    return GoldRelease(batch_id="previous", silver_versions=silver_versions, gold_versions={})
+    return GoldRelease(
+        batch_id="previous",
+        silver_versions=silver_versions,
+        gold_versions={name: index for index, name in enumerate(GOLD_TABLES)},
+    )
 
 
 def test_gold_skips_all_source_reads_when_silver_versions_are_current() -> None:
@@ -58,7 +65,12 @@ def test_gold_reads_only_changed_silver_version_ranges() -> None:
     incremental_changes = builder._run_incremental.call_args.args[0]
     assert set(incremental_changes) == {"payments"}
     incremental_changes["payments"].unpersist.assert_called_once_with()
-    builder._publish.assert_called_once_with(current, "batch-2")
+    builder._publish.assert_called_once_with(
+        current,
+        "batch-2",
+        frozenset({"fact_sales"}),
+        builder.releases.latest.return_value,
+    )
 
 
 def test_gold_full_builds_once_when_delta_progress_is_missing() -> None:
@@ -71,7 +83,12 @@ def test_gold_full_builds_once_when_delta_progress_is_missing() -> None:
 
     builder._run_full.assert_called_once_with()
     builder._run_incremental.assert_not_called()
-    builder._publish.assert_called_once_with(current, "batch-3")
+    builder._publish.assert_called_once_with(
+        current,
+        "batch-3",
+        frozenset(GOLD_TABLES),
+        None,
+    )
 
 
 def test_gold_does_not_publish_when_candidate_write_fails() -> None:
@@ -127,11 +144,40 @@ def test_incremental_checkpoints_reused_affected_order_ids() -> None:
     affected_plan.localCheckpoint.return_value = affected_ids
     builder._ids_if_changed = Mock(return_value=changed_order_ids)
     builder._affected_order_ids = Mock(return_value=affected_plan)
-    builder._apply_incremental = Mock()
+    changed_gold_tables = frozenset({"dim_date", "fact_sales"})
+    builder._apply_incremental = Mock(return_value=changed_gold_tables)
     changes = {"orders": Mock()}
 
-    builder._run_incremental(changes)
+    assert builder._run_incremental(changes) == changed_gold_tables
 
     affected_plan.localCheckpoint.assert_called_once_with(eager=True)
     builder._apply_incremental.assert_called_once_with(changes, changed_order_ids, affected_ids)
     affected_ids.unpersist.assert_called_once_with()
+
+
+def test_publisher_reads_versions_only_for_changed_gold_tables(monkeypatch: pytest.MonkeyPatch) -> None:
+    builder = object.__new__(GoldBuilder)
+    builder.spark = Mock()
+    builder.config = SimpleNamespace(
+        lakehouse=SimpleNamespace(
+            table_reference=lambda layer, table: f"{layer}.{table}",
+        )
+    )
+    builder.releases = Mock()
+    previous = _release({"orders": 4})
+    version_reader = Mock(return_value=99)
+    monkeypatch.setattr(gold_module, "latest_delta_version", version_reader)
+
+    builder._publish(
+        {"orders": 5},
+        "batch-5",
+        frozenset({"dim_payment"}),
+        previous,
+    )
+
+    version_reader.assert_called_once_with(builder.spark, "gold.dim_payment")
+    candidate = builder.releases.publish.call_args.args[0]
+    assert candidate.previous_versions == previous.gold_versions
+    assert candidate.committed_versions["dim_payment"] == 99
+    assert candidate.committed_versions["dim_customer"] == previous.gold_versions["dim_customer"]
+    assert candidate.quality_status == "PASSED"

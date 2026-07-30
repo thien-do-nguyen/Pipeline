@@ -13,6 +13,7 @@ from ecommerce_pipeline.adapters.lakehouse import (
 )
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.gold_tables import GOLD_TABLES
+from ecommerce_pipeline.control.manifests import GoldCandidateManifest
 
 GOLD_PIPELINE_NAME = "silver_to_gold"
 GOLD_RELEASE_PROPERTY = "pipeline.goldActiveRelease"
@@ -43,25 +44,27 @@ class GoldReleaseStore:
 
     def publish(
         self,
-        *,
-        batch_id: str,
-        silver_versions: dict[str, int],
-        gold_versions: dict[str, int],
+        candidate: GoldCandidateManifest,
     ) -> GoldRelease:
-        _validate_versions(silver_versions, "silver_versions")
-        _validate_versions(gold_versions, "gold_versions", expected=set(GOLD_TABLES))
-        current_gold_versions = dict(gold_versions)
+        _validate_versions(candidate.silver_versions, "silver_versions")
+        _validate_versions(candidate.committed_versions, "gold_versions", expected=set(GOLD_TABLES))
+        if not candidate.changed_tables <= set(GOLD_TABLES):
+            unknown = sorted(candidate.changed_tables - set(GOLD_TABLES))
+            raise ValueError(f"Unknown changed Gold tables: {unknown}")
+        current_gold_versions = dict(candidate.committed_versions)
         fact_path = self.config.lakehouse.table_reference("gold", "fact_sales")
         current_gold_versions["fact_sales"] += 1
         release = GoldRelease(
-            batch_id=batch_id,
-            silver_versions=dict(silver_versions),
+            batch_id=candidate.batch_id,
+            silver_versions=dict(candidate.silver_versions),
             gold_versions=current_gold_versions,
         )
         metadata: dict[str, object] = {
             "schema_version": RELEASE_SCHEMA_VERSION,
             "pipeline": GOLD_PIPELINE_NAME,
             "batch_id": release.batch_id,
+            "changed_gold_tables": sorted(candidate.changed_tables),
+            "quality_status": candidate.quality_status,
             "silver_versions": release.silver_versions,
             "gold_versions": release.gold_versions,
         }

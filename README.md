@@ -374,14 +374,26 @@ Mỗi bảng có progress độc lập nhưng progress nằm hoàn toàn trong D
 ```text
 PostgreSQL → Bronze:
   Bronze commitInfo.userMetadata.last_event_id
+  BronzeBatchManifest:
+    batch_id, changed_tables, record/operation counts,
+    event_id ranges, previous/committed versions, schema versions
 
 Bronze → Silver:
   Silver commitInfo.userMetadata.last_processed_bronze_version
+  Silver commitInfo.userMetadata.silver_schema_version
   + Bronze Change Data Feed [lastProcessedVersion + 1, latestVersion]
+  SilverBatchManifest:
+    batch_id, changed_tables, processed Bronze CDF ranges,
+    committed versions, schema versions, propagated source counts
 
 Silver → Gold:
   fact_sales TBLPROPERTIES.pipeline.goldActiveRelease.{silver_versions, gold_versions}
   + Silver Change Data Feed cho từng source table
+
+Gold write → Publisher:
+  GoldCandidateManifest:
+    changed tables, previous/committed Gold versions,
+    quality status, release batch_id
 ```
 
 Run bình thường không scan full Bronze Parquet. Silver chỉ đọc các file change của những Delta version mới rồi
@@ -395,9 +407,11 @@ vào Delta log. Gold đọc full Silver đúng một lần khi chưa có progres
 
 Gold progress và publish state dùng chung một release marker, không có checkpoint file hay Delta table điều phối
 riêng. Candidate tables được ghi trước; sau khi quality gate pass, một metadata-only `ALTER TABLE SET TBLPROPERTIES`
-commit ghi marker vào `_delta_log` của `fact_sales`. Marker chứa version chính xác của cả 11 Gold tables. Đọc marker
-từ current Delta metadata không scan Parquet và cũng không scan toàn bộ history. Consumer chụp marker một lần rồi
-đọc mọi table bằng `versionAsOf`: trước commit thấy toàn bộ release cũ, sau commit thấy toàn bộ release mới.
+commit ghi marker vào `_delta_log` của `fact_sales`. Publisher tái sử dụng version từ release trước cho bảng không
+đổi và chỉ đọc latest history của các Gold table vừa được ghi. Marker vẫn chứa version chính xác của cả 11 Gold
+tables. Đọc marker từ current Delta metadata không scan Parquet và cũng không scan toàn bộ history. Consumer chụp
+marker một lần rồi đọc mọi table bằng `versionAsOf`: trước commit thấy toàn bộ release cũ, sau commit thấy toàn bộ
+release mới.
 
 Nếu job lỗi giữa chừng, marker cũ giữ nguyên nên dữ liệu candidate chưa hoàn tất không được publish. Retry đọc
 lại cùng Silver CDF range và các Delta merge/delete theo key vẫn idempotent. Trong code Python, entrypoint đọc

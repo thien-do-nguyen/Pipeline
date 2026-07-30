@@ -12,12 +12,8 @@ from pyspark.sql import SparkSession
 
 from ecommerce_pipeline.config.loader import load_config
 from ecommerce_pipeline.config.models import AppConfig
-from ecommerce_pipeline.control.batch_runs import (
-    BronzeTableResult,
-    local_pipeline_lock,
-    new_batch_id,
-    write_batch_run_status,
-)
+from ecommerce_pipeline.control.batch_runs import local_pipeline_lock, new_batch_id, write_batch_run_status
+from ecommerce_pipeline.control.manifests import BronzeBatchManifest, BronzeTableResult, SilverBatchManifest
 from ecommerce_pipeline.ingestion.batch.extract_to_bronze import extract_all_to_bronze
 from ecommerce_pipeline.pipelines.build_gold import build_gold
 from ecommerce_pipeline.pipelines.build_silver import build_silver
@@ -117,10 +113,12 @@ def run_mode(
     timings_ms: dict[str, int],
 ) -> tuple[list[BronzeTableResult], dict[str, list[str]]]:
     bronze_results: list[BronzeTableResult] = []
+    bronze_manifest: BronzeBatchManifest | None = None
     outputs: dict[str, list[str]] = {}
     if args.mode in {"bronze", "all"}:
         started = perf_counter()
-        bronze_results = extract_all_to_bronze(spark, config, batch_id, args.tables)
+        bronze_manifest = extract_all_to_bronze(spark, config, batch_id, args.tables)
+        bronze_results = bronze_manifest.results
         timings_ms["bronze"] = round((perf_counter() - started) * 1000)
         outputs["bronze"] = [result.output_path for result in bronze_results]
         changed = [f"{result.table_name}:{result.record_count}" for result in bronze_results if result.record_count]
@@ -147,22 +145,19 @@ def run_mode(
             print("[pipeline] no changes; skipped=silver,gold", flush=True)
             return bronze_results, outputs
 
-    silver_versions: dict[str, int] | None = None
+    silver_manifest: SilverBatchManifest | None = None
     if args.mode in {"silver", "all"}:
         started = perf_counter()
         silver_tables = args.tables if args.mode == "silver" else None
-        silver_result = build_silver(
+        silver_manifest = build_silver(
             spark,
             config,
             silver_tables,
             batch_id=batch_id,
             full_rebuild=args.full_rebuild_silver,
-            bronze_versions=(
-                {result.table_name: result.delta_version for result in bronze_results} if args.mode == "all" else None
-            ),
+            bronze_manifest=bronze_manifest if args.mode == "all" else None,
         )
-        outputs["silver"] = silver_result.outputs
-        silver_versions = silver_result.versions
+        outputs["silver"] = silver_manifest.outputs
         timings_ms["silver"] = round((perf_counter() - started) * 1000)
         print(
             f"[silver] tables={len(outputs['silver'])} elapsed={_seconds(timings_ms['silver'])}",
@@ -186,7 +181,7 @@ def run_mode(
             batch_id=batch_id,
             full_rebuild=args.full_rebuild_gold,
             timings_ms=timings_ms,
-            silver_versions=silver_versions,
+            silver_manifest=silver_manifest,
         )
         timings_ms["gold"] = round((perf_counter() - started) * 1000)
         print(
