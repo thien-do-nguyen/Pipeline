@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from time import perf_counter
 
@@ -16,7 +16,8 @@ from ecommerce_pipeline.adapters.lakehouse import (
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.gold_tables import GOLD_TABLES, SCD2_DIMENSIONS
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
-from ecommerce_pipeline.control.gold_releases import GoldReleaseStore
+from ecommerce_pipeline.control.gold_releases import GoldRelease, GoldReleaseStore
+from ecommerce_pipeline.control.manifests import GoldCandidateManifest, SilverBatchManifest
 from ecommerce_pipeline.pipelines.quality import GoldQualityChecker
 from ecommerce_pipeline.transformations.gold.dimensions import (
     build_dim_category,
@@ -31,6 +32,7 @@ from ecommerce_pipeline.transformations.gold.dimensions import (
     build_dim_time,
 )
 from ecommerce_pipeline.transformations.gold.fact_sales import build_fact_sales
+from ecommerce_pipeline.transformations.silver.common import SILVER_SCHEMA_VERSION
 
 FACT_SOURCE_TABLES = {
     "orders",
@@ -48,14 +50,14 @@ class GoldBuilder:
         spark: SparkSession,
         config: AppConfig,
         timings_ms: dict[str, int] | None = None,
-        silver_versions: Mapping[str, int] | None = None,
+        silver_manifest: SilverBatchManifest | None = None,
     ) -> None:
         self.spark = spark
         self.config = config
         self.lakehouse = LakehouseAdapter(spark, config)
         self.releases = GoldReleaseStore(spark, config)
         self.timings_ms = timings_ms
-        self.silver_versions = None if silver_versions is None else dict(silver_versions)
+        self.silver_manifest = silver_manifest
 
     def run(self, *, batch_id: str = "standalone", full_rebuild: bool = False) -> list[str]:
         with self._timed("gold.metadata"):
@@ -64,9 +66,9 @@ class GoldBuilder:
         previous_versions = None if previous_release is None else previous_release.silver_versions
         if full_rebuild or previous_versions is None:
             with self._timed("gold.full_build"):
-                self._run_full()
+                changed_gold_tables = self._run_full()
             with self._timed("gold.publish"):
-                self._publish(current_versions, batch_id)
+                self._publish(current_versions, batch_id, changed_gold_tables, previous_release)
             return self._paths()
 
         self._validate_progress(previous_versions, current_versions)
@@ -84,15 +86,15 @@ class GoldBuilder:
             dataframe.cache()
         try:
             with self._timed("gold.incremental"):
-                self._run_incremental(changes)
+                changed_gold_tables = self._run_incremental(changes)
             with self._timed("gold.publish"):
-                self._publish(current_versions, batch_id)
+                self._publish(current_versions, batch_id, changed_gold_tables, previous_release)
         finally:
             for dataframe in owned_cache:
                 dataframe.unpersist()
         return self._paths()
 
-    def _run_full(self) -> None:
+    def _run_full(self) -> frozenset[str]:
         tables = self._read_sources()
         scd2_outputs = {
             "dim_customer": build_dim_customer(tables["app_users"], self.spark),
@@ -128,12 +130,13 @@ class GoldBuilder:
         for table_name, (df, keys) in outputs.items():
             self.lakehouse.upsert_table(df, "gold", table_name, keys, delete_not_matched_by_source=True)
         GoldQualityChecker(self.lakehouse).run(tables)
+        return frozenset(GOLD_TABLES)
 
-    def _run_incremental(self, changes: dict[str, DataFrame]) -> None:
+    def _run_incremental(self, changes: dict[str, DataFrame]) -> frozenset[str]:
         changed_order_ids = self._ids_if_changed(changes, "orders", "order_id")
         affected_order_ids = self._affected_order_ids(changes).localCheckpoint(eager=True)
         try:
-            self._apply_incremental(changes, changed_order_ids, affected_order_ids)
+            return self._apply_incremental(changes, changed_order_ids, affected_order_ids)
         finally:
             affected_order_ids.unpersist()
 
@@ -142,20 +145,23 @@ class GoldBuilder:
         changes: dict[str, DataFrame],
         changed_order_ids: DataFrame,
         affected_order_ids: DataFrame,
-    ) -> None:
+    ) -> frozenset[str]:
         dimensions_started = perf_counter()
         changed_tables = set(changes)
+        changed_gold_tables: set[str] = set()
         changed_scd2: list[str] = []
         if "app_users" in changes:
             user_ids = self._ids(changes["app_users"], "user_id")
             users = self._filter_current("app_users", "user_id", user_ids)
             self._merge_scd2("dim_customer", build_dim_customer(users, self.spark))
             changed_scd2.append("dim_customer")
+            changed_gold_tables.add("dim_customer")
 
         if "orders" in changes:
             orders = self._filter_current("orders", "order_id", changed_order_ids)
             self.lakehouse.upsert_table(build_dim_date(orders, self.spark), "gold", "dim_date", ["date_key"])
             self.lakehouse.upsert_table(build_dim_time(orders, self.spark), "gold", "dim_time", ["time_key"])
+            changed_gold_tables.update(("dim_date", "dim_time"))
         else:
             orders = self._empty_current("orders")
 
@@ -168,18 +174,21 @@ class GoldBuilder:
                 "dim_location",
                 ["location_key"],
             )
+            changed_gold_tables.add("dim_location")
 
         if "shops" in changes:
             shop_ids = self._ids(changes["shops"], "shop_id")
             shops = self._filter_current("shops", "shop_id", shop_ids)
             self._merge_scd2("dim_shop", build_dim_shop(shops, self.spark))
             changed_scd2.append("dim_shop")
+            changed_gold_tables.add("dim_shop")
 
         if "categories" in changes:
             category_ids = self._affected_category_ids(changes["categories"])
             categories = self._category_scope(category_ids)
             self._merge_scd2("dim_category", build_dim_category(categories, self.spark))
             changed_scd2.append("dim_category")
+            changed_gold_tables.add("dim_category")
 
         if changed_tables & {"products", "product_variants"}:
             product_ids = self._affected_product_ids(changes)
@@ -190,6 +199,7 @@ class GoldBuilder:
                 build_dim_product(products, variants, self.spark),
             )
             changed_scd2.append("dim_product")
+            changed_gold_tables.add("dim_product")
 
         if changed_tables & {"order_vouchers", "vouchers"}:
             order_vouchers, vouchers = self._promotion_scope(affected_order_ids)
@@ -199,6 +209,7 @@ class GoldBuilder:
                 "dim_promotion",
                 ["promotion_key"],
             )
+            changed_gold_tables.add("dim_promotion")
 
         if "payments" in changes:
             payment_ids = self._ids(changes["payments"], "payment_id")
@@ -209,6 +220,7 @@ class GoldBuilder:
                 "dim_payment",
                 ["payment_key"],
             )
+            changed_gold_tables.add("dim_payment")
 
         if "shipments" in changes:
             shipment_ids = self._ids(changes["shipments"], "shipment_id")
@@ -219,6 +231,7 @@ class GoldBuilder:
                 "dim_shipping",
                 ["shipping_key"],
             )
+            changed_gold_tables.add("dim_shipping")
 
         GoldQualityChecker(self.lakehouse).validate_scd2(changed_scd2)
         self._record_elapsed("gold.dimensions", dimensions_started)
@@ -262,12 +275,14 @@ class GoldBuilder:
                         fact_keys,
                         delete_keys=stale_fact_keys,
                     )
+                    changed_gold_tables.add("fact_sales")
             finally:
                 if facts is not None:
                     facts.unpersist()
                 fact_sources["orders"].unpersist()
                 fact_sources["order_items"].unpersist()
             self._record_elapsed("gold.fact_total", fact_started)
+        return frozenset(changed_gold_tables)
 
     def _affected_order_ids(self, changes: dict[str, DataFrame]) -> DataFrame:
         frames = [
@@ -332,12 +347,20 @@ class GoldBuilder:
         }
 
     def _current_silver_versions(self) -> dict[str, int]:
-        if self.silver_versions is not None:
-            if set(self.silver_versions) != set(SILVER_TABLES):
-                missing = sorted(set(SILVER_TABLES) - set(self.silver_versions))
-                extra = sorted(set(self.silver_versions) - set(SILVER_TABLES))
+        if self.silver_manifest is not None:
+            versions = self.silver_manifest.committed_versions
+            if set(versions) != set(SILVER_TABLES):
+                missing = sorted(set(SILVER_TABLES) - set(versions))
+                extra = sorted(set(versions) - set(SILVER_TABLES))
                 raise ValueError(f"Invalid propagated Silver versions: missing={missing}, extra={extra}")
-            return self.silver_versions
+            invalid_schemas = {
+                name: result.schema_version
+                for name, result in self.silver_manifest.tables.items()
+                if result.schema_version != SILVER_SCHEMA_VERSION
+            }
+            if invalid_schemas:
+                raise RuntimeError(f"Invalid propagated Silver schema versions: {invalid_schemas}")
+            return versions
         return self._silver_versions()
 
     def _silver_versions(self) -> dict[str, int]:
@@ -361,19 +384,36 @@ class GoldBuilder:
         if ahead:
             raise RuntimeError(f"Gold progress is ahead of Silver: {ahead}")
 
-    def _publish(self, silver_versions: dict[str, int], batch_id: str) -> None:
-        gold_versions = {
-            table_name: latest_delta_version(
-                self.spark,
-                self.config.lakehouse.table_reference("gold", table_name),
-            )
-            for table_name in GOLD_TABLES
-        }
-        self.releases.publish(
-            batch_id=batch_id,
-            silver_versions=silver_versions,
-            gold_versions=gold_versions,
+    def _publish(
+        self,
+        silver_versions: dict[str, int],
+        batch_id: str,
+        changed_tables: frozenset[str],
+        previous_release: GoldRelease | None,
+    ) -> None:
+        previous_versions = {} if previous_release is None else dict(previous_release.gold_versions)
+        gold_versions = dict(previous_versions)
+        gold_versions.update(
+            {
+                table_name: latest_delta_version(
+                    self.spark,
+                    self.config.lakehouse.table_reference("gold", table_name),
+                )
+                for table_name in changed_tables
+            }
         )
+        missing = sorted(set(GOLD_TABLES) - set(gold_versions))
+        if missing:
+            raise RuntimeError(f"Gold candidate is missing committed versions: {missing}")
+        candidate = GoldCandidateManifest(
+            batch_id=batch_id,
+            changed_tables=changed_tables,
+            previous_versions=previous_versions,
+            committed_versions=gold_versions,
+            silver_versions=silver_versions,
+            quality_status="PASSED",
+        )
+        self.releases.publish(candidate)
 
     def _read_changes(self, table_name: str, starting_version: int, ending_version: int) -> DataFrame:
         return read_delta(
@@ -525,9 +565,9 @@ def build_gold(
     batch_id: str = "standalone",
     full_rebuild: bool = False,
     timings_ms: dict[str, int] | None = None,
-    silver_versions: Mapping[str, int] | None = None,
+    silver_manifest: SilverBatchManifest | None = None,
 ) -> list[str]:
-    return GoldBuilder(spark, config, timings_ms, silver_versions).run(
+    return GoldBuilder(spark, config, timings_ms, silver_manifest).run(
         batch_id=batch_id,
         full_rebuild=full_rebuild,
     )

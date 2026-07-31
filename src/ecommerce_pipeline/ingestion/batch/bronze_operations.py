@@ -9,7 +9,7 @@ from pyspark.sql import functions as F
 from ecommerce_pipeline.adapters.lakehouse import delta_commit_metadata, write_delta
 from ecommerce_pipeline.adapters.postgres import PostgresReader
 from ecommerce_pipeline.config.models import AppConfig, TableReference
-from ecommerce_pipeline.contracts.bronze_tables import BronzeTableContract
+from ecommerce_pipeline.contracts.bronze_tables import BRONZE_SCHEMA_VERSION, BronzeTableContract
 from ecommerce_pipeline.contracts.change_events import ChangeOperation, EventCursor
 
 CHANGE_EVENT_TABLE = "change_events"
@@ -19,6 +19,7 @@ CHANGE_EVENT_TABLE = "change_events"
 class ChangeEventStats:
     record_count: int
     last_event_id: int | None
+    operation_counts: dict[str, int]
 
 
 def add_bronze_metadata(df: DataFrame, config: AppConfig, table_name: str, batch_id: str) -> DataFrame:
@@ -125,6 +126,7 @@ def write_append_only(
         "source_table": table_name,
         "batch_id": batch_id,
         "last_event_id": cursor.last_event_id,
+        "bronze_schema_version": BRONZE_SCHEMA_VERSION,
     }
     writer = df.write.format("delta").mode(mode).option("mergeSchema", "true")
     if not table_exists:
@@ -152,6 +154,12 @@ def collect_change_event_stats(df: DataFrame, contract: BronzeTableContract) -> 
         F.count(F.lit(1)).alias("record_count"),
         F.max("_event_id").alias("last_event_id"),
         F.sum(F.when(invalid_condition, F.lit(1)).otherwise(F.lit(0))).alias("invalid_count"),
+        *(
+            F.sum(F.when(F.col("_operation") == operation.value, F.lit(1)).otherwise(F.lit(0))).alias(
+                f"operation_{operation.value.lower()}"
+            )
+            for operation in ChangeOperation
+        ),
     ).first()
     if row is None:
         raise RuntimeError(f"Change-event metrics are unavailable for: {contract.table_name}")
@@ -160,6 +168,9 @@ def collect_change_event_stats(df: DataFrame, contract: BronzeTableContract) -> 
     return ChangeEventStats(
         record_count=int(row["record_count"]),
         last_event_id=None if row["last_event_id"] is None else int(row["last_event_id"]),
+        operation_counts={
+            operation.value: int(row[f"operation_{operation.value.lower()}"] or 0) for operation in ChangeOperation
+        },
     )
 
 

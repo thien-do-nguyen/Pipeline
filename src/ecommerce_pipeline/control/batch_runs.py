@@ -5,27 +5,16 @@ import os
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from ecommerce_pipeline.control.manifests import BronzeTableResult
+
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-
-
-@dataclass(frozen=True)
-class BronzeTableResult:
-    batch_id: str
-    table_name: str
-    output_path: str
-    record_count: int
-    ingestion_type: str
-    delta_version: int
-    batch_upper_bound_event_id: int | None = None
-    previous_event_id: int | None = None
-    current_event_id: int | None = None
 
 
 def _now(timezone_name: str = DEFAULT_TIMEZONE) -> datetime:

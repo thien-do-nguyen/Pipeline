@@ -14,10 +14,16 @@ from ecommerce_pipeline.adapters.lakehouse import (
 )
 from ecommerce_pipeline.adapters.postgres import PostgresReader
 from ecommerce_pipeline.config.models import AppConfig, TableReference
-from ecommerce_pipeline.contracts.bronze_tables import BRONZE_TABLES, BronzeTableContract, get_bronze_contract
-from ecommerce_pipeline.contracts.change_events import EventCursor
-from ecommerce_pipeline.control.batch_runs import BronzeTableResult
+from ecommerce_pipeline.contracts.bronze_tables import (
+    BRONZE_SCHEMA_VERSION,
+    BRONZE_TABLES,
+    BronzeTableContract,
+    get_bronze_contract,
+)
+from ecommerce_pipeline.contracts.change_events import ChangeOperation, EventCursor
+from ecommerce_pipeline.control.manifests import BronzeBatchManifest, BronzeTableResult
 from ecommerce_pipeline.ingestion.batch.bronze_operations import (
+    ChangeEventStats,
     add_bronze_metadata,
     change_event_query,
     collect_change_event_stats,
@@ -43,14 +49,15 @@ class BronzeExtractor:
         self.batch_id = batch_id
         self.reader = PostgresReader(spark, config)
 
-    def run(self, table_names: list[str]) -> list[BronzeTableResult]:
+    def run(self, table_names: list[str]) -> BronzeBatchManifest:
         states = [self._table_state(table_name) for table_name in table_names]
         upper_bounds = read_batch_upper_bounds(
             self.reader,
             self.config,
             {state.table_name: state.cursor for state in states},
         )
-        return [self._run_table(state, upper_bounds[state.table_name]) for state in states]
+        results = [self._run_table(state, upper_bounds[state.table_name]) for state in states]
+        return BronzeBatchManifest.from_results(self.batch_id, results)
 
     def _table_state(self, table_name: str) -> _BronzeState:
         reference = self.config.lakehouse.table_reference("bronze", table_name)
@@ -68,12 +75,20 @@ class BronzeExtractor:
         previous = state.cursor
         contract = get_bronze_contract(table_name)
         if table_exists and upper_bound is None:
-            return self._result(state, previous, None, 0)
+            return self._result(
+                state,
+                previous,
+                None,
+                0,
+                {operation.value: 0 for operation in ChangeOperation},
+            )
 
-        source_df, record_count, last_event_id = self._materialize_events(contract, previous, upper_bound)
+        source_df, stats = self._materialize_events(contract, previous, upper_bound)
         try:
-            current = EventCursor(last_event_id) if last_event_id is not None else previous or EventCursor(0)
-            if record_count > 0 or not table_exists:
+            current = (
+                EventCursor(stats.last_event_id) if stats.last_event_id is not None else previous or EventCursor(0)
+            )
+            if stats.record_count > 0 or not table_exists:
                 write_append_only(
                     self.spark,
                     source_df,
@@ -91,7 +106,8 @@ class BronzeExtractor:
             state,
             current,
             upper_bound,
-            record_count,
+            stats.record_count,
+            stats.operation_counts,
         )
 
     def _result(
@@ -100,6 +116,7 @@ class BronzeExtractor:
         current: EventCursor | None,
         upper_bound: int | None,
         record_count: int,
+        operation_counts: dict[str, int],
     ) -> BronzeTableResult:
         table_exists = state.delta_state is not None
         wrote_commit = record_count > 0 or not table_exists
@@ -112,6 +129,9 @@ class BronzeExtractor:
             record_count=record_count,
             ingestion_type="incremental" if table_exists else "initial",
             delta_version=delta_version,
+            previous_delta_version=physical_version,
+            operation_counts=operation_counts,
+            schema_version=BRONZE_SCHEMA_VERSION,
             batch_upper_bound_event_id=upper_bound,
             previous_event_id=state.cursor.last_event_id if state.cursor else None,
             current_event_id=current.last_event_id if current else None,
@@ -144,12 +164,12 @@ class BronzeExtractor:
         contract: BronzeTableContract,
         cursor: EventCursor | None,
         upper_bound: int | None,
-    ) -> tuple[DataFrame, int, int | None]:
-        def materialize() -> tuple[DataFrame, int, int | None]:
+    ) -> tuple[DataFrame, ChangeEventStats]:
+        def materialize() -> tuple[DataFrame, ChangeEventStats]:
             source_df = self._read_events(contract, cursor, upper_bound).cache()
             try:
                 stats = collect_change_event_stats(source_df, contract)
-                return source_df, stats.record_count, stats.last_event_id
+                return source_df, stats
             except Exception:
                 source_df.unpersist()
                 raise
@@ -187,6 +207,7 @@ class BronzeExtractor:
             "source_table": table_name,
             "batch_id": self.batch_id,
             "last_event_id": cursor.last_event_id,
+            "bronze_schema_version": BRONZE_SCHEMA_VERSION,
             "migration": "legacy_bronze_cursor",
         }
         with delta_commit_metadata(self.spark, metadata):
@@ -204,7 +225,7 @@ def extract_all_to_bronze(
     config: AppConfig,
     batch_id: str,
     table_names: list[str] | None = None,
-) -> list[BronzeTableResult]:
+) -> BronzeBatchManifest:
     tables = list(BRONZE_TABLES) if table_names is None else table_names
     unknown = sorted(set(tables) - set(BRONZE_TABLES))
     if unknown:

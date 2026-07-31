@@ -10,9 +10,13 @@ import pytest
 from pyspark.sql import SparkSession
 
 from ecommerce_pipeline.config.loader import load_config
-from ecommerce_pipeline.control.batch_runs import BronzeTableResult
+from ecommerce_pipeline.control.manifests import (
+    BronzeBatchManifest,
+    BronzeTableResult,
+    SilverBatchManifest,
+    SilverTableResult,
+)
 from ecommerce_pipeline.jobs import run_batch
-from ecommerce_pipeline.pipelines.build_silver import SilverBuildResult
 
 
 def test_prepare_databricks_environment_sets_non_secret_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -101,8 +105,10 @@ def test_all_mode_stops_after_unchanged_bronze(monkeypatch: pytest.MonkeyPatch) 
         record_count=0,
         ingestion_type="incremental",
         delta_version=7,
+        previous_delta_version=7,
     )
-    monkeypatch.setattr(run_batch, "extract_all_to_bronze", Mock(return_value=[result]))
+    bronze_manifest = BronzeBatchManifest.from_results("batch", [result])
+    monkeypatch.setattr(run_batch, "extract_all_to_bronze", Mock(return_value=bronze_manifest))
     silver = Mock()
     gold = Mock()
     monkeypatch.setattr(run_batch, "build_silver", silver)
@@ -134,14 +140,28 @@ def test_all_mode_propagates_layer_versions(monkeypatch: pytest.MonkeyPatch) -> 
         record_count=2,
         ingestion_type="incremental",
         delta_version=8,
+        previous_delta_version=7,
+        operation_counts={"INSERT": 2},
     )
-    monkeypatch.setattr(run_batch, "extract_all_to_bronze", Mock(return_value=[bronze]))
-    silver = Mock(
-        return_value=SilverBuildResult(
-            outputs=["catalog.silver.orders"],
-            versions={"orders": 5},
-        )
+    bronze_manifest = BronzeBatchManifest.from_results("batch", [bronze])
+    monkeypatch.setattr(run_batch, "extract_all_to_bronze", Mock(return_value=bronze_manifest))
+    silver_manifest = SilverBatchManifest(
+        batch_id="batch",
+        tables={
+            "orders": SilverTableResult(
+                table_name="orders",
+                output_path="catalog.silver.orders",
+                processing_mode="cdf",
+                bronze_starting_version=8,
+                bronze_ending_version=8,
+                committed_version=5,
+                schema_version=1,
+                source_record_count=2,
+                source_operation_counts={"INSERT": 2},
+            )
+        },
     )
+    silver = Mock(return_value=silver_manifest)
     gold = Mock(return_value=["catalog.gold.fact_sales"])
     monkeypatch.setattr(run_batch, "build_silver", silver)
     monkeypatch.setattr(run_batch, "build_gold", gold)
@@ -158,5 +178,5 @@ def test_all_mode_propagates_layer_versions(monkeypatch: pytest.MonkeyPatch) -> 
 
     run_batch.run_mode(Mock(), args, config, "batch", {})
 
-    assert silver.call_args.kwargs["bronze_versions"] == {"orders": 8}
-    assert gold.call_args.kwargs["silver_versions"] == {"orders": 5}
+    assert silver.call_args.kwargs["bronze_manifest"] is bronze_manifest
+    assert gold.call_args.kwargs["silver_manifest"] is silver_manifest

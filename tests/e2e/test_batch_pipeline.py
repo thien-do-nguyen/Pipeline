@@ -50,10 +50,16 @@ def test_postgres_to_gold_is_incremental_idempotent_and_reconciled(tmp_path: Pat
     )
     spark = build_spark(test_config)
     try:
-        first = extract_all_to_bronze(spark, test_config, new_batch_id(test_config.application.timezone))
-        assert all(result.record_count > 0 for result in first)
-        build_silver(spark, test_config, batch_id=new_batch_id(test_config.application.timezone))
-        build_gold(spark, test_config)
+        first_batch_id = new_batch_id(test_config.application.timezone)
+        first = extract_all_to_bronze(spark, test_config, first_batch_id)
+        assert all(result.record_count > 0 for result in first.results)
+        first_silver = build_silver(
+            spark,
+            test_config,
+            batch_id=first_batch_id,
+            bronze_manifest=first,
+        )
+        build_gold(spark, test_config, batch_id=first_batch_id, silver_manifest=first_silver)
         first_report = validate_batch_lakehouse(spark, test_config)
 
         releases = GoldReleaseStore(spark, test_config)
@@ -68,17 +74,24 @@ def test_postgres_to_gold_is_incremental_idempotent_and_reconciled(tmp_path: Pat
         fact_rows_before = fact_before.count()
         created_at_before = fact_before.agg({"created_at": "min"}).first()[0]
 
-        second = extract_all_to_bronze(spark, test_config, new_batch_id(test_config.application.timezone))
-        assert all(result.record_count == 0 for result in second)
-        build_silver(spark, test_config, batch_id=new_batch_id(test_config.application.timezone))
-        build_gold(spark, test_config)
+        second_batch_id = new_batch_id(test_config.application.timezone)
+        second = extract_all_to_bronze(spark, test_config, second_batch_id)
+        assert all(result.record_count == 0 for result in second.results)
+        second_silver = build_silver(
+            spark,
+            test_config,
+            batch_id=second_batch_id,
+            bronze_manifest=second,
+        )
+        build_gold(spark, test_config, batch_id=second_batch_id, silver_manifest=second_silver)
         assert lakehouse.read_table("gold", "fact_sales").count() == fact_rows_before
         assert lakehouse.read_table("gold", "fact_sales").agg({"created_at": "min"}).first()[0] == created_at_before
         assert lakehouse.read_table("gold", "dim_customer").count() == customer_versions_before
 
         seed_continuous("local", seed=99, orders_per_batch=2, interval_seconds=0, max_batches=1)
-        third = extract_all_to_bronze(spark, test_config, new_batch_id(test_config.application.timezone))
-        changed = {result.table_name: result.record_count for result in third}
+        third_batch_id = new_batch_id(test_config.application.timezone)
+        third = extract_all_to_bronze(spark, test_config, third_batch_id)
+        changed = {result.table_name: result.record_count for result in third.results}
         assert changed["orders"] == 4  # two inserts, one lifecycle update and one hard delete
         assert changed["app_users"] == 1
         assert changed["user_addresses"] == 1
@@ -90,8 +103,13 @@ def test_postgres_to_gold_is_incremental_idempotent_and_reconciled(tmp_path: Pat
         assert changed["payments"] == 4
         assert changed["shipments"] == 4
 
-        build_silver(spark, test_config, batch_id=new_batch_id(test_config.application.timezone))
-        build_gold(spark, test_config)
+        third_silver = build_silver(
+            spark,
+            test_config,
+            batch_id=third_batch_id,
+            bronze_manifest=third,
+        )
+        build_gold(spark, test_config, batch_id=third_batch_id, silver_manifest=third_silver)
         final_report = validate_batch_lakehouse(spark, test_config)
         assert lakehouse.read_table("gold", "dim_customer").count() == customer_versions_before
         assert lakehouse.read_table("gold", "fact_sales").count() == fact_rows_before

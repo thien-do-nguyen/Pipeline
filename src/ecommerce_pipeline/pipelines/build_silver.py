@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+from typing import Literal
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -13,7 +12,13 @@ from ecommerce_pipeline.adapters.lakehouse import (
     try_delta_table_state,
 )
 from ecommerce_pipeline.config.models import AppConfig
+from ecommerce_pipeline.contracts.bronze_tables import BRONZE_SCHEMA_VERSION
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES, SilverTableContract, get_silver_contract
+from ecommerce_pipeline.control.manifests import (
+    BronzeBatchManifest,
+    SilverBatchManifest,
+    SilverTableResult,
+)
 from ecommerce_pipeline.transformations.silver.common import SILVER_SCHEMA_VERSION
 from ecommerce_pipeline.transformations.silver.customers import supports_customer_table, transform_customer_table
 from ecommerce_pipeline.transformations.silver.sales import supports_sales_table, transform_sales_table
@@ -21,23 +26,17 @@ from ecommerce_pipeline.transformations.silver.sales import supports_sales_table
 SILVER_PIPELINE_NAME = "bronze_to_silver"
 
 
-@dataclass(frozen=True)
-class SilverBuildResult:
-    outputs: list[str]
-    versions: dict[str, int]
-
-
 class SilverBuilder:
     def __init__(
         self,
         spark: SparkSession,
         config: AppConfig,
-        bronze_versions: Mapping[str, int] | None = None,
+        bronze_manifest: BronzeBatchManifest | None = None,
     ) -> None:
         self.spark = spark
         self.config = config
         self.lakehouse = LakehouseAdapter(spark, config)
-        self.bronze_versions = None if bronze_versions is None else dict(bronze_versions)
+        self.bronze_manifest = bronze_manifest
 
     def run(
         self,
@@ -45,18 +44,18 @@ class SilverBuilder:
         *,
         batch_id: str,
         full_rebuild: bool = False,
-    ) -> SilverBuildResult:
+    ) -> SilverBatchManifest:
         tables = list(SILVER_TABLES) if table_names is None else table_names
         unknown = sorted(set(tables) - set(SILVER_TABLES))
         if unknown:
             raise ValueError(f"Unknown silver source tables: {unknown}")
         results = [self.run_table(table_name, batch_id=batch_id, full_rebuild=full_rebuild) for table_name in tables]
-        return SilverBuildResult(
-            outputs=[output for output, _ in results],
-            versions=dict(zip(tables, (version for _, version in results), strict=True)),
+        return SilverBatchManifest(
+            batch_id=batch_id,
+            tables=dict(zip(tables, results, strict=True)),
         )
 
-    def run_table(self, table_name: str, *, batch_id: str, full_rebuild: bool = False) -> tuple[str, int]:
+    def run_table(self, table_name: str, *, batch_id: str, full_rebuild: bool = False) -> SilverTableResult:
         contract = get_silver_contract(table_name)
         current_bronze_version = self._bronze_version(table_name)
         silver_reference = self.config.lakehouse.table_reference("silver", table_name)
@@ -69,12 +68,26 @@ class SilverBuilder:
         if full_rebuild or silver_state is None:
             self._replace_from_snapshot(contract, current_bronze_version, batch_id)
             version = 0 if silver_state is None else silver_state.version + 1
-            return silver_reference.value, version
+            return self._result(
+                contract,
+                silver_reference.value,
+                "snapshot",
+                None,
+                current_bronze_version,
+                version,
+            )
 
         previous_bronze_version = self._processed_version(table_name, silver_state.progress)
         if previous_bronze_version is None:
             self._replace_from_snapshot(contract, current_bronze_version, batch_id)
-            return silver_reference.value, silver_state.version + 1
+            return self._result(
+                contract,
+                silver_reference.value,
+                "snapshot",
+                None,
+                current_bronze_version,
+                silver_state.version + 1,
+            )
         if previous_bronze_version > current_bronze_version:
             raise RuntimeError(
                 f"Silver progress is ahead of Bronze for {table_name}: "
@@ -83,18 +96,31 @@ class SilverBuilder:
         if previous_bronze_version == current_bronze_version:
             if silver_state.progress_version is None:
                 raise RuntimeError(f"Silver progress version is missing for table: {table_name}")
-            return silver_reference.value, silver_state.progress_version
+            return self._result(
+                contract,
+                silver_reference.value,
+                "no_change",
+                None,
+                current_bronze_version,
+                silver_state.progress_version,
+            )
 
-        self._validate_schema_version(table_name)
+        self._validate_schema_version(table_name, silver_state.progress)
+        starting_version = previous_bronze_version + 1
         changes = self.read_changes(
             table_name,
-            starting_version=previous_bronze_version + 1,
+            starting_version=starting_version,
             ending_version=current_bronze_version,
         )
         transformed = self.transform(contract, changes)
         with delta_commit_metadata(
             self.spark,
-            self._progress_metadata(table_name, current_bronze_version, batch_id),
+            self._progress_metadata(
+                table_name,
+                current_bronze_version,
+                batch_id,
+                bronze_starting_version=starting_version,
+            ),
         ):
             self.lakehouse.upsert_table(
                 transformed,
@@ -104,7 +130,14 @@ class SilverBuilder:
                 delete_mode="hard",
                 target_exists=True,
             )
-        return silver_reference.value, silver_state.version + 1
+        return self._result(
+            contract,
+            silver_reference.value,
+            "cdf",
+            starting_version,
+            current_bronze_version,
+            silver_state.version + 1,
+        )
 
     def transform(self, contract: SilverTableContract, bronze_df: DataFrame) -> DataFrame:
         if supports_customer_table(contract.table_name):
@@ -155,7 +188,12 @@ class SilverBuilder:
         )
         with delta_commit_metadata(
             self.spark,
-            self._progress_metadata(contract.table_name, bronze_version, batch_id),
+            self._progress_metadata(
+                contract.table_name,
+                bronze_version,
+                batch_id,
+                bronze_starting_version=None,
+            ),
         ):
             self.lakehouse.write_table(
                 snapshot,
@@ -165,28 +203,44 @@ class SilverBuilder:
             )
 
     @staticmethod
-    def _progress_metadata(table_name: str, bronze_version: int, batch_id: str) -> dict[str, object]:
+    def _progress_metadata(
+        table_name: str,
+        bronze_version: int,
+        batch_id: str,
+        *,
+        bronze_starting_version: int | None,
+    ) -> dict[str, object]:
         return {
             "pipeline": SILVER_PIPELINE_NAME,
             "source_table": table_name,
             "batch_id": batch_id,
             "last_processed_bronze_version": bronze_version,
+            "bronze_starting_version": bronze_starting_version,
+            "silver_schema_version": SILVER_SCHEMA_VERSION,
         }
 
-    def _validate_schema_version(self, table_name: str) -> None:
-        silver = self.lakehouse.read_table("silver", table_name)
-        if "_silver_schema_version" not in silver.columns:
-            raise RuntimeError(f"Silver schema metadata is missing for {table_name}; run with --full-rebuild-silver")
-        row = silver.select("_silver_schema_version").limit(1).first()
-        if row is None or row["_silver_schema_version"] != SILVER_SCHEMA_VERSION:
+    def _validate_schema_version(self, table_name: str, metadata: dict[str, object] | None) -> None:
+        version = None if metadata is None else metadata.get("silver_schema_version")
+        if version is None:
+            silver = self.lakehouse.read_table("silver", table_name)
+            if "_silver_schema_version" not in silver.columns:
+                raise RuntimeError(
+                    f"Silver schema metadata is missing for {table_name}; run with --full-rebuild-silver"
+                )
+            row = silver.select("_silver_schema_version").limit(1).first()
+            version = None if row is None else row["_silver_schema_version"]
+        if version != SILVER_SCHEMA_VERSION:
             raise RuntimeError(f"Silver schema version is outdated for {table_name}; run with --full-rebuild-silver")
 
     def _bronze_version(self, table_name: str) -> int:
-        if self.bronze_versions is not None:
+        if self.bronze_manifest is not None:
             try:
-                return self.bronze_versions[table_name]
+                result = self.bronze_manifest.tables[table_name]
             except KeyError as exc:
                 raise ValueError(f"Bronze version was not provided for table: {table_name}") from exc
+            if result.schema_version != BRONZE_SCHEMA_VERSION:
+                raise RuntimeError(f"Bronze schema version is outdated for {table_name}: {result.schema_version}")
+            return result.delta_version
         state = try_delta_table_state(
             self.spark,
             self.config.lakehouse.table_reference("bronze", table_name),
@@ -198,6 +252,38 @@ class SilverBuilder:
             raise RuntimeError(f"Bronze progress metadata is missing for table: {table_name}")
         return state.progress_version
 
+    def _result(
+        self,
+        contract: SilverTableContract,
+        output_path: str,
+        processing_mode: Literal["snapshot", "cdf", "no_change"],
+        bronze_starting_version: int | None,
+        bronze_ending_version: int,
+        committed_version: int,
+    ) -> SilverTableResult:
+        source_record_count: int | None = None
+        source_operation_counts: dict[str, int] = {}
+        if self.bronze_manifest is not None and processing_mode != "snapshot":
+            source = self.bronze_manifest.tables[contract.table_name]
+            exact_current_commit = processing_mode == "no_change" or (
+                bronze_starting_version == source.delta_version
+                and source.previous_delta_version + 1 == source.delta_version
+            )
+            if exact_current_commit:
+                source_record_count = source.record_count
+                source_operation_counts = dict(source.operation_counts)
+        return SilverTableResult(
+            table_name=contract.table_name,
+            output_path=output_path,
+            processing_mode=processing_mode,
+            bronze_starting_version=bronze_starting_version,
+            bronze_ending_version=bronze_ending_version,
+            committed_version=committed_version,
+            schema_version=SILVER_SCHEMA_VERSION,
+            source_record_count=source_record_count,
+            source_operation_counts=source_operation_counts,
+        )
+
 
 def build_silver(
     spark: SparkSession,
@@ -206,9 +292,9 @@ def build_silver(
     *,
     batch_id: str,
     full_rebuild: bool = False,
-    bronze_versions: Mapping[str, int] | None = None,
-) -> SilverBuildResult:
-    return SilverBuilder(spark, config, bronze_versions).run(
+    bronze_manifest: BronzeBatchManifest | None = None,
+) -> SilverBatchManifest:
+    return SilverBuilder(spark, config, bronze_manifest).run(
         table_names,
         batch_id=batch_id,
         full_rebuild=full_rebuild,

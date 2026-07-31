@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pydantic import SecretStr
+from pyspark.sql import SparkSession
 
 from ecommerce_pipeline.config.models import (
     AppConfig,
@@ -15,6 +16,7 @@ from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
 from ecommerce_pipeline.ingestion.batch.bronze_operations import (
     batch_upper_bounds_query,
     change_event_query,
+    collect_change_event_stats,
     jdbc_partition_count,
 )
 
@@ -103,3 +105,20 @@ def test_bronze_and_silver_contracts_cover_the_same_sources() -> None:
     assert set(BRONZE_TABLES) == set(SILVER_TABLES)
     for table_name, bronze_contract in BRONZE_TABLES.items():
         assert bronze_contract.primary_keys == SILVER_TABLES[table_name].primary_keys
+
+
+def test_change_event_stats_include_operation_counts_in_one_result(spark: SparkSession) -> None:
+    events = spark.createDataFrame(
+        [
+            (1, 10, "INSERT", "2026-07-29 00:00:00"),
+            (2, 10, "UPDATE", "2026-07-29 00:01:00"),
+            (3, 11, "DELETE", "2026-07-29 00:02:00"),
+        ],
+        "_event_id long, order_id int, _operation string, _event_occurred_at string",
+    )
+
+    stats = collect_change_event_stats(events, get_bronze_contract("orders"))
+
+    assert stats.record_count == 3
+    assert stats.last_event_id == 3
+    assert stats.operation_counts == {"INSERT": 1, "UPDATE": 1, "DELETE": 1}
