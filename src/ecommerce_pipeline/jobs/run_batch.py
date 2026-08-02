@@ -117,7 +117,13 @@ def run_mode(
     outputs: dict[str, list[str]] = {}
     if args.mode in {"bronze", "all"}:
         started = perf_counter()
-        bronze_manifest = extract_all_to_bronze(spark, config, batch_id, args.tables)
+        bronze_manifest = extract_all_to_bronze(
+            spark,
+            config,
+            batch_id,
+            args.tables,
+            timings_ms=timings_ms,
+        )
         bronze_results = bronze_manifest.results
         timings_ms["bronze"] = round((perf_counter() - started) * 1000)
         outputs["bronze"] = [result.output_path for result in bronze_results]
@@ -156,6 +162,7 @@ def run_mode(
             batch_id=batch_id,
             full_rebuild=args.full_rebuild_silver,
             bronze_manifest=bronze_manifest if args.mode == "all" else None,
+            timings_ms=timings_ms,
         )
         outputs["silver"] = silver_manifest.outputs
         timings_ms["silver"] = round((perf_counter() - started) * 1000)

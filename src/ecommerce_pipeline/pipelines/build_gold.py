@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from time import perf_counter
 
@@ -103,11 +104,12 @@ class GoldBuilder:
             "dim_product": build_dim_product(tables["products"], tables["product_variants"], self.spark),
         }
         for table_name, dimension in scd2_outputs.items():
-            self._merge_scd2(
-                table_name,
-                dimension,
-                replace=self._scd2_requires_replacement(table_name),
-            )
+            with self._timed(f"gold.table.{table_name}"):
+                self._merge_scd2(
+                    table_name,
+                    dimension,
+                    replace=self._scd2_requires_replacement(table_name),
+                )
         fact_dimensions = self._read_fact_dimensions()
         outputs: dict[str, tuple[DataFrame, list[str]]] = {
             "dim_date": (build_dim_date(tables["orders"], self.spark), ["date_key"]),
@@ -128,7 +130,8 @@ class GoldBuilder:
             ),
         }
         for table_name, (df, keys) in outputs.items():
-            self.lakehouse.upsert_table(df, "gold", table_name, keys, delete_not_matched_by_source=True)
+            with self._timed(f"gold.table.{table_name}"):
+                self.lakehouse.upsert_table(df, "gold", table_name, keys, delete_not_matched_by_source=True)
         GoldQualityChecker(self.lakehouse).run(tables)
         return frozenset(GOLD_TABLES)
 
@@ -136,7 +139,13 @@ class GoldBuilder:
         changed_order_ids = self._ids_if_changed(changes, "orders", "order_id")
         affected_order_ids = self._affected_order_ids(changes).localCheckpoint(eager=True)
         try:
-            return self._apply_incremental(changes, changed_order_ids, affected_order_ids)
+            has_affected_orders = not affected_order_ids.isEmpty()
+            return self._apply_incremental(
+                changes,
+                changed_order_ids,
+                affected_order_ids,
+                has_affected_orders=has_affected_orders,
+            )
         finally:
             affected_order_ids.unpersist()
 
@@ -145,98 +154,150 @@ class GoldBuilder:
         changes: dict[str, DataFrame],
         changed_order_ids: DataFrame,
         affected_order_ids: DataFrame,
+        *,
+        has_affected_orders: bool,
     ) -> frozenset[str]:
         dimensions_started = perf_counter()
         changed_tables = set(changes)
         changed_gold_tables: set[str] = set()
         changed_scd2: list[str] = []
+        dimension_jobs: list[tuple[str, Callable[[], None]]] = []
+
+        def add_job(table_name: str, action: Callable[[], None], *, scd2: bool = False) -> None:
+            dimension_jobs.append((table_name, action))
+            changed_gold_tables.add(table_name)
+            if scd2:
+                changed_scd2.append(table_name)
+
         if "app_users" in changes:
-            user_ids = self._ids(changes["app_users"], "user_id")
-            users = self._filter_current("app_users", "user_id", user_ids)
-            self._merge_scd2("dim_customer", build_dim_customer(users, self.spark))
-            changed_scd2.append("dim_customer")
-            changed_gold_tables.add("dim_customer")
+
+            def update_customer() -> None:
+                user_ids = self._ids(changes["app_users"], "user_id")
+                users = self._filter_current("app_users", "user_id", user_ids)
+                self._merge_scd2("dim_customer", build_dim_customer(users, self.spark))
+
+            add_job("dim_customer", update_customer, scd2=True)
 
         if "orders" in changes:
             orders = self._filter_current("orders", "order_id", changed_order_ids)
-            self.lakehouse.upsert_table(build_dim_date(orders, self.spark), "gold", "dim_date", ["date_key"])
-            self.lakehouse.upsert_table(build_dim_time(orders, self.spark), "gold", "dim_time", ["time_key"])
-            changed_gold_tables.update(("dim_date", "dim_time"))
+
+            def update_date() -> None:
+                self._append_dimension_members(
+                    build_dim_date(orders, self.spark),
+                    "dim_date",
+                    "date_key",
+                )
+
+            def update_time() -> None:
+                self._append_dimension_members(
+                    build_dim_time(orders, self.spark),
+                    "dim_time",
+                    "time_key",
+                )
+
+            add_job("dim_date", update_date)
+            add_job("dim_time", update_time)
         else:
             orders = self._empty_current("orders")
 
         if changed_tables & {"user_addresses", "orders"}:
-            address_ids = self._ids_if_changed(changes, "user_addresses", "address_id")
-            addresses = self._filter_current("user_addresses", "address_id", address_ids)
-            self.lakehouse.upsert_table(
-                build_dim_location(addresses, orders, self.spark),
-                "gold",
-                "dim_location",
-                ["location_key"],
-            )
-            changed_gold_tables.add("dim_location")
+
+            def update_location() -> None:
+                address_ids = self._ids_if_changed(changes, "user_addresses", "address_id")
+                addresses = self._filter_current("user_addresses", "address_id", address_ids)
+                self._append_dimension_members(
+                    build_dim_location(addresses, orders, self.spark),
+                    "dim_location",
+                    "location_key",
+                )
+
+            add_job("dim_location", update_location)
 
         if "shops" in changes:
-            shop_ids = self._ids(changes["shops"], "shop_id")
-            shops = self._filter_current("shops", "shop_id", shop_ids)
-            self._merge_scd2("dim_shop", build_dim_shop(shops, self.spark))
-            changed_scd2.append("dim_shop")
-            changed_gold_tables.add("dim_shop")
+
+            def update_shop() -> None:
+                shop_ids = self._ids(changes["shops"], "shop_id")
+                shops = self._filter_current("shops", "shop_id", shop_ids)
+                self._merge_scd2("dim_shop", build_dim_shop(shops, self.spark))
+
+            add_job("dim_shop", update_shop, scd2=True)
 
         if "categories" in changes:
-            category_ids = self._affected_category_ids(changes["categories"])
-            categories = self._category_scope(category_ids)
-            self._merge_scd2("dim_category", build_dim_category(categories, self.spark))
-            changed_scd2.append("dim_category")
-            changed_gold_tables.add("dim_category")
+
+            def update_category() -> None:
+                category_ids = self._affected_category_ids(changes["categories"])
+                categories = self._category_scope(category_ids)
+                self._merge_scd2("dim_category", build_dim_category(categories, self.spark))
+
+            add_job("dim_category", update_category, scd2=True)
 
         if changed_tables & {"products", "product_variants"}:
-            product_ids = self._affected_product_ids(changes)
-            products = self._filter_current("products", "product_id", product_ids)
-            variants = self._filter_current("product_variants", "product_id", product_ids)
-            self._merge_scd2(
-                "dim_product",
-                build_dim_product(products, variants, self.spark),
-            )
-            changed_scd2.append("dim_product")
-            changed_gold_tables.add("dim_product")
+
+            def update_product() -> None:
+                product_ids = self._affected_product_ids(changes)
+                products = self._filter_current("products", "product_id", product_ids)
+                variants = self._filter_current("product_variants", "product_id", product_ids)
+                self._merge_scd2(
+                    "dim_product",
+                    build_dim_product(products, variants, self.spark),
+                )
+
+            add_job("dim_product", update_product, scd2=True)
 
         if changed_tables & {"order_vouchers", "vouchers"}:
-            order_vouchers, vouchers = self._promotion_scope(affected_order_ids)
-            self.lakehouse.upsert_table(
-                build_dim_promotion(order_vouchers, vouchers, self.spark),
-                "gold",
-                "dim_promotion",
-                ["promotion_key"],
-            )
-            changed_gold_tables.add("dim_promotion")
+
+            def update_promotion() -> None:
+                order_vouchers, vouchers = self._promotion_scope(affected_order_ids)
+                promotions = build_dim_promotion(order_vouchers, vouchers, self.spark).filter("promotion_key <> 0")
+                self.lakehouse.upsert_table(
+                    promotions,
+                    "gold",
+                    "dim_promotion",
+                    ["promotion_key"],
+                    target_exists=True,
+                )
+
+            add_job("dim_promotion", update_promotion)
 
         if "payments" in changes:
-            payment_ids = self._ids(changes["payments"], "payment_id")
-            payments = self._filter_current("payments", "payment_id", payment_ids)
-            self.lakehouse.upsert_table(
-                build_dim_payment(payments, self.spark),
-                "gold",
-                "dim_payment",
-                ["payment_key"],
-            )
-            changed_gold_tables.add("dim_payment")
+
+            def update_payment() -> None:
+                payment_ids = self._ids(changes["payments"], "payment_id")
+                payments = self._filter_current("payments", "payment_id", payment_ids)
+                self._append_dimension_members(
+                    build_dim_payment(payments, self.spark),
+                    "dim_payment",
+                    "payment_key",
+                )
+
+            add_job("dim_payment", update_payment)
 
         if "shipments" in changes:
-            shipment_ids = self._ids(changes["shipments"], "shipment_id")
-            shipments = self._filter_current("shipments", "shipment_id", shipment_ids)
-            self.lakehouse.upsert_table(
-                build_dim_shipping(shipments, self.spark),
-                "gold",
-                "dim_shipping",
-                ["shipping_key"],
-            )
-            changed_gold_tables.add("dim_shipping")
+
+            def update_shipping() -> None:
+                shipment_ids = self._ids(changes["shipments"], "shipment_id")
+                shipments = self._filter_current("shipments", "shipment_id", shipment_ids)
+                self._append_dimension_members(
+                    build_dim_shipping(shipments, self.spark),
+                    "dim_shipping",
+                    "shipping_key",
+                )
+
+            add_job("dim_shipping", update_shipping)
+
+        def execute_dimension(job: tuple[str, Callable[[], None]]) -> None:
+            table_name, action = job
+            with self._timed(f"gold.table.{table_name}"):
+                action()
+
+        workers = max(1, min(len(dimension_jobs), self.config.spark.max_parallel_tables))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(execute_dimension, dimension_jobs))
 
         GoldQualityChecker(self.lakehouse).validate_scd2(changed_scd2)
         self._record_elapsed("gold.dimensions", dimensions_started)
 
-        if changed_tables & FACT_SOURCE_TABLES:
+        if changed_tables & FACT_SOURCE_TABLES and has_affected_orders:
             fact_started = perf_counter()
             fact_sources = self._fact_scope(affected_order_ids)
             fact_sources["orders"] = fact_sources["orders"].cache()
@@ -479,9 +540,21 @@ class GoldBuilder:
             result = result.unionByName(frame.select(column))
         return result.where(F.col(column).isNotNull()).distinct()
 
-    def _merge_scd2(self, table_name: str, dimension: DataFrame, *, replace: bool = False) -> None:
+    def _append_dimension_members(self, dimension: DataFrame, table_name: str, key: str) -> bool:
+        members = dimension.filter(F.col(key) != F.lit(0))
+        return self.lakehouse.append_new_rows(
+            members,
+            "gold",
+            table_name,
+            [key],
+            target_exists=True,
+        )
+
+    def _merge_scd2(self, table_name: str, dimension: DataFrame, *, replace: bool = False) -> bool:
         contract = SCD2_DIMENSIONS[table_name]
-        self.lakehouse.merge_scd2(
+        if not replace:
+            dimension = dimension.filter(F.col(contract.source_key).isNotNull())
+        return self.lakehouse.merge_scd2(
             dimension,
             "gold",
             table_name,

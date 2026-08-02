@@ -77,6 +77,7 @@ def test_silver_processes_only_unapplied_delta_versions(monkeypatch: pytest.Monk
         ("order_id",),
         delete_mode="hard",
         target_exists=True,
+        source_is_nonempty=True,
     )
 
 

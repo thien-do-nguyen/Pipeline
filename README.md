@@ -42,6 +42,9 @@ Power BI có thể đọc Gold qua Databricks SQL; ADF, Event Hubs và Debezium/
   Silver/Gold.
 - Gold đọc Silver CDF, lan truyền affected IDs qua các dependency và chỉ dựng lại dimension members/order facts
   bị ảnh hưởng.
+- Incremental Gold chỉ append member mới cho các dimension bất biến `dim_date`, `dim_time`, `dim_location`,
+  `dim_payment` và `dim_shipping`; unknown member chỉ được tạo ở full build. Cách này tránh Delta `MERGE` rewrite
+  file khi micro-batch chỉ tham chiếu member đã tồn tại.
 - Gold có 10 dimensions và `fact_sales` ở grain một dòng cho mỗi `order_item`.
 - `dim_customer`, `dim_product`, `dim_shop` và `dim_category` dùng SCD Type 2; fact temporal-join surrogate key
   theo `order_created_at`. Giá và tồn kho sản phẩm được cập nhật Type 1 để không tạo history quá mức.
@@ -263,7 +266,8 @@ logs/
 ```
 
 Mỗi batch status có `timings_ms.spark_startup`, `bronze`, `silver`, `gold` và `total` để xác định layer chậm mà
-không phải suy đoán từ số record. Các timing đã hoàn tất vẫn được giữ nếu batch lỗi.
+không phải suy đoán từ số record. Chi tiết từng bảng nằm ở `bronze.table.<table>`, `silver.table.<table>` và
+`gold.table.<table>`; các timing đã hoàn tất vẫn được giữ nếu batch lỗi.
 
 ### Bước 6 — validate kết quả
 
@@ -400,6 +404,10 @@ Run bình thường không scan full Bronze Parquet. Silver chỉ đọc các fi
 `MERGE`. Gold lấy affected IDs từ Silver CDF; payment/shipment/voucher changes được lan truyền về đúng `order_id`,
 sau đó chỉ các fact rows thuộc order bị ảnh hưởng được dựng lại. Product/shop/category changes chỉ mở SCD2 version
 mới và không rewrite historical facts.
+
+Bronze, Silver và các Gold dimension độc lập dùng Spark FAIR scheduling, tối đa `spark.max_parallel_tables` table
+cùng lúc. Fact chỉ chạy sau khi dimension hoàn tất. Mặc định là 4; giảm giá trị này nếu PostgreSQL hoặc cluster bị
+giới hạn connection/CPU.
 
 Chỉ lần tạo Silver đầu tiên, lần tự migrate bảng Silver cũ chưa có progress, và `--full-rebuild-silver` đọc full
 Bronze snapshot. Bronze cũ được migrate cursor tự động bằng cách đọc `MAX(_event_id)` đúng một lần và ghi marker

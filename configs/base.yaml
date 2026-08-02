@@ -26,7 +26,9 @@ postgres:
 
 spark:
   app_name: lakehouse-pipeline
+  max_parallel_tables: 4
   config:
+    spark.scheduler.mode: FAIR
     spark.databricks.delta.schema.autoMerge.enabled: "false"
     spark.sql.adaptive.enabled: "true"
     spark.sql.maxPlanStringLength: "524288"

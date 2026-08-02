@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from time import perf_counter
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -43,21 +45,47 @@ class _BronzeState:
 
 
 class BronzeExtractor:
-    def __init__(self, spark: SparkSession, config: AppConfig, batch_id: str) -> None:
+    def __init__(
+        self,
+        spark: SparkSession,
+        config: AppConfig,
+        batch_id: str,
+        timings_ms: dict[str, int] | None = None,
+    ) -> None:
         self.spark = spark
         self.config = config
         self.batch_id = batch_id
         self.reader = PostgresReader(spark, config)
+        self.timings_ms = timings_ms
 
     def run(self, table_names: list[str]) -> BronzeBatchManifest:
-        states = [self._table_state(table_name) for table_name in table_names]
+        with ThreadPoolExecutor(max_workers=self._worker_count(len(table_names))) as executor:
+            states = list(executor.map(self._table_state_in_session, table_names))
         upper_bounds = read_batch_upper_bounds(
             self.reader,
             self.config,
             {state.table_name: state.cursor for state in states},
         )
-        results = [self._run_table(state, upper_bounds[state.table_name]) for state in states]
+
+        def process(state: _BronzeState) -> BronzeTableResult:
+            worker = BronzeExtractor(self.spark.newSession(), self.config, self.batch_id, self.timings_ms)
+            started = perf_counter()
+            try:
+                return worker._run_table(state, upper_bounds[state.table_name])
+            finally:
+                if self.timings_ms is not None:
+                    self.timings_ms[f"bronze.table.{state.table_name}"] = round((perf_counter() - started) * 1000)
+
+        with ThreadPoolExecutor(max_workers=self._worker_count(len(states))) as executor:
+            results = list(executor.map(process, states))
         return BronzeBatchManifest.from_results(self.batch_id, results)
+
+    def _table_state_in_session(self, table_name: str) -> _BronzeState:
+        worker = BronzeExtractor(self.spark.newSession(), self.config, self.batch_id, self.timings_ms)
+        return worker._table_state(table_name)
+
+    def _worker_count(self, count: int) -> int:
+        return max(1, min(count, self.config.spark.max_parallel_tables))
 
     def _table_state(self, table_name: str) -> _BronzeState:
         reference = self.config.lakehouse.table_reference("bronze", table_name)
@@ -225,10 +253,11 @@ def extract_all_to_bronze(
     config: AppConfig,
     batch_id: str,
     table_names: list[str] | None = None,
+    timings_ms: dict[str, int] | None = None,
 ) -> BronzeBatchManifest:
     tables = list(BRONZE_TABLES) if table_names is None else table_names
     unknown = sorted(set(tables) - set(BRONZE_TABLES))
     if unknown:
         raise ValueError(f"Unknown source tables: {unknown}")
-    extractor = BronzeExtractor(spark, config, batch_id)
+    extractor = BronzeExtractor(spark, config, batch_id, timings_ms)
     return extractor.run(tables)

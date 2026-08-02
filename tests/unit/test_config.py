@@ -69,6 +69,7 @@ def test_load_config_merges_sections_and_hides_secret(tmp_path: Path, monkeypatc
 
     assert config.environment == "local"
     assert config.spark.master == "local[2]"
+    assert config.spark.max_parallel_tables == 1
     assert config.spark.config == {"shared": "base", "local-only": "enabled"}
     assert config.postgres.password_value == "secret value"
     assert "secret value" not in repr(config)

@@ -95,6 +95,7 @@ class SparkConfig(FrozenConfigModel):
     app_name: str = Field(min_length=1)
     configure_delta_package: bool = True
     stop_session: bool = True
+    max_parallel_tables: int = Field(default=1, ge=1, le=16)
     config: dict[str, str] = Field(default_factory=dict)
 
 
