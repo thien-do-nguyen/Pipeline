@@ -78,3 +78,58 @@ def test_unity_catalog_external_table_uses_owned_adls_path() -> None:
 
     writer.option.assert_called_once_with("path", reference.storage_path)
     writer.saveAsTable.assert_called_once_with(reference.value)
+
+
+def test_known_nonempty_source_skips_the_extra_spark_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    spark = Mock()
+    config = Mock()
+    config.lakehouse = LakehouseConfig(base_path="data/lakehouse")
+    adapter = LakehouseAdapter(spark, config)
+    target = Mock(columns=["id", "value"])
+    adapter.read_table = Mock(return_value=target)
+    source = Mock(columns=["id", "value"], is_cached=False)
+    cached = source.cache.return_value
+    merge = Mock()
+    delta = Mock()
+    delta.alias.return_value.merge.return_value = merge
+    merge.whenMatchedUpdate.return_value = merge
+    merge.whenNotMatchedInsertAll.return_value = merge
+    monkeypatch.setattr("ecommerce_pipeline.adapters.lakehouse._delta_table", Mock(return_value=delta))
+
+    assert adapter.upsert_table(
+        source,
+        "silver",
+        "orders",
+        ["id"],
+        target_exists=True,
+        source_is_nonempty=True,
+    )
+
+    cached.isEmpty.assert_not_called()
+    merge.execute.assert_called_once_with()
+    cached.unpersist.assert_called_once_with()
+
+
+def test_immutable_dimension_uses_insert_only_merge(monkeypatch: pytest.MonkeyPatch) -> None:
+    spark = Mock()
+    config = Mock()
+    config.lakehouse = LakehouseConfig(base_path="data/lakehouse")
+    adapter = LakehouseAdapter(spark, config)
+    target = Mock(columns=["key", "value"])
+    adapter.read_table = Mock(return_value=target)
+    source = Mock(columns=["key", "value"])
+    deduplicated = source.dropDuplicates.return_value
+    merge = Mock()
+    delta = Mock()
+    delta.alias.return_value.merge.return_value = merge
+    merge.whenNotMatchedInsertAll.return_value = merge
+    monkeypatch.setattr("ecommerce_pipeline.adapters.lakehouse._delta_table", Mock(return_value=delta))
+
+    assert adapter.append_new_rows(source, "gold", "dim_date", ["key"], target_exists=True)
+
+    source.dropDuplicates.assert_called_once_with(["key"])
+    delta.alias.return_value.merge.assert_called_once_with(
+        deduplicated.alias.return_value, "target.`key` = source.`key`"
+    )
+    merge.whenNotMatchedInsertAll.assert_called_once_with()
+    merge.execute.assert_called_once_with()

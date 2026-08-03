@@ -199,7 +199,8 @@ class LakehouseAdapter:
         *,
         delete_keys: DataFrame | None = None,
         target_exists: bool | None = None,
-    ) -> None:
+        source_is_nonempty: bool = False,
+    ) -> bool:
         if not merge_keys:
             raise ValueError("merge_keys must not be empty")
         if delete_mode not in {"soft", "hard"}:
@@ -219,7 +220,7 @@ class LakehouseAdapter:
             if uses_operation_delete:
                 df = df.filter(F.coalesce(F.col("_operation") != F.lit("DELETE"), F.lit(True)))
             self.write_table(df, layer, table_name)
-            return
+            return True
 
         join_condition = " AND ".join(f"target.`{key}` = source.`{key}`" for key in merge_keys)
         target_columns = set(self.read_table(layer, table_name).columns)
@@ -256,8 +257,8 @@ class LakehouseAdapter:
         if owned_cache:
             changes = changes.localCheckpoint(eager=True) if layer == "gold" else changes.cache()
         try:
-            if changes.isEmpty():
-                return
+            if not source_is_nonempty and changes.isEmpty():
+                return False
             merge = _delta_table(self.spark, reference).alias("target").merge(changes.alias("source"), join_condition)
             if delete_condition is not None:
                 merge = merge.whenMatchedDelete(condition=delete_condition)
@@ -276,9 +277,59 @@ class LakehouseAdapter:
             if delete_not_matched_by_source:
                 merge = merge.whenNotMatchedBySourceDelete()
             merge.execute()
+            return True
         finally:
             if owned_cache:
                 changes.unpersist()
+
+    def append_new_rows(
+        self,
+        df: DataFrame,
+        layer: str,
+        table_name: str,
+        merge_keys: Sequence[str],
+        *,
+        target_exists: bool | None = None,
+    ) -> bool:
+        """Insert only dimension members whose keys are not already present.
+
+        This is intended for immutable, content-addressed dimensions. It avoids
+        both target-file updates and the eager anti-join action that an append
+        implementation would otherwise need for idempotency.
+        """
+
+        if not merge_keys:
+            raise ValueError("merge_keys must not be empty")
+        missing_keys = sorted(set(merge_keys) - set(df.columns))
+        if missing_keys:
+            raise ValueError(f"Missing append keys for {layer}.{table_name}: {missing_keys}")
+
+        reference = self.config.lakehouse.table_reference(layer, table_name)
+        exists = self.table_exists(layer, table_name) if target_exists is None else target_exists
+        if not exists:
+            self.write_table(df, layer, table_name)
+            return True
+
+        target = self.read_table(layer, table_name)
+        source_columns = set(df.columns)
+        target_columns = set(target.columns)
+        if source_columns != target_columns:
+            raise ValueError(
+                f"Schema mismatch for {layer}.{table_name}; "
+                f"missing_from_source={sorted(target_columns - source_columns)}, "
+                f"missing_from_target={sorted(source_columns - target_columns)}. "
+                "Rebuild the affected layer explicitly."
+            )
+
+        join_condition = " AND ".join(f"target.`{key}` = source.`{key}`" for key in merge_keys)
+        (
+            _delta_table(self.spark, reference)
+            .alias("target")
+            .merge(df.dropDuplicates(list(merge_keys)).alias("source"), join_condition)
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+        return True
 
     def merge_scd2(
         self,
@@ -291,7 +342,7 @@ class LakehouseAdapter:
         type1_columns: Sequence[str] = (),
         *,
         replace: bool = False,
-    ) -> None:
+    ) -> bool:
         reference = self.config.lakehouse.table_reference(layer, table_name)
         if initial_effective_from not in df.columns:
             raise ValueError(
@@ -306,7 +357,7 @@ class LakehouseAdapter:
                 ).otherwise(F.col("effective_from")),
             )
             self.write_table(initial, layer, table_name)
-            return
+            return True
 
         target = self.read_table(layer, table_name)
         source_columns = set(df.columns)
@@ -330,7 +381,7 @@ class LakehouseAdapter:
         delta = _delta_table(self.spark, reference)
         try:
             if staged.isEmpty():
-                return
+                return False
             merge = (
                 delta.alias("target")
                 .merge(
@@ -358,6 +409,7 @@ class LakehouseAdapter:
                 condition="source.`_action` = 'INSERT'",
                 values=insert_values,
             ).execute()
+            return True
         finally:
             staged.unpersist()
 

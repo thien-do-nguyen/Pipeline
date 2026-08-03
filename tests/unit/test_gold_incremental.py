@@ -115,6 +115,25 @@ def test_product_changes_do_not_rewrite_historical_facts(spark: SparkSession) ->
     assert affected.collect() == []
 
 
+def test_incremental_immutable_dimension_excludes_unknown_member(spark: SparkSession) -> None:
+    builder = object.__new__(GoldBuilder)
+    builder.lakehouse = Mock()
+    builder.lakehouse.append_new_rows.return_value = True
+    dimension = spark.createDataFrame([(0, "unknown"), (101, "known")], "payment_key long, label string")
+
+    assert builder._append_dimension_members(dimension, "dim_payment", "payment_key")
+
+    members = builder.lakehouse.append_new_rows.call_args.args[0]
+    assert [(row["payment_key"], row["label"]) for row in members.collect()] == [(101, "known")]
+    builder.lakehouse.append_new_rows.assert_called_once_with(
+        members,
+        "gold",
+        "dim_payment",
+        ["payment_key"],
+        target_exists=True,
+    )
+
+
 def test_gold_filter_can_map_different_id_column_names(spark: SparkSession) -> None:
     builder = object.__new__(GoldBuilder)
     builder.spark = spark
@@ -142,6 +161,7 @@ def test_incremental_checkpoints_reused_affected_order_ids() -> None:
     affected_plan = Mock()
     affected_ids = Mock()
     affected_plan.localCheckpoint.return_value = affected_ids
+    affected_ids.isEmpty.return_value = False
     builder._ids_if_changed = Mock(return_value=changed_order_ids)
     builder._affected_order_ids = Mock(return_value=affected_plan)
     changed_gold_tables = frozenset({"dim_date", "fact_sales"})
@@ -151,7 +171,12 @@ def test_incremental_checkpoints_reused_affected_order_ids() -> None:
     assert builder._run_incremental(changes) == changed_gold_tables
 
     affected_plan.localCheckpoint.assert_called_once_with(eager=True)
-    builder._apply_incremental.assert_called_once_with(changes, changed_order_ids, affected_ids)
+    builder._apply_incremental.assert_called_once_with(
+        changes,
+        changed_order_ids,
+        affected_ids,
+        has_affected_orders=True,
+    )
     affected_ids.unpersist.assert_called_once_with()
 
 

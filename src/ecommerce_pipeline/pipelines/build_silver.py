@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from time import perf_counter
 from typing import Literal
 
 from pyspark.sql import DataFrame, SparkSession
@@ -32,11 +34,13 @@ class SilverBuilder:
         spark: SparkSession,
         config: AppConfig,
         bronze_manifest: BronzeBatchManifest | None = None,
+        timings_ms: dict[str, int] | None = None,
     ) -> None:
         self.spark = spark
         self.config = config
         self.lakehouse = LakehouseAdapter(spark, config)
         self.bronze_manifest = bronze_manifest
+        self.timings_ms = timings_ms
 
     def run(
         self,
@@ -49,7 +53,24 @@ class SilverBuilder:
         unknown = sorted(set(tables) - set(SILVER_TABLES))
         if unknown:
             raise ValueError(f"Unknown silver source tables: {unknown}")
-        results = [self.run_table(table_name, batch_id=batch_id, full_rebuild=full_rebuild) for table_name in tables]
+
+        def process(table_name: str) -> SilverTableResult:
+            worker = SilverBuilder(
+                self.spark.newSession(),
+                self.config,
+                bronze_manifest=self.bronze_manifest,
+                timings_ms=self.timings_ms,
+            )
+            started = perf_counter()
+            try:
+                return worker.run_table(table_name, batch_id=batch_id, full_rebuild=full_rebuild)
+            finally:
+                if self.timings_ms is not None:
+                    self.timings_ms[f"silver.table.{table_name}"] = round((perf_counter() - started) * 1000)
+
+        workers = max(1, min(len(tables), self.config.spark.max_parallel_tables))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = list(executor.map(process, tables))
         return SilverBatchManifest(
             batch_id=batch_id,
             tables=dict(zip(tables, results, strict=True)),
@@ -129,6 +150,7 @@ class SilverBuilder:
                 contract.primary_keys,
                 delete_mode="hard",
                 target_exists=True,
+                source_is_nonempty=True,
             )
         return self._result(
             contract,
@@ -293,8 +315,9 @@ def build_silver(
     batch_id: str,
     full_rebuild: bool = False,
     bronze_manifest: BronzeBatchManifest | None = None,
+    timings_ms: dict[str, int] | None = None,
 ) -> SilverBatchManifest:
-    return SilverBuilder(spark, config, bronze_manifest).run(
+    return SilverBuilder(spark, config, bronze_manifest, timings_ms).run(
         table_names,
         batch_id=batch_id,
         full_rebuild=full_rebuild,
