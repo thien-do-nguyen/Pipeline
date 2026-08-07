@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
+import pytest
 from pydantic import SecretStr
-from pyspark.sql import SparkSession
+from pyspark.sql import Row, SparkSession
 
 from ecommerce_pipeline.config.models import (
     AppConfig,
@@ -18,6 +21,7 @@ from ecommerce_pipeline.ingestion.batch.bronze_operations import (
     change_event_query,
     collect_change_event_stats,
     jdbc_partition_count,
+    read_batch_upper_bounds,
 )
 
 
@@ -72,6 +76,17 @@ def test_upper_bound_query_captures_all_sources_in_one_snapshot() -> None:
     assert "events.source_table = cursors.source_table" in query
     assert "events.event_id > cursors.last_event_id" in query
     assert "ORDER BY events.event_id LIMIT 500000" in query
+    assert "AS source_max_event_id" in query
+
+
+def test_batch_fails_fast_when_postgres_event_sequence_regresses() -> None:
+    reader = Mock()
+    reader.read_all.return_value = [
+        Row(source_table="orders", batch_upper_bound=None, source_max_event_id=1301),
+    ]
+
+    with pytest.raises(RuntimeError, match="sequence regressed"):
+        read_batch_upper_bounds(reader, _config(), {"orders": EventCursor(last_event_id=314_673)})
 
 
 def test_jdbc_partition_count_is_dynamic_and_source_throttled() -> None:

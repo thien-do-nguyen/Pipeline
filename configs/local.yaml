@@ -4,7 +4,8 @@ application:
   logs_path: "logs"
 
 spark:
-  master: "local[*]"
+  # Bound local concurrency so decoded Debezium JSON cannot exhaust driver heap.
+  master: "local[4]"
   configure_delta_package: true
   stop_session: true
   config:
@@ -16,7 +17,41 @@ spark:
     spark.ui.showConsoleProgress: "false"
     spark.driver.bindAddress: "127.0.0.1"
     spark.driver.host: "127.0.0.1"
+    spark.driver.memory: "2g"
     spark.databricks.delta.snapshotPartitions: "2"
+    spark.sql.debug.maxToStringFields: "2000"
+    spark.driver.extraJavaOptions: "-Dlog4j2.configurationFile=file:infra/local/spark/log4j2.properties"
+    spark.executor.extraJavaOptions: "-Dlog4j2.configurationFile=file:infra/local/spark/log4j2.properties"
 
 lakehouse:
   base_path: data/lakehouse
+
+streaming:
+  enabled: true
+  trigger_interval: 2 seconds
+  # v2: reset after migrating local CDC from one routed topic to 12 per-table Debezium topics.
+  checkpoint_version: v2
+  checkpoint_root: data/checkpoints
+  spark_packages:
+    - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.2
+  kafka:
+    bootstrap_servers: localhost:29092
+    topic_pattern: "ecommerce\\.customer_app\\..*"
+    starting_offsets: earliest
+    fail_on_data_loss: true
+    max_offsets_per_trigger: 100000
+  silver:
+    enabled: true
+    trigger_interval: 5 seconds
+    # v3 replays Raw Bronze after fixing foreachBatch writer-session transactions.
+    checkpoint_version: v3
+    max_files_per_trigger: 4
+    max_bytes_per_trigger: 32m
+    reconcile_gold_each_batch: true
+    max_gold_readiness_order_ids: 5000
+    gold_deferred_retry_seconds: 30
+    gold_deferred_retry_interval_seconds: 2
+
+coordination:
+  # Local CDC owns Gold; local batch --mode all intentionally stops at Silver.
+  gold_owner: streaming

@@ -5,13 +5,15 @@ from time import perf_counter
 from typing import Literal
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
 
 from ecommerce_pipeline.adapters.lakehouse import (
     LakehouseAdapter,
     delta_commit_metadata,
+    delta_idempotent_transaction,
+    latest_delta_pipeline_commit,
     read_delta,
     try_delta_table_state,
+    write_delta,
 )
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.bronze_tables import BRONZE_SCHEMA_VERSION
@@ -21,11 +23,25 @@ from ecommerce_pipeline.control.manifests import (
     SilverBatchManifest,
     SilverTableResult,
 )
-from ecommerce_pipeline.transformations.silver.common import SILVER_SCHEMA_VERSION
-from ecommerce_pipeline.transformations.silver.customers import supports_customer_table, transform_customer_table
-from ecommerce_pipeline.transformations.silver.sales import supports_sales_table, transform_sales_table
+from ecommerce_pipeline.transformations.silver.common import (
+    SILVER_SCHEMA_VERSION,
+    SILVER_SEQUENCE_COLUMNS,
+    silver_change_history_table_name,
+)
+from ecommerce_pipeline.transformations.silver.customers import (
+    supports_customer_table,
+    transform_customer_history,
+    transform_customer_table,
+)
+from ecommerce_pipeline.transformations.silver.sales import (
+    supports_sales_table,
+    transform_sales_history,
+    transform_sales_table,
+)
 
 SILVER_PIPELINE_NAME = "bronze_to_silver"
+SILVER_CHANGE_HISTORY_PIPELINE_NAME = "bronze_to_silver_change_history"
+SILVER_DATA_PIPELINES = (SILVER_PIPELINE_NAME, "cdc_to_silver")
 
 
 class SilverBuilder:
@@ -123,7 +139,11 @@ class SilverBuilder:
                 "no_change",
                 None,
                 current_bronze_version,
-                silver_state.progress_version,
+                latest_delta_pipeline_commit(
+                    self.spark,
+                    silver_reference,
+                    pipelines=SILVER_DATA_PIPELINES,
+                ).version,
             )
 
         self._validate_schema_version(table_name, silver_state.progress)
@@ -133,7 +153,16 @@ class SilverBuilder:
             starting_version=starting_version,
             ending_version=current_bronze_version,
         )
+        history = self.transform_history(contract, changes)
         transformed = self.transform(contract, changes)
+        self.append_change_history(
+            contract,
+            history,
+            batch_id=batch_id,
+            bronze_version=current_bronze_version,
+            bronze_starting_version=starting_version,
+            transaction_version=current_bronze_version,
+        )
         with delta_commit_metadata(
             self.spark,
             self._progress_metadata(
@@ -148,7 +177,8 @@ class SilverBuilder:
                 "silver",
                 table_name,
                 contract.primary_keys,
-                delete_mode="hard",
+                delete_mode="soft",
+                sequence_columns=SILVER_SEQUENCE_COLUMNS,
                 target_exists=True,
                 source_is_nonempty=True,
             )
@@ -167,6 +197,13 @@ class SilverBuilder:
         if supports_sales_table(contract.table_name):
             return transform_sales_table(bronze_df, contract)
         raise ValueError(f"Missing silver transformation for table: {contract.table_name}")
+
+    def transform_history(self, contract: SilverTableContract, bronze_df: DataFrame) -> DataFrame:
+        if supports_customer_table(contract.table_name):
+            return transform_customer_history(bronze_df, contract)
+        if supports_sales_table(contract.table_name):
+            return transform_sales_history(bronze_df, contract)
+        raise ValueError(f"Missing silver history transformation for table: {contract.table_name}")
 
     def read_snapshot(self, table_name: str) -> DataFrame:
         return read_delta(self.spark, self.config.lakehouse.table_reference("bronze", table_name))
@@ -205,9 +242,9 @@ class SilverBuilder:
         bronze_version: int,
         batch_id: str,
     ) -> None:
-        snapshot = self.transform(contract, self.read_snapshot(contract.table_name)).filter(
-            F.coalesce(F.col("_operation") != F.lit("DELETE"), F.lit(True))
-        )
+        source = self.read_snapshot(contract.table_name)
+        snapshot = self.transform(contract, source)
+        history = self.transform_history(contract, source)
         with delta_commit_metadata(
             self.spark,
             self._progress_metadata(
@@ -223,6 +260,61 @@ class SilverBuilder:
                 contract.table_name,
                 enable_change_data_feed=True,
             )
+        with delta_commit_metadata(
+            self.spark,
+            self._history_progress_metadata(
+                contract.table_name,
+                bronze_version,
+                batch_id,
+                bronze_starting_version=None,
+            ),
+        ):
+            self.lakehouse.write_table(
+                history,
+                "silver",
+                silver_change_history_table_name(contract.table_name),
+                enable_change_data_feed=True,
+            )
+
+    def append_change_history(
+        self,
+        contract: SilverTableContract,
+        history: DataFrame,
+        *,
+        batch_id: str,
+        bronze_version: int,
+        bronze_starting_version: int | None,
+        transaction_version: int,
+        pipeline_name: str = SILVER_CHANGE_HISTORY_PIPELINE_NAME,
+        transaction_app_id: str | None = None,
+    ) -> bool:
+        """Append immutable Silver Change History rows with Delta retry idempotency."""
+
+        table_name = silver_change_history_table_name(contract.table_name)
+        reference = self.config.lakehouse.table_reference("silver", table_name)
+        metadata = self._history_progress_metadata(
+            contract.table_name,
+            bronze_version,
+            batch_id,
+            bronze_starting_version=bronze_starting_version,
+            pipeline_name=pipeline_name,
+        )
+        with (
+            delta_commit_metadata(self.spark, metadata),
+            delta_idempotent_transaction(
+                self.spark,
+                application_id=transaction_app_id or f"{pipeline_name}:{contract.table_name}:v{SILVER_SCHEMA_VERSION}",
+                transaction_version=transaction_version,
+            ),
+        ):
+            writer = (
+                history.write.format("delta")
+                .mode("append")
+                .option("mergeSchema", "true")
+                .option("delta.enableChangeDataFeed", "true")
+            )
+            write_delta(writer, reference)
+        return True
 
     @staticmethod
     def _progress_metadata(
@@ -239,6 +331,26 @@ class SilverBuilder:
             "last_processed_bronze_version": bronze_version,
             "bronze_starting_version": bronze_starting_version,
             "silver_schema_version": SILVER_SCHEMA_VERSION,
+        }
+
+    @staticmethod
+    def _history_progress_metadata(
+        table_name: str,
+        bronze_version: int,
+        batch_id: str,
+        *,
+        bronze_starting_version: int | None,
+        pipeline_name: str = SILVER_CHANGE_HISTORY_PIPELINE_NAME,
+    ) -> dict[str, object]:
+        return {
+            "pipeline": pipeline_name,
+            "source_table": table_name,
+            "history_table": silver_change_history_table_name(table_name),
+            "batch_id": batch_id,
+            "last_processed_bronze_version": bronze_version,
+            "bronze_starting_version": bronze_starting_version,
+            "silver_schema_version": SILVER_SCHEMA_VERSION,
+            "append_only": True,
         }
 
     def _validate_schema_version(self, table_name: str, metadata: dict[str, object] | None) -> None:

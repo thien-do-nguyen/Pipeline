@@ -81,13 +81,31 @@ def test_gold_full_builds_once_when_delta_progress_is_missing() -> None:
 
     builder.run(batch_id="batch-3")
 
-    builder._run_full.assert_called_once_with()
+    builder._run_full.assert_called_once_with(replace=False)
     builder._run_incremental.assert_not_called()
     builder._publish.assert_called_once_with(
         current,
         "batch-3",
         frozenset(GOLD_TABLES),
         None,
+    )
+
+
+def test_explicit_gold_full_rebuild_replaces_existing_candidates() -> None:
+    builder = _builder()
+    current = {"orders": 9}
+    previous = _release({"orders": 8})
+    builder._silver_versions = Mock(return_value=current)
+    builder.releases.latest.return_value = previous
+
+    builder.run(batch_id="recovery", full_rebuild=True)
+
+    builder._run_full.assert_called_once_with(replace=True)
+    builder._publish.assert_called_once_with(
+        current,
+        "recovery",
+        frozenset(GOLD_TABLES),
+        previous,
     )
 
 

@@ -36,3 +36,28 @@ spark:
     spark.sql.parquet.datetimeRebaseModeInWrite: CORRECTED
     spark.sql.parquet.int96RebaseModeInRead: CORRECTED
     spark.sql.parquet.int96RebaseModeInWrite: CORRECTED
+
+streaming:
+  enabled: false
+  query_name: ecommerce-cdc-to-bronze
+  bronze_table: cdc_events
+  checkpoint_version: v1
+  trigger_interval: 15 seconds
+  silver:
+    enabled: false
+    query_name: ecommerce-cdc-to-silver
+    checkpoint_version: v1
+    trigger_interval: 30 seconds
+    max_files_per_trigger: 8
+    max_bytes_per_trigger: 32m
+    reconcile_gold_each_batch: false
+    max_gold_readiness_order_ids: 5000
+    gold_deferred_retry_seconds: 0
+    gold_deferred_retry_interval_seconds: 2
+
+coordination:
+  # Keep the deployed batch job as owner until the cloud streaming job is enabled.
+  gold_owner: batch
+  cloud_lock_name: unified_silver_writer
+  cloud_lock_ttl_seconds: 21600
+  lock_wait_seconds: 600

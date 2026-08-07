@@ -8,6 +8,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from time import monotonic, sleep
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -112,16 +113,26 @@ def _validate_safe_name(value: str, label: str) -> None:
 
 
 @contextmanager
-def local_pipeline_lock(logs_path: str, batch_id: str) -> Iterator[None]:
+def local_pipeline_lock(
+    logs_path: str,
+    batch_id: str,
+    *,
+    wait_timeout_seconds: int = 0,
+) -> Iterator[None]:
     """Prevent concurrent writers for the local filesystem implementation."""
 
     lock_path = Path(logs_path) / "_pipeline.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError as exc:
-        owner = lock_path.read_text(encoding="utf-8").strip() if lock_path.exists() else "unknown"
-        raise RuntimeError(f"Another local pipeline run is active: {owner}") from exc
+    deadline = monotonic() + wait_timeout_seconds
+    while True:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError as exc:
+            if monotonic() >= deadline:
+                owner = lock_path.read_text(encoding="utf-8").strip() if lock_path.exists() else "unknown"
+                raise RuntimeError(f"Another local pipeline run is active: {owner}") from exc
+            sleep(1)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as lock_file:
             lock_file.write(batch_id)

@@ -4,6 +4,7 @@ from pyspark.sql import DataFrame
 
 from ecommerce_pipeline.contracts.silver_tables import SilverTableContract
 from ecommerce_pipeline.transformations.silver.common import (
+    change_history,
     clean_text,
     current_state,
     normalize_lower,
@@ -21,6 +22,36 @@ def transform_customer_table(df: DataFrame, contract: SilverTableContract) -> Da
     if not supports_customer_table(contract.table_name):
         raise ValueError(f"Unsupported customer silver table: {contract.table_name}")
     cleaned = current_state(df, contract)
+    if contract.table_name == "app_users":
+        cleaned = clean_text(cleaned, ["username", "email", "first_name", "last_name", "phone_number"])
+        cleaned = normalize_lower(cleaned, ["username", "email", "status"])
+        cleaned = normalize_phone(cleaned)
+        return cleaned
+
+    cleaned = clean_text(
+        cleaned,
+        [
+            "address_type",
+            "recipient_name",
+            "phone_number",
+            "street",
+            "ward",
+            "district",
+            "city",
+            "state",
+            "postal_code",
+            "country",
+        ],
+    )
+    cleaned = normalize_lower(cleaned, ["address_type"])
+    cleaned = normalize_phone(cleaned)
+    return cleaned
+
+
+def transform_customer_history(df: DataFrame, contract: SilverTableContract) -> DataFrame:
+    if not supports_customer_table(contract.table_name):
+        raise ValueError(f"Unsupported customer silver history table: {contract.table_name}")
+    cleaned = change_history(df, contract)
     if contract.table_name == "app_users":
         cleaned = clean_text(cleaned, ["username", "email", "first_name", "last_name", "phone_number"])
         cleaned = normalize_lower(cleaned, ["username", "email", "status"])

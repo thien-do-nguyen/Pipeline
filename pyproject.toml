@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ecommerce-pipeline"
 version = "0.1.0"
-description = "Local-first PostgreSQL to Delta Lake batch pipeline for an ecommerce lakehouse"
+description = "Local-first PostgreSQL batch and CDC streaming pipeline to Delta Lake"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 
@@ -19,6 +19,8 @@ dependencies = [
 [project.scripts]
 ecommerce-generate = "ecommerce_pipeline.generator.cli:main"
 ecommerce-batch = "ecommerce_pipeline.jobs.run_batch:main"
+ecommerce-stream = "ecommerce_pipeline.jobs.run_streaming:main"
+ecommerce-silver-stream = "ecommerce_pipeline.jobs.run_silver_streaming:main"
 ecommerce-validate = "ecommerce_pipeline.jobs.validate_batch:main"
 
 [project.optional-dependencies]

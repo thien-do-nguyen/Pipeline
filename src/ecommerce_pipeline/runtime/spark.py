@@ -11,8 +11,9 @@ SPARK_WAREHOUSE_CONFIG = "spark.sql.warehouse.dir"
 
 
 class SparkSessionBuilder:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, *, extra_packages: tuple[str, ...] = ()) -> None:
         self.config = config
+        self.extra_packages = extra_packages
         self.builder = SparkSession.builder.appName(config.spark.app_name)
 
     def _configure_delta_package(self) -> None:
@@ -26,18 +27,24 @@ class SparkSessionBuilder:
             for package in self.config.spark.config.get("spark.jars.packages", "").split(",")
             if package.strip()
         ]
+        extra_packages.extend(package for package in self.extra_packages if package not in extra_packages)
 
         self.builder = configure_spark_with_delta_pip(self.builder, extra_packages=extra_packages)
 
     def build(self) -> SparkSession:
         if self.config.spark.configure_delta_package:
             self._configure_delta_package()
+        elif self.extra_packages:
+            configured = self.config.spark.config.get("spark.jars.packages", "")
+            packages = [package.strip() for package in configured.split(",") if package.strip()]
+            packages.extend(package for package in self.extra_packages if package not in packages)
+            self.builder = self.builder.config("spark.jars.packages", ",".join(packages))
 
         if self.config.spark.master:
             self.builder = self.builder.master(self.config.spark.master)
 
         for key, value in self.config.spark.config.items():
-            if key == "spark.jars.packages" and self.config.spark.configure_delta_package:
+            if key == "spark.jars.packages" and (self.config.spark.configure_delta_package or self.extra_packages):
                 continue
             self.builder = self.builder.config(key, value)
 
@@ -52,5 +59,5 @@ class SparkSessionBuilder:
         return spark
 
 
-def build_spark(config: AppConfig) -> SparkSession:
-    return SparkSessionBuilder(config).build()
+def build_spark(config: AppConfig, *, extra_packages: tuple[str, ...] = ()) -> SparkSession:
+    return SparkSessionBuilder(config, extra_packages=extra_packages).build()

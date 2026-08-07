@@ -1,26 +1,34 @@
 # E-commerce Lakehouse Pipeline — Local và Azure Databricks
 
-Repo này chạy batch pipeline trên Spark local hoặc Azure Databricks:
+Repo này chạy batch pipeline trên Spark local/Azure Databricks và PostgreSQL CDC streaming ở local:
 
 ```text
-PostgreSQL OLTP
-      │ transactional triggers + JDBC event cursor from Delta commit metadata
-      ▼
-Bronze Delta (append-only change events)
-      │ Delta Change Data Feed by table version
-      ▼
-Silver Delta (one current row per source PK)
-      │ dimensional transformations
-      ▼
-Gold Delta (star schema + fact_sales)
-      │ quality checks → atomic release marker in fact_sales/_delta_log
-      ▼
-Analytics-ready Lakehouse
+                         PostgreSQL OLTP
+                         /             \
+          JDBC full snapshot          WAL / Debezium / Kafka
+                   │                           │
+                   ▼                           ▼
+       Bronze Batch Raw              Bronze Streaming Raw CDC
+       bronze/batch/<table>           bronze/streaming/cdc_events
+                   \                 │
+                    \       12 Typed Bronze + quarantine
+                     \      bronze/streaming/<table>
+                      \               /
+                     ▼                       ▼
+                  Unified Silver (một row hiện tại/PK + tombstone)
+                                  │
+                                  ▼
+                  Unified Gold (star schema + fact_sales)
+                                  │
+                                  ▼
+                       Analytics-ready Lakehouse
 ```
 
 Spark/JDBC compute có thể chạy local hoặc trên Databricks. Local dùng filesystem; cloud dùng external Delta tables
 trên StorageV2/ADLS Gen2 do project sở hữu. Unity Catalog quản lý metadata, permissions, lineage và governance.
-Power BI có thể đọc Gold qua Databricks SQL; ADF, Event Hubs và Debezium/Kafka chưa nằm trong phạm vi hiện tại.
+Power BI có thể đọc Gold qua Databricks SQL. Local CDC dùng đúng Kafka protocol để khi triển khai cloud chỉ cần
+đổi broker/security/checkpoint/storage configuration sang Event Hubs, ADLS và Unity Catalog. ADF và cloud streaming
+deployment chưa nằm trong phạm vi hiện tại.
 
 ## 1. Những tính chất pipeline bảo đảm
 
@@ -33,9 +41,11 @@ Power BI có thể đọc Gold qua Databricks SQL; ADF, Event Hubs và Debezium/
 - Column filtering cho analytics chỉ diễn ra ở Silver; Bronze bổ sung `_record_hash`, `_batch_id`, `_ingested_at`
   và source metadata.
 - Retry an toàn: dữ liệu và Bronze cursor cùng thuộc một Delta transaction.
-- Silver đọc Change Data Feed theo các Bronze Delta version chưa xử lý, chọn event mới nhất theo source PK và
-  merge SCD1 vào Delta.
-- Silver lưu `_bronze_event_id`; Bronze version đã xử lý nằm trong commit metadata của Silver `_delta_log`.
+- Silver là điểm hội tụ duy nhất của Batch Bronze và Streaming CDC Bronze. Cả hai dùng chung transformation và
+  cùng ghi một Delta table cho mỗi entity.
+- Silver chọn event theo `event_occurred_at`, ưu tiên CDC khi hòa, rồi sequence của nguồn; tombstone được giữ vật lý
+  để batch cũ không thể làm sống lại record đã bị CDC xóa.
+- Reader nghiệp vụ loại `_is_deleted=true`; Gold chỉ đọc Unified Silver và không biết dữ liệu đến từ batch hay stream.
 - Một batch truyền Bronze Delta versions trực tiếp sang Silver và Silver versions trực tiếp sang Gold, tránh đọc
   lại history của 12 bảng ở layer kế tiếp.
 - Nếu toàn bộ Bronze tables không có event mới, `--mode all` kết thúc ngay sau Bronze và không scan metadata
@@ -56,7 +66,11 @@ Power BI có thể đọc Gold qua Databricks SQL; ADF, Event Hubs và Debezium/
 - Gold chỉ publish sau khi quality pass. Một metadata-only commit trên `fact_sales` giữ version chính xác của mọi
   Gold table trong Delta table property `pipeline.goldActiveRelease`;
   consumer đọc bằng snapshot `versionAsOf`, nên không thấy trạng thái nửa batch.
-- Local pipeline dùng lock để ngăn hai writer chạy đồng thời.
+- Shared Silver writer dùng local file lock hoặc Delta-backed cloud lock theo từng micro-batch. Gold có đúng một owner
+  cấu hình bằng `coordination.gold_owner`; local giao ownership cho streaming nên batch dừng ở Silver.
+- CDC downstream vật lý hóa 12 typed contracts thành Delta trước khi Silver đọc. Valid records tiếp tục xử lý;
+  record lỗi type/schema/key đi vào `bronze/streaming/quarantine` và phát quality alert, không làm chết query.
+- Typed Bronze và mỗi Silver target dùng `txnAppId + txnVersion`; sequence guard bảo vệ retry/out-of-order event.
 
 ## 2. Cấu trúc repo
 
@@ -69,11 +83,16 @@ azure-lakehouse-pipeline/
 ├── schema/
 │   ├── oltpSchema.sql            # PostgreSQL source schema
 │   └── dwhSchema.sql             # physical reference cho Gold star schema
+├── infra/local/
+│   ├── postgres/                 # idempotent CDC role + publication bootstrap
+│   ├── kafka/                    # Kafka topics, gồm compacted Connect state topics
+│   └── connect/                  # Debezium connector config + registration
 ├── src/ecommerce_pipeline/
 │   ├── ingestion/batch/          # PostgreSQL change events → full-fidelity Bronze
+│   ├── ingestion/streaming/      # Kafka source → normalized raw CDC Bronze
 │   ├── pipelines/                # Silver/Gold orchestration and quality gates
 │   ├── transformations/          # pure Silver/Gold DataFrame transformations
-│   ├── contracts/                # layer-specific Bronze/Silver contracts
+│   ├── contracts/                # layer-specific Bronze/Silver/CDC contracts
 │   ├── adapters/                 # PostgreSQL and Delta Lake I/O
 │   ├── control/                  # run status and local lock
 │   ├── validation/               # cross-layer validation
@@ -85,7 +104,7 @@ azure-lakehouse-pipeline/
 │   ├── unit/
 │   ├── integration/
 │   └── e2e/
-├── data/lakehouse/               # generated Delta tables, không commit Git
+├── data/lakehouse/               # generated Bronze/Silver/Gold Delta tables, không commit Git
 ├── docker-compose.yaml
 ├── pyproject.toml
 ├── Makefile
@@ -98,7 +117,7 @@ azure-lakehouse-pipeline/
 - Python 3.11 hoặc 3.12.
 - Java 17.
 - Docker Engine/Desktop có Docker Compose v2.
-- Tối thiểu khoảng 4 GB RAM trống cho PostgreSQL + Spark local.
+- Tối thiểu khoảng 4 GB RAM trống cho batch; nên có 8 GB RAM trống khi chạy thêm Kafka và Kafka Connect.
 
 Kiểm tra:
 
@@ -199,6 +218,11 @@ make seed CUSTOMERS=10000 ORDERS=50000 SEED_BATCH_SIZE=1000
 `make seed` luôn reset dữ liệu trước khi chạy. Sau baseline, mỗi chunk order được commit độc lập; nếu một chunk lỗi,
 chạy lại lệnh sẽ reset và tạo lại dữ liệu deterministic.
 
+Vì reset dùng `TRUNCATE ... RESTART IDENTITY`, `make seed` sẽ fail-fast khi local Lakehouse hoặc checkpoint cũ
+còn tồn tại. PostgreSQL CDC không sinh row-level `DELETE` cho truncate, nên giữ state cũ có thể để lại row mồ côi
+trong Unified Silver. Muốn tạo baseline mới, chạy `make pg-reset` trước để PostgreSQL, Kafka, Lakehouse và cả hai
+checkpoint cùng bắt đầu trong một source epoch. Dùng `make seed-stream` cho thay đổi incremental khi pipeline đang chạy.
+
 Mỗi batch của `seed-stream` chủ động tạo đủ các trường hợp để quan sát pipeline:
 
 - Insert order cùng order items, voucher áp dụng (nếu có), payment và shipment.
@@ -232,9 +256,9 @@ Job thực hiện tuần tự:
 
 1. Đọc event mới trong `customer_app.change_events` qua JDBC và append vào 12 bảng Bronze.
 2. Dựng current-state, normalize và merge vào 12 bảng Silver.
-3. Dựng candidate dimensions + `fact_sales`, merge vào Gold.
-4. Chạy quality gate và source-to-Gold reconciliation.
-5. Atomically publish release marker chứa Delta version của toàn bộ Gold tables vào `_delta_log` của `fact_sales`.
+3. Nếu batch là Gold owner, dựng candidate dimensions + `fact_sales`; local mặc định bỏ qua vì streaming là owner.
+4. Khi batch là Gold owner, chạy quality gate và source-to-Gold reconciliation.
+5. Khi batch là Gold owner, atomically publish release marker chứa Delta version của toàn bộ Gold tables.
 6. Ghi run status JSON ở `logs/batch_runs/`, tách khỏi dữ liệu Lakehouse.
 
 Output chính:
@@ -277,7 +301,114 @@ make validate
 
 Lệnh trả JSON gồm số version Bronze, số current rows Silver, số order/items/fact và tổng gross/discount/tax/shipping/net của Gold. Nếu có sai lệch lớn hơn `0.01`, job fail.
 
-## 5. Chứng minh incremental và idempotency
+## 5. Chạy PostgreSQL CDC streaming ở local
+
+CDC stack dùng PostgreSQL logical replication, Kafka KRaft và Debezium Connect. `cdc-up` không reset database;
+nó chạy bootstrap idempotent để tạo replication role/publication trên cả database mới và volume đã tồn tại:
+
+```bash
+make cdc-up
+make cdc-status
+```
+
+Connector chụp consistent initial snapshot của 12 bảng rồi tiếp tục đọc WAL. `change_events` không thuộc publication
+và `app_users.password_hash` bị loại ngay tại connector. Mỗi bảng nguồn được ghi vào một Kafka topic riêng theo mẫu
+`ecommerce.customer_app.<table>`; Spark đọc 12 topic này bằng `subscribePattern` rồi landing vào Raw CDC Bronze.
+Kafka Connect vẫn dùng ba compacted internal topics riêng.
+
+Đọc hết Kafka event hiện có vào Raw CDC Bronze, sau đó merge backlog vào Unified Silver và cập nhật cùng một Gold:
+
+```bash
+make run-cdc-local-once
+```
+
+Hai bước cũng có thể chạy riêng để kiểm tra:
+
+```bash
+make run-stream-local-once
+make run-silver-stream-local-once
+```
+
+Chạy liên tục ở hai terminal và tạo source changes ở terminal thứ ba:
+
+```bash
+make run-stream-local
+```
+
+```bash
+make run-silver-stream-local
+```
+
+```bash
+make seed-stream ORDERS_PER_BATCH=2 INTERVAL_SECONDS=3
+```
+
+Continuous downstream merge micro-batch vào Unified Silver rồi reconcile Gold ngay khi
+`streaming.silver.reconcile_gold_each_batch: true`. Job `reconcile-gold-local` vẫn dùng được để backfill hoặc repair
+thủ công từ Unified Silver đã hợp nhất:
+
+```bash
+make reconcile-gold-local
+```
+
+Output và recovery state:
+
+```text
+data/lakehouse/bronze/streaming/cdc_events/       # raw append-only Delta
+data/lakehouse/bronze/streaming/<table>/          # 12 typed append-only Delta tables
+data/lakehouse/bronze/streaming/quarantine/       # invalid CDC side-output
+data/checkpoints/ecommerce-cdc-to-bronze/v2/     # Kafka offsets + query metadata
+data/lakehouse/silver/<table>/                    # shared Batch + CDC current state
+data/lakehouse/gold/<table>/                      # shared curated model
+data/checkpoints/ecommerce-cdc-to-silver/v3/      # raw Delta source progress + admission control
+```
+
+Bronze giữ nguyên `key_json`, `value_json`, Kafka topic/partition/offset, PostgreSQL LSN/transaction và cờ parse
+validation. `_transport_event_id = topic:partition:offset` là transport identity. Query dùng một Delta sink và một
+checkpoint riêng, vì vậy restart tiếp tục từ offset đã commit.
+
+Downstream query đọc Raw CDC Delta như append stream và dùng một `foreachBatch`. Nó chọn `after` cho
+snapshot/create/update, chọn `before` cho delete, kiểm tra schema drift/primary key và cast timestamp, decimal,
+boolean theo contract. Nó tạo đủ 12 Delta table typed ở `bronze/streaming/<table>`, append valid rows bằng idempotent
+transaction, rồi đọc lại đúng `_batch_id` đã commit làm input cho Silver. Trên Unity Catalog, tên metadata là
+`cdc_typed_<table>` để không trùng Batch Bronze, còn external location vẫn giữ layout trên.
+Nếu Silver stream khởi động trước Kafka-to-Bronze stream, job tự tạo Raw CDC Delta table rỗng từ chính normalized
+Debezium schema; hai query vì vậy không phụ thuộc thứ tự startup.
+
+Record không hợp lệ được append vào `bronze/streaming/quarantine` cùng raw envelope, lý do, thời điểm và batch ID.
+Query log `[cdc-quality-alert]` rồi tiếp tục valid rows; việc replay cùng Spark batch ID không append quarantine trùng.
+
+Mỗi table được transform bằng cùng Silver rule của batch rồi merge vào `data/lakehouse/silver/<table>`. Merge dùng
+event time, ingestion priority và source sequence; CDC thắng batch khi cùng event time. Delete được lưu thành
+tombstone để sự kiện batch cũ không resurrect dữ liệu. Transaction identity gồm query name, checkpoint version,
+table name và Spark batch ID; retry bỏ qua transaction đã commit và tiếp tục table còn lại. Với local continuous query,
+Gold đọc Delta CDF và publish sau từng micro-batch Silver thành công. Nếu Silver chưa có đủ fact source từ 12 Kafka
+topics, stream log `[gold-reconcile] status=deferred reason=source_fact_incomplete`, retry trong cửa sổ
+`streaming.silver.gold_deferred_retry_seconds`, rồi tiếp tục idle-reconcile định kỳ khi query không nhận thêm raw file;
+khi source đã đủ thì pending scope được publish. Nếu quality vẫn fail, stream log `[gold-quality-alert]`, bỏ publish lần
+đó và tiếp tục xử lý.
+
+Batch và CDC-to-Silver chỉ giữ lock trong lúc ghi Shared Silver/Gold. Local dùng `_pipeline.lock`; cloud dùng bảng
+Delta `_pipeline_writer_locks` với optimistic concurrency và TTL, nên khóa có hiệu lực giữa hai Databricks jobs khác
+nhau. `max_concurrent_runs: 1` vẫn được giữ để chống trùng run trong cùng job, nhưng không được coi là cross-job lock.
+`coordination.gold_owner` chặn writer Gold không phải owner ngay trong code.
+
+Tắt broker/connector nhưng giữ volume và offset:
+
+```bash
+make cdc-down
+```
+
+Không xóa riêng Bronze hoặc checkpoint. `make pg-reset` tạo source epoch mới nên tự động xóa toàn bộ generated
+lakehouse và checkpoint sau khi reset PostgreSQL; nếu giữ Batch Bronze cursor hoặc streaming offset cũ, pipeline có
+thể bỏ qua event. Batch extractor cũng fail-fast khi `change_events.event_id` lùi so với Bronze cursor. Sau reset,
+seed source, chạy `make cdc-up`, rồi bootstrap lại pipeline.
+
+Nếu Silver hiện có còn schema cũ, dừng streaming, chạy `make unified-state-reset`, bootstrap lại bằng
+`make run-batch-local`, rồi chạy `make run-silver-stream-local-once` để replay Raw CDC. Target reset này chỉ xóa
+generated Silver/Gold và checkpoint downstream; Batch Bronze và Raw CDC Bronze vẫn được giữ.
+
+## 6. Chứng minh incremental và idempotency
 
 Chạy lại khi PostgreSQL không thay đổi:
 
@@ -309,12 +440,12 @@ Có thể chạy toàn bộ demo trên bằng:
 make demo-batch-local
 ```
 
-## 6. Chạy từng layer khi phát triển
+## 7. Chạy từng layer khi phát triển
 
 ```bash
 .venv/bin/python -m ecommerce_pipeline.jobs.run_batch --env local --mode bronze
 .venv/bin/python -m ecommerce_pipeline.jobs.run_batch --env local --mode silver
-.venv/bin/python -m ecommerce_pipeline.jobs.run_batch --env local --mode gold
+.venv/bin/python -m ecommerce_pipeline.jobs.run_batch --env local --mode gold  # bị chặn khi streaming owns Gold
 ```
 
 Chạy một số bảng chỉ hỗ trợ ở mode Bronze/Silver:
@@ -333,7 +464,7 @@ Schema Silver chỉ được rebuild khi yêu cầu rõ ràng:
   --env local --mode silver --full-rebuild-silver
 ```
 
-Gold cũng có explicit full rebuild cho schema/business-rule migration:
+Gold cũng có explicit full rebuild cho schema/business-rule migration khi cấu hình `gold_owner: batch`:
 
 ```bash
 .venv/bin/python -m ecommerce_pipeline.jobs.run_batch \
@@ -342,7 +473,7 @@ Gold cũng có explicit full rebuild cho schema/business-rule migration:
 
 Sau khi nâng schema Gold để thêm SCD2 cho product/shop/category, cần chạy full rebuild Gold đúng một lần.
 
-## 7. Test và quality gates
+## 8. Test và quality gates
 
 ```bash
 make format-check
@@ -371,7 +502,7 @@ Lệnh kiểm tra nhanh toàn repo:
 make check
 ```
 
-## 8. Incremental không dùng checkpoint tự quản
+## 9. Incremental không dùng checkpoint tự quản
 
 Mỗi bảng có progress độc lập nhưng progress nằm hoàn toàn trong Delta log:
 
@@ -435,7 +566,7 @@ Không dùng `spark.read.load(.../gold/...)` trực tiếp cho consumer vì các
 cả candidate chưa publish. Gold release chỉ dùng marker native trong `fact_sales/_delta_log`; pipeline không tạo
 thêm bảng điều phối.
 
-## 9. Chạy trên Azure Databricks
+## 10. Chạy trên Azure Databricks
 
 Yêu cầu:
 
@@ -497,7 +628,7 @@ vì vậy wheel cloud không đóng gói `pyspark` hoặc `delta-spark`; pipelin
 Runtime 16.4 thay vì cài thêm Maven library. Task lấy password PostgreSQL bằng `dbutils.secrets`; quyền ADLS đến từ
 Unity Catalog managed identity/storage credential, không dùng account key trong code.
 
-## 10. Giới hạn có chủ đích của batch JDBC
+## 11. Giới hạn có chủ đích của batch JDBC
 
 - Trigger/outbox làm tăng write I/O và kích thước PostgreSQL; production chỉ nên xóa event đã qua cursor của mọi consumer.
 - `event_id` polling trong project giả định một writer generator. Với OLTP concurrency lớn, dùng PostgreSQL WAL + Debezium thay vì coi sequence ID là commit order tuyệt đối.
@@ -512,7 +643,7 @@ Unity Catalog managed identity/storage credential, không dùng account key tron
   orchestrator phải đặt concurrency bằng 1 hoặc dùng distributed lease.
 - `schema/dwhSchema.sql` là physical reference; runtime local lưu Gold bằng Delta, không tạo PostgreSQL DWH riêng.
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 **Thiếu biến môi trường**: loader fail với `Missing required environment variable`. Tạo `.env` từ `.env.example`.
 
@@ -520,6 +651,25 @@ Unity Catalog managed identity/storage credential, không dùng account key tron
 
 **Spark local không tải được JAR**: lần đầu chạy local cần internet để tải Delta Lake và PostgreSQL JDBC artifacts.
 Kiểm tra proxy/firewall của Maven Central. Databricks Runtime 16.4 dùng driver tích hợp và không thực hiện bước này.
+
+**Spark streaming warning quá nhiễu ở local**: local Spark dùng `infra/local/spark/log4j2.properties` để lọc warning
+Kafka `AdminClientConfig` không có giá trị hành động. Local CDC ưu tiên near realtime: Raw Bronze trigger mỗi 2 giây,
+downstream Silver/Gold trigger mỗi 5 giây. Gold readiness chỉ kiểm tra các `order_id` bị micro-batch hiện tại hoặc
+batch trước đó ảnh hưởng, nên không scan toàn bộ Silver trong vòng polling bình thường.
+
+**`run-silver-stream-local` cứ `input_rows=0` dù Kafka/PostgreSQL có data**: kiểm tra có ai đã xóa
+`data/lakehouse/bronze/streaming/cdc_events` trong khi checkpoint `data/checkpoints/ecommerce-cdc-to-bronze/...`
+vẫn còn không. Khi checkpoint Kafka đã advance nhưng Raw Bronze Delta mất, downstream chỉ thấy source rỗng. Dừng cả hai
+stream, chạy `make cdc-state-reset`, rồi start lại `make run-stream-local` và `make run-silver-stream-local`.
+
+**Debezium task FAILED với `LSN ... no longer available`**: Kafka Connect đang giữ offset cũ nhưng PostgreSQL không
+còn WAL/schema history tại LSN đó, thường xảy ra sau khi reset PostgreSQL hoặc để connector dừng quá lâu. Reset offset
+của connector rồi để Debezium snapshot lại:
+
+```bash
+make cdc-recover-offsets
+make cdc-status
+```
 
 **Muốn chạy lại sạch Lakehouse nhưng giữ PostgreSQL**:
 

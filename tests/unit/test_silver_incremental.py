@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from ecommerce_pipeline.adapters.lakehouse import DeltaTableState
+from ecommerce_pipeline.adapters.lakehouse import DeltaPipelineCommit, DeltaTableState
 from ecommerce_pipeline.config.models import TableReference
 from ecommerce_pipeline.control.manifests import BronzeBatchManifest, BronzeTableResult
 from ecommerce_pipeline.pipelines import build_silver as silver_module
@@ -49,14 +49,22 @@ def _mock_progress(
         return DeltaTableState(silver_version or 0, silver_version, metadata)
 
     monkeypatch.setattr(silver_module, "try_delta_table_state", table_state)
+    monkeypatch.setattr(
+        silver_module,
+        "latest_delta_pipeline_commit",
+        Mock(return_value=DeltaPipelineCommit(silver_version or 0, {"silver_schema_version": 2})),
+    )
 
 
 def test_silver_processes_only_unapplied_delta_versions(monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service()
     changes = object()
     transformed = object()
+    history = object()
     service.read_changes = Mock(return_value=changes)
     service.transform = Mock(return_value=transformed)
+    service.transform_history = Mock(return_value=history)
+    service.append_change_history = Mock()
     service._validate_schema_version = Mock()
     _mock_progress(monkeypatch)
 
@@ -70,12 +78,27 @@ def test_silver_processes_only_unapplied_delta_versions(monkeypatch: pytest.Monk
     assert result.source_record_count is None
     service.read_changes.assert_called_once_with("orders", starting_version=11, ending_version=25)
     assert service.transform.call_args.args[1] is changes
+    service.transform_history.assert_called_once()
+    service.append_change_history.assert_called_once_with(
+        silver_module.get_silver_contract("orders"),
+        history,
+        batch_id="batch-1",
+        bronze_version=25,
+        bronze_starting_version=11,
+        transaction_version=25,
+    )
     service.lakehouse.upsert_table.assert_called_once_with(
         transformed,
         "silver",
         "orders",
         ("order_id",),
-        delete_mode="hard",
+        delete_mode="soft",
+        sequence_columns=(
+            "_event_occurred_at",
+            "_ingestion_priority",
+            "_source_event_sequence",
+            "_source_event_subsequence",
+        ),
         target_exists=True,
         source_is_nonempty=True,
     )

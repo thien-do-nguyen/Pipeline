@@ -5,11 +5,16 @@ from dataclasses import asdict, dataclass
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter, delta_table_state, read_delta
+from ecommerce_pipeline.adapters.lakehouse import (
+    LakehouseAdapter,
+    delta_table_state,
+    latest_delta_pipeline_commit,
+    read_delta,
+)
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
 from ecommerce_pipeline.control.gold_releases import GoldReleaseStore
-from ecommerce_pipeline.pipelines.build_silver import SILVER_PIPELINE_NAME
+from ecommerce_pipeline.pipelines.build_silver import SILVER_DATA_PIPELINES, SILVER_PIPELINE_NAME
 from ecommerce_pipeline.pipelines.quality import GoldQualityChecker, GoldQualityReport
 
 
@@ -31,6 +36,7 @@ class BatchValidationReport:
 
 def validate_batch_lakehouse(spark: SparkSession, config: AppConfig) -> BatchValidationReport:
     lakehouse = LakehouseAdapter(spark, config)
+    streaming_counts = _streaming_event_counts(spark, config)
     reports: list[LayerTableReport] = []
     current_silver_versions: dict[str, int] = {}
     for table_name, contract in SILVER_TABLES.items():
@@ -38,6 +44,7 @@ def validate_batch_lakehouse(spark: SparkSession, config: AppConfig) -> BatchVal
         silver_path = config.lakehouse.table_reference("silver", table_name)
         bronze = read_delta(spark, bronze_path)
         silver = lakehouse.read_table("silver", table_name)
+        physical_silver = read_delta(spark, silver_path)
         bronze_state = delta_table_state(spark, bronze_path, pipeline="postgres_to_bronze")
         silver_state = delta_table_state(
             spark,
@@ -81,24 +88,29 @@ def validate_batch_lakehouse(spark: SparkSession, config: AppConfig) -> BatchVal
             invalid_metadata = invalid_metadata | F.col(column_name).isNull()
         if bronze.filter(invalid_metadata).take(1):
             raise ValueError(f"Null ingestion metadata in bronze.{table_name}")
-        duplicate = silver.groupBy(*contract.primary_keys).count().filter(F.col("count") > 1)
+        duplicate = physical_silver.groupBy(*contract.primary_keys).count().filter(F.col("count") > 1)
         if duplicate.take(1):
             raise ValueError(f"Duplicate key in silver.{table_name}: {contract.primary_keys}")
         null_key = F.lit(False)
         for key in contract.primary_keys:
             null_key = null_key | F.col(key).isNull()
-        if silver.filter(null_key).take(1):
+        if physical_silver.filter(null_key).take(1):
             raise ValueError(f"Null primary key in silver.{table_name}")
-        if "_bronze_event_id" not in silver.columns:
-            raise ValueError(f"Missing incremental lineage in silver.{table_name}: _bronze_event_id")
-        if silver.filter(F.col("_bronze_event_id") > F.lit(last_event_id)).take(1):
+        if "_source_event_sequence" not in silver.columns or "_ingestion_mode" not in silver.columns:
+            raise ValueError(f"Missing unified lineage in silver.{table_name}")
+        if physical_silver.filter(
+            (F.col("_ingestion_mode") == "batch") & (F.col("_source_event_sequence") > F.lit(last_event_id))
+        ).take(1):
             raise ValueError(f"Silver contains an event beyond Bronze progress for {table_name}")
         bronze_versions = bronze.count()
         silver_rows = silver.count()
-        if silver_rows > bronze_versions:
+        physical_silver_rows = physical_silver.count()
+        total_source_versions = bronze_versions + streaming_counts.get(table_name, 0)
+        if physical_silver_rows > total_source_versions:
             raise ValueError(
-                f"Silver row count exceeds Bronze source versions for {table_name}: "
-                f"silver={silver_rows}, bronze={bronze_versions}"
+                f"Silver row count exceeds combined Bronze source versions for {table_name}: "
+                f"silver={physical_silver_rows}, batch_bronze={bronze_versions}, "
+                f"streaming_bronze={streaming_counts.get(table_name, 0)}"
             )
         reports.append(
             LayerTableReport(
@@ -107,9 +119,11 @@ def validate_batch_lakehouse(spark: SparkSession, config: AppConfig) -> BatchVal
                 silver_rows=silver_rows,
             )
         )
-        if silver_state.progress_version is None:
-            raise ValueError(f"Silver Delta progress metadata is missing for {table_name}")
-        current_silver_versions[table_name] = silver_state.progress_version
+        current_silver_versions[table_name] = latest_delta_pipeline_commit(
+            spark,
+            silver_path,
+            pipelines=SILVER_DATA_PIPELINES,
+        ).version
     releases = GoldReleaseStore(spark, config)
     release = releases.latest()
     published_silver_versions = None if release is None else release.silver_versions
@@ -123,3 +137,24 @@ def validate_batch_lakehouse(spark: SparkSession, config: AppConfig) -> BatchVal
         raise RuntimeError("Gold has no published release")
     gold_report = GoldQualityChecker(lakehouse.with_gold_versions(release.gold_versions)).run()
     return BatchValidationReport(tables=tuple(reports), gold=gold_report)
+
+
+def _streaming_event_counts(spark: SparkSession, config: AppConfig) -> dict[str, int]:
+    from delta.tables import DeltaTable
+
+    reference = config.lakehouse.streaming_bronze_reference(config.streaming.bronze_table)
+    exists = (
+        spark.catalog.tableExists(reference.value)
+        if reference.is_catalog
+        else DeltaTable.isDeltaTable(spark, reference.value)
+    )
+    if not exists:
+        return {}
+    rows = (
+        read_delta(spark, reference)
+        .where(F.col("is_valid") & F.col("source_table").isin(*SILVER_TABLES))
+        .groupBy("source_table")
+        .count()
+        .collect()
+    )
+    return {str(row["source_table"]): int(row["count"]) for row in rows}
