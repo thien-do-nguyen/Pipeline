@@ -82,3 +82,25 @@ def test_change_event_log_captures_insert_update_and_delete_without_password_has
     assert [event["operation"] for event in events] == ["INSERT", "UPDATE", "DELETE"]
     assert all(event["primary_key"] == {"user_id": user_id} for event in events)
     assert all("password_hash" not in event["row_data"] for event in events)
+
+
+@pytest.mark.integration
+def test_debezium_role_and_publication_match_the_cdc_contract() -> None:
+    if os.getenv("RUN_INTEGRATION") != "1":
+        pytest.skip("Set RUN_INTEGRATION=1 with PostgreSQL running")
+    config = load_config("local")
+
+    with connect(config.postgres) as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT rolreplication FROM pg_roles WHERE rolname = 'ecommerce_cdc'")
+        role = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT schemaname, tablename
+            FROM pg_publication_tables
+            WHERE pubname = 'ecommerce_cdc_publication'
+            """
+        )
+        published = {(str(row["schemaname"]), str(row["tablename"])) for row in cursor.fetchall()}
+
+    assert role is not None and role["rolreplication"] is True
+    assert published == {(config.postgres.source_schema, table) for table in BRONZE_TABLES}

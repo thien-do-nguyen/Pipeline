@@ -4,6 +4,7 @@ from pyspark.sql import DataFrame
 
 from ecommerce_pipeline.contracts.silver_tables import SilverTableContract
 from ecommerce_pipeline.transformations.silver.common import (
+    change_history,
     clean_text,
     current_state,
     normalize_lower,
@@ -64,6 +65,16 @@ def transform_sales_table(df: DataFrame, contract: SilverTableContract) -> DataF
     if not supports_sales_table(contract.table_name):
         raise ValueError(f"Unsupported sales silver table: {contract.table_name}")
     cleaned = current_state(df, contract)
+    cleaned = clean_text(cleaned, sorted(TEXT_COLUMNS & set(cleaned.columns)))
+    cleaned = normalize_lower(cleaned, sorted(LOWER_COLUMNS & set(cleaned.columns)))
+    cleaned = normalize_upper(cleaned, sorted(UPPER_COLUMNS & set(cleaned.columns)))
+    return cleaned
+
+
+def transform_sales_history(df: DataFrame, contract: SilverTableContract) -> DataFrame:
+    if not supports_sales_table(contract.table_name):
+        raise ValueError(f"Unsupported sales silver history table: {contract.table_name}")
+    cleaned = change_history(df, contract)
     cleaned = clean_text(cleaned, sorted(TEXT_COLUMNS & set(cleaned.columns)))
     cleaned = normalize_lower(cleaned, sorted(LOWER_COLUMNS & set(cleaned.columns)))
     cleaned = normalize_upper(cleaned, sorted(UPPER_COLUMNS & set(cleaned.columns)))

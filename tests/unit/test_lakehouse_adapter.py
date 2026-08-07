@@ -1,12 +1,16 @@
+import json
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from pyspark.sql import Row
 
 from ecommerce_pipeline.adapters.lakehouse import (
     LakehouseAdapter,
     _delta_sql_identifier,
+    _lexicographic_newer_condition,
     _sql_identifier,
+    latest_delta_pipeline_commit,
     write_delta,
 )
 from ecommerce_pipeline.config.models import LakehouseConfig, TableReference
@@ -22,6 +26,39 @@ def test_delta_sql_identifier_preserves_cloud_uri() -> None:
     path = "abfss://lakehouse@example.dfs.core.windows.net/silver/orders"
 
     assert _delta_sql_identifier(path) == f"delta.`{path}`"
+
+
+def test_merge_sequence_predicate_is_lexicographic_and_null_safe() -> None:
+    condition = _lexicographic_newer_condition(["event_time", "priority", "sequence"])
+
+    assert condition is not None
+    assert "source.`event_time` > target.`event_time`" in condition
+    assert "source.`event_time` <=> target.`event_time`" in condition
+    assert "source.`priority` > target.`priority`" in condition
+    assert "source.`sequence` > target.`sequence`" in condition
+
+
+def test_latest_data_commit_ignores_delta_maintenance_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    latest_history = Mock()
+    latest_history.select.return_value.first.return_value = Row(version=9, userMetadata=None)
+    fallback_history = Mock()
+    fallback_history.select.return_value.collect.return_value = [
+        Row(version=9, userMetadata=None),
+        Row(version=8, userMetadata=json.dumps({"pipeline": "cdc_to_silver"})),
+        Row(version=7, userMetadata=json.dumps({"pipeline": "bronze_to_silver"})),
+    ]
+    delta = Mock()
+    delta.history.side_effect = [latest_history, fallback_history]
+    monkeypatch.setattr("ecommerce_pipeline.adapters.lakehouse._delta_table", Mock(return_value=delta))
+
+    commit = latest_delta_pipeline_commit(
+        Mock(),
+        "data/lakehouse/silver/orders",
+        pipelines=("bronze_to_silver", "cdc_to_silver"),
+    )
+
+    assert commit.version == 8
+    assert commit.metadata["pipeline"] == "cdc_to_silver"
 
 
 def test_gold_snapshot_reads_the_published_delta_version() -> None:

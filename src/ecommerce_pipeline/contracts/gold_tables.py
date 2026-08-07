@@ -35,6 +35,7 @@ class Scd2DimensionContract:
             "effective_from",
             "effective_to",
             "is_current",
+            "is_deleted",
         }
 
 

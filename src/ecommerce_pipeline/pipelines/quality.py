@@ -11,6 +11,10 @@ from ecommerce_pipeline.adapters.lakehouse import LakehouseAdapter
 from ecommerce_pipeline.contracts.gold_tables import SCD2_DIMENSIONS, Scd2DimensionContract
 
 
+class GoldQualityError(ValueError):
+    """A candidate Gold snapshot failed a data quality gate and was not published."""
+
+
 @dataclass(frozen=True)
 class GoldQualityReport:
     source_order_rows: int
@@ -137,7 +141,7 @@ class GoldQualityChecker:
         violations = [self._scd2_violations(name, SCD2_DIMENSIONS[name]) for name in names]
         violation = self._union_all(violations).first()
         if violation is not None:
-            raise ValueError(f"Invalid SCD2 history in gold.{violation['dimension']}: {violation['violation']}")
+            raise GoldQualityError(f"Invalid SCD2 history in gold.{violation['dimension']}: {violation['violation']}")
 
     @staticmethod
     @contextmanager
@@ -168,7 +172,7 @@ class GoldQualityChecker:
             .first()
         )
         if row is None:
-            raise ValueError("Gold quality metrics are unavailable")
+            raise GoldQualityError("Gold quality metrics are unavailable")
         return (
             self._fact_metrics_from_row(row),
             int(row["source_order_rows"]),
@@ -215,13 +219,13 @@ class GoldQualityChecker:
     @staticmethod
     def _assert_fact_metrics(metrics: _FactMetrics, table_name: str) -> None:
         if metrics.distinct_source_keys != metrics.rows:
-            raise ValueError(f"Duplicate key in gold.{table_name}: ['source_order_id', 'source_order_item_id']")
+            raise GoldQualityError(f"Duplicate key in gold.{table_name}: ['source_order_id', 'source_order_item_id']")
         if metrics.distinct_sales_keys != metrics.rows:
-            raise ValueError(f"Duplicate key in gold.{table_name}: ['sales_key']")
+            raise GoldQualityError(f"Duplicate key in gold.{table_name}: ['sales_key']")
         if metrics.invalid_amount_rows:
-            raise ValueError("Gold fact contains null/invalid quantity or monetary amounts")
+            raise GoldQualityError("Gold fact contains null/invalid quantity or monetary amounts")
         if metrics.unresolved_key_rows:
-            raise ValueError("Gold fact contains unresolved required dimension keys")
+            raise GoldQualityError("Gold fact contains unresolved required dimension keys")
 
     def _assert_dimension_integrity(self, fact: DataFrame, *, check_uniqueness: bool) -> None:
         references = [
@@ -285,15 +289,26 @@ class GoldQualityChecker:
 
         violation = self._union_all(violations).first()
         if violation is not None:
-            raise ValueError(str(violation["violation"]))
+            raise GoldQualityError(str(violation["violation"]))
 
     def _scd2_violations(self, table_name: str, contract: Scd2DimensionContract) -> DataFrame:
         dimension = self.lakehouse.read_table("gold", table_name).filter(F.col(contract.source_key).isNotNull())
-        all_members = dimension.select(contract.source_key).distinct()
+        all_members = dimension.groupBy(contract.source_key).agg(
+            F.max(F.col("effective_to")).alias("_last_effective_to"),
+            F.max(F.col("is_deleted").cast("int")).alias("_has_deleted_version")
+            if "is_deleted" in dimension.columns
+            else F.lit(0).alias("_has_deleted_version"),
+        )
         current_counts = dimension.filter("is_current").groupBy(contract.source_key).count()
         invalid_current = (
             all_members.join(current_counts, contract.source_key, "left")
-            .filter(F.coalesce(F.col("count"), F.lit(0)) != 1)
+            .filter(
+                (F.coalesce(F.col("count"), F.lit(0)) > F.lit(1))
+                | (
+                    (F.coalesce(F.col("count"), F.lit(0)) == F.lit(0))
+                    & (F.coalesce(F.col("_has_deleted_version"), F.lit(0)) == F.lit(0))
+                )
+            )
             .select(
                 F.lit(table_name).alias("dimension"),
                 F.lit("invalid current member count").alias("violation"),
@@ -324,7 +339,9 @@ class GoldQualityChecker:
         source_item_rows: int,
     ) -> GoldQualityReport:
         if source_item_rows != metrics.rows:
-            raise ValueError(f"Fact row count mismatch: source_items={source_item_rows}, fact_rows={metrics.rows}")
+            raise GoldQualityError(
+                f"Fact row count mismatch: source_items={source_item_rows}, fact_rows={metrics.rows}"
+            )
 
         source_keys = items.select(
             F.col("order_id").alias("source_order_id"),
@@ -370,9 +387,9 @@ class GoldQualityChecker:
         violations = self._union_all([missing_items, monetary_mismatches]).limit(3).collect()
         if violations:
             if any(row["violation"] == "missing_order_item" for row in violations):
-                raise ValueError("Gold fact is missing one or more source order-item keys")
+                raise GoldQualityError("Gold fact is missing one or more source order-item keys")
             examples = [row["details"] for row in violations]
-            raise ValueError(f"Source-to-Gold monetary reconciliation failed: {examples}")
+            raise GoldQualityError(f"Source-to-Gold monetary reconciliation failed: {examples}")
 
         return GoldQualityReport(
             source_order_rows=source_order_rows,

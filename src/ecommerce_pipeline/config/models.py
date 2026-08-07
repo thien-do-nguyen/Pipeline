@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -99,6 +100,131 @@ class SparkConfig(FrozenConfigModel):
     config: dict[str, str] = Field(default_factory=dict)
 
 
+class KafkaSourceConfig(FrozenConfigModel):
+    """Kafka protocol settings shared by local Kafka and Azure Event Hubs."""
+
+    bootstrap_servers: str = Field(min_length=1)
+    topic: str | None = Field(default=None, min_length=1)
+    topic_pattern: str | None = Field(default=None, min_length=1)
+    starting_offsets: str = Field(default="earliest", min_length=1)
+    fail_on_data_loss: bool = True
+    max_offsets_per_trigger: int = Field(default=100_000, ge=1)
+    options: dict[str, str] = Field(default_factory=dict)
+    secret_options: dict[str, SecretStr] = Field(default_factory=dict)
+
+    @field_validator("topic")
+    @classmethod
+    def validate_topic(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+            raise ValueError("topic contains unsupported characters")
+        return value
+
+    @model_validator(mode="after")
+    def validate_subscription_mode(self) -> KafkaSourceConfig:
+        if (self.topic is None) == (self.topic_pattern is None):
+            raise ValueError("Configure exactly one of kafka.topic or kafka.topic_pattern")
+        return self
+
+    @property
+    def subscribe_key(self) -> Literal["subscribe", "subscribePattern"]:
+        return "subscribe" if self.topic is not None else "subscribePattern"
+
+    @property
+    def subscription(self) -> str:
+        return self.topic if self.topic is not None else str(self.topic_pattern)
+
+    def spark_options(self) -> dict[str, str]:
+        options = {
+            "kafka.bootstrap.servers": self.bootstrap_servers,
+            self.subscribe_key: self.subscription,
+            "startingOffsets": self.starting_offsets,
+            "failOnDataLoss": str(self.fail_on_data_loss).lower(),
+            "maxOffsetsPerTrigger": str(self.max_offsets_per_trigger),
+            "includeHeaders": "true",
+        }
+        options.update(self.options)
+        options.update({key: value.get_secret_value() for key, value in self.secret_options.items()})
+        return options
+
+
+class UnifiedSilverStreamingConfig(FrozenConfigModel):
+    """Settings for the raw CDC to shared Silver/Gold query."""
+
+    enabled: bool = False
+    query_name: str = Field(default="ecommerce-cdc-to-silver", min_length=1)
+    checkpoint_version: str = Field(default="v1", pattern=r"^v[1-9][0-9]*$")
+    trigger_interval: str = Field(default="1 minute", min_length=1)
+    max_files_per_trigger: int = Field(default=8, ge=1, le=10_000)
+    max_bytes_per_trigger: str = Field(default="32m", pattern=r"^[1-9][0-9]*[kKmMgG]$")
+    reconcile_gold_each_batch: bool = False
+    max_gold_readiness_order_ids: int = Field(default=5_000, ge=1, le=1_000_000)
+    gold_deferred_retry_seconds: int = Field(default=0, ge=0, le=600)
+    gold_deferred_retry_interval_seconds: float = Field(default=2.0, gt=0, le=60)
+
+
+class PipelineCoordinationConfig(FrozenConfigModel):
+    """Single-writer policy shared by batch and streaming runtimes."""
+
+    gold_owner: Literal["batch", "streaming"] = "batch"
+    cloud_lock_name: str = Field(default="unified_silver_writer", min_length=1)
+    cloud_lock_ttl_seconds: int = Field(default=21_600, ge=300, le=86_400)
+    lock_wait_seconds: int = Field(default=600, ge=0, le=3600)
+
+    @field_validator("cloud_lock_name")
+    @classmethod
+    def validate_cloud_lock_name(cls, value: str) -> str:
+        if not _IDENTIFIER.fullmatch(value):
+            raise ValueError("cloud_lock_name must be a safe identifier")
+        return value
+
+
+class StreamingConfig(FrozenConfigModel):
+    """Validated runtime settings for PostgreSQL CDC ingestion."""
+
+    enabled: bool = False
+    query_name: str = Field(default="ecommerce-cdc-to-bronze", min_length=1)
+    bronze_table: str = Field(default="cdc_events", min_length=1)
+    checkpoint_root: str | None = Field(default=None, min_length=1)
+    checkpoint_version: str = Field(default="v1", pattern=r"^v[1-9][0-9]*$")
+    trigger_interval: str = Field(default="30 seconds", min_length=1)
+    spark_packages: tuple[str, ...] = ()
+    kafka: KafkaSourceConfig | None = None
+    silver: UnifiedSilverStreamingConfig = Field(default_factory=UnifiedSilverStreamingConfig)
+
+    @field_validator("bronze_table")
+    @classmethod
+    def validate_bronze_table(cls, value: str) -> str:
+        if not _IDENTIFIER.fullmatch(value):
+            raise ValueError("bronze_table must be a safe identifier")
+        return value
+
+    @model_validator(mode="after")
+    def validate_enabled_settings(self) -> StreamingConfig:
+        if self.enabled and (self.kafka is None or self.checkpoint_root is None):
+            raise ValueError("Enabled streaming requires kafka and checkpoint_root")
+        if self.silver.enabled and self.checkpoint_root is None:
+            raise ValueError("Enabled streaming Silver requires streaming.checkpoint_root")
+        return self
+
+    @property
+    def checkpoint_location(self) -> str:
+        if self.checkpoint_root is None:
+            raise ValueError("Streaming checkpoint_root is not configured")
+        return "/".join((self.checkpoint_root.rstrip("/"), self.query_name, self.checkpoint_version))
+
+    @property
+    def silver_checkpoint_location(self) -> str:
+        if self.checkpoint_root is None:
+            raise ValueError("Streaming checkpoint_root is not configured")
+        return "/".join(
+            (
+                self.checkpoint_root.rstrip("/"),
+                self.silver.query_name,
+                self.silver.checkpoint_version,
+            )
+        )
+
+
 @dataclass(frozen=True)
 class TableReference:
     value: str
@@ -155,10 +281,73 @@ class LakehouseConfig(FrozenConfigModel):
         parts.append(table_name)
         return TableReference(value="/".join(parts), is_catalog=False)
 
+    def streaming_bronze_reference(self, table_name: str) -> TableReference:
+        """Resolve the raw CDC table without changing the batch Bronze layout."""
+
+        if not _IDENTIFIER.fullmatch(table_name):
+            raise ValueError(f"Unsafe table_name: {table_name}")
+        if self.catalog is not None:
+            return TableReference(
+                value=f"{self.catalog}.{self.schemas['bronze']}.{table_name}",
+                is_catalog=True,
+                storage_path=(
+                    None
+                    if self.external_root is None
+                    else "/".join((self.external_root.rstrip("/"), "bronze", "streaming", table_name))
+                ),
+            )
+        assert self.base_path is not None
+        return TableReference(
+            value="/".join((self.base_path.rstrip("/"), "bronze", "streaming", table_name)),
+            is_catalog=False,
+        )
+
+    def streaming_typed_bronze_reference(self, table_name: str) -> TableReference:
+        """Resolve typed CDC without colliding with batch Bronze in Unity Catalog."""
+
+        if not _IDENTIFIER.fullmatch(table_name):
+            raise ValueError(f"Unsafe table_name: {table_name}")
+        if self.catalog is not None:
+            return TableReference(
+                value=f"{self.catalog}.{self.schemas['bronze']}.cdc_typed_{table_name}",
+                is_catalog=True,
+                storage_path=(
+                    None
+                    if self.external_root is None
+                    else "/".join((self.external_root.rstrip("/"), "bronze", "streaming", table_name))
+                ),
+            )
+        assert self.base_path is not None
+        return TableReference(
+            value="/".join((self.base_path.rstrip("/"), "bronze", "streaming", table_name)),
+            is_catalog=False,
+        )
+
+    def coordination_reference(self) -> TableReference:
+        """Resolve the Delta-backed cross-job advisory lock table."""
+
+        if self.catalog is not None:
+            return TableReference(
+                value=f"{self.catalog}.{self.schemas['silver']}._pipeline_writer_locks",
+                is_catalog=True,
+                storage_path=(
+                    None
+                    if self.external_root is None
+                    else "/".join((self.external_root.rstrip("/"), "_control", "pipeline_writer_locks"))
+                ),
+            )
+        assert self.base_path is not None
+        return TableReference(
+            value="/".join((self.base_path.rstrip("/"), "_control", "pipeline_writer_locks")),
+            is_catalog=False,
+        )
+
 
 class AppConfig(FrozenConfigModel):
     application: ApplicationConfig
     postgres: PostgresConfig
     spark: SparkConfig
     lakehouse: LakehouseConfig
+    streaming: StreamingConfig = Field(default_factory=StreamingConfig)
+    coordination: PipelineCoordinationConfig = Field(default_factory=PipelineCoordinationConfig)
     environment: str = Field(min_length=1)

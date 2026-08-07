@@ -163,6 +163,7 @@ def build_dim_customer(users: DataFrame, spark: SparkSession) -> DataFrame:
         F.coalesce("updated_at", "created_at").alias("effective_from"),
         F.lit("9999-12-31").cast("timestamp").alias("effective_to"),
         F.lit(True).alias("is_current"),
+        F.lit(False).alias("is_deleted"),
         F.current_timestamp().alias("created_at"),
         F.current_timestamp().alias("updated_at"),
     )
@@ -174,7 +175,7 @@ def build_dim_customer(users: DataFrame, spark: SparkSession) -> DataFrame:
                CAST(NULL AS STRING) phone_number, 'unknown' customer_status, CAST(NULL AS STRING) attribute_hash,
                CAST(NULL AS TIMESTAMP) registered_at, CAST(NULL AS TIMESTAMP) last_login_at,
                TIMESTAMP '1970-01-01' effective_from, TIMESTAMP '9999-12-31' effective_to, TRUE is_current,
-               current_timestamp() created_at, current_timestamp() updated_at
+               FALSE is_deleted, current_timestamp() created_at, current_timestamp() updated_at
         """
     )
     return unknown.unionByName(rows)
@@ -245,6 +246,7 @@ def build_dim_shop(shops: DataFrame, spark: SparkSession) -> DataFrame:
         effective_from.alias("effective_from"),
         F.lit("9999-12-31").cast("timestamp").alias("effective_to"),
         F.lit(True).alias("is_current"),
+        F.lit(False).alias("is_deleted"),
         F.current_timestamp().alias("created_at"),
         F.current_timestamp().alias("updated_at"),
     )
@@ -254,7 +256,7 @@ def build_dim_shop(shops: DataFrame, spark: SparkSession) -> DataFrame:
                'Unknown Shop' shop_name, CAST(NULL AS STRING) shop_slug, 'unknown' shop_status,
                CAST(NULL AS STRING) attribute_hash, CAST(NULL AS TIMESTAMP) shop_created_at,
                TIMESTAMP '1970-01-01' effective_from, TIMESTAMP '9999-12-31' effective_to, TRUE is_current,
-               current_timestamp() created_at, current_timestamp() updated_at
+               FALSE is_deleted, current_timestamp() created_at, current_timestamp() updated_at
         """
     )
     return unknown.unionByName(rows)
@@ -294,6 +296,7 @@ def build_dim_category(categories: DataFrame, spark: SparkSession) -> DataFrame:
         effective_from.alias("effective_from"),
         F.lit("9999-12-31").cast("timestamp").alias("effective_to"),
         F.lit(True).alias("is_current"),
+        F.lit(False).alias("is_deleted"),
         F.current_timestamp().alias("created_at"),
         F.current_timestamp().alias("updated_at"),
     )
@@ -304,7 +307,7 @@ def build_dim_category(categories: DataFrame, spark: SparkSession) -> DataFrame:
                'unknown' category_slug, CAST(NULL AS STRING) parent_category_name, FALSE is_active,
                CAST(NULL AS STRING) attribute_hash, CAST(NULL AS TIMESTAMP) category_created_at,
                TIMESTAMP '1970-01-01' effective_from, TIMESTAMP '9999-12-31' effective_to, TRUE is_current,
-               current_timestamp() created_at, current_timestamp() updated_at
+               FALSE is_deleted, current_timestamp() created_at, current_timestamp() updated_at
         """
     )
     return unknown.unionByName(rows)
@@ -408,6 +411,7 @@ def build_dim_product(products: DataFrame, variants: DataFrame, spark: SparkSess
         effective_from.alias("effective_from"),
         F.lit("9999-12-31").cast("timestamp").alias("effective_to"),
         F.lit(True).alias("is_current"),
+        F.lit(False).alias("is_deleted"),
         F.current_timestamp().alias("created_at"),
         F.current_timestamp().alias("updated_at"),
     )
@@ -427,7 +431,7 @@ def build_dim_product(products: DataFrame, variants: DataFrame, spark: SparkSess
                CAST(NULL AS TIMESTAMP) product_created_at, CAST(NULL AS TIMESTAMP) variant_created_at,
                CAST(NULL AS STRING) attribute_hash, TIMESTAMP '1970-01-01' effective_from,
                TIMESTAMP '9999-12-31' effective_to, TRUE is_current,
-               current_timestamp() created_at, current_timestamp() updated_at
+               FALSE is_deleted, current_timestamp() created_at, current_timestamp() updated_at
         """
     )
     return unknown.unionByName(rows)

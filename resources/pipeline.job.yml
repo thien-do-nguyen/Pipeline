@@ -8,7 +8,7 @@ resources:
 
       tasks:
         - task_key: run_pipeline
-          existing_cluster_id: 0729-012731-0heucyp7
+          existing_cluster_id: 0804-071458-pswonf6z
           python_wheel_task:
             package_name: ecommerce_pipeline
             entry_point: ecommerce-batch

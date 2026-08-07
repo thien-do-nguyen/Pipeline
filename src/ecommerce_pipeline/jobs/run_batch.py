@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from importlib import import_module
 from time import perf_counter
@@ -10,13 +11,17 @@ from typing import Protocol, cast
 from pydantic import SecretStr
 from pyspark.sql import SparkSession
 
+from ecommerce_pipeline.adapters.lakehouse import try_latest_delta_pipeline_commit
 from ecommerce_pipeline.config.loader import load_config
 from ecommerce_pipeline.config.models import AppConfig
+from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
 from ecommerce_pipeline.control.batch_runs import local_pipeline_lock, new_batch_id, write_batch_run_status
+from ecommerce_pipeline.control.cloud_lock import cloud_pipeline_lock
+from ecommerce_pipeline.control.gold_releases import GoldReleaseStore
 from ecommerce_pipeline.control.manifests import BronzeBatchManifest, BronzeTableResult, SilverBatchManifest
 from ecommerce_pipeline.ingestion.batch.extract_to_bronze import extract_all_to_bronze
 from ecommerce_pipeline.pipelines.build_gold import build_gold
-from ecommerce_pipeline.pipelines.build_silver import build_silver
+from ecommerce_pipeline.pipelines.build_silver import SILVER_DATA_PIPELINES, build_silver
 from ecommerce_pipeline.runtime.spark import build_spark
 
 
@@ -147,6 +152,7 @@ def run_mode(
             and not args.full_rebuild_silver
             and not args.full_rebuild_gold
             and _is_no_change_batch(bronze_results)
+            and _downstream_is_current(spark, config)
         ):
             print("[pipeline] no changes; skipped=silver,gold", flush=True)
             return bronze_results, outputs
@@ -155,15 +161,21 @@ def run_mode(
     if args.mode in {"silver", "all"}:
         started = perf_counter()
         silver_tables = args.tables if args.mode == "silver" else None
-        silver_manifest = build_silver(
-            spark,
-            config,
-            silver_tables,
-            batch_id=batch_id,
-            full_rebuild=args.full_rebuild_silver,
-            bronze_manifest=bronze_manifest if args.mode == "all" else None,
-            timings_ms=timings_ms,
+        writer_lock = (
+            cloud_pipeline_lock(spark, config, f"batch-{batch_id}")
+            if getattr(getattr(config, "spark", None), "master", "local") is None
+            else nullcontext()
         )
+        with writer_lock:
+            silver_manifest = build_silver(
+                spark,
+                config,
+                silver_tables,
+                batch_id=batch_id,
+                full_rebuild=args.full_rebuild_silver,
+                bronze_manifest=bronze_manifest if args.mode == "all" else None,
+                timings_ms=timings_ms,
+            )
         outputs["silver"] = silver_manifest.outputs
         timings_ms["silver"] = round((perf_counter() - started) * 1000)
         print(
@@ -180,7 +192,12 @@ def run_mode(
             timings_ms=timings_ms,
         )
 
-    if args.mode in {"gold", "all"}:
+    gold_owner = getattr(getattr(config, "coordination", None), "gold_owner", "batch")
+    if args.mode == "gold" and gold_owner != "batch":
+        raise RuntimeError(
+            "Gold ownership is assigned to streaming; batch --mode gold is disabled to prevent dual writers"
+        )
+    if args.mode in {"gold", "all"} and gold_owner == "batch":
         started = perf_counter()
         outputs["gold"] = build_gold(
             spark,
@@ -204,6 +221,8 @@ def run_mode(
             outputs=outputs,
             timings_ms=timings_ms,
         )
+    elif args.mode == "all":
+        print("[gold] skipped owner=streaming; batch pipeline stops at Unified Silver", flush=True)
     return bronze_results, outputs
 
 
@@ -211,6 +230,30 @@ def _is_no_change_batch(results: list[BronzeTableResult]) -> bool:
     return bool(results) and all(
         result.ingestion_type == "incremental" and result.record_count == 0 for result in results
     )
+
+
+def _downstream_is_current(spark: SparkSession, config: AppConfig) -> bool:
+    """Skip safely only when Unified Silver exists and the active Gold release has consumed it."""
+
+    release = GoldReleaseStore(spark, config).latest()
+    if release is None or set(release.silver_versions) != set(SILVER_TABLES):
+        return False
+
+    def inspect_table(table_name: str) -> tuple[str, int | None]:
+        session = spark.newSession()
+        commit = try_latest_delta_pipeline_commit(
+            session,
+            config.lakehouse.table_reference("silver", table_name),
+            pipelines=SILVER_DATA_PIPELINES,
+        )
+        if commit is None or commit.metadata.get("silver_schema_version") != 2:
+            return table_name, None
+        return table_name, commit.version
+
+    workers = max(1, min(len(SILVER_TABLES), config.spark.max_parallel_tables))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        inspected = dict(executor.map(inspect_table, SILVER_TABLES))
+    return None not in inspected.values() and release.silver_versions == inspected
 
 
 def _seconds(milliseconds: int) -> str:

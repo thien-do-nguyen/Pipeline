@@ -46,6 +46,16 @@ def read_batch_upper_bounds(
     if not cursors:
         return {}
     rows = reader.read_all(batch_upper_bounds_query(config, cursors))
+    for row in rows:
+        table_name = str(row["source_table"])
+        cursor = cursors[table_name]
+        source_max = None if row["source_max_event_id"] is None else int(row["source_max_event_id"])
+        if cursor is not None and (source_max is None or source_max < cursor.last_event_id):
+            raise RuntimeError(
+                f"PostgreSQL change-event sequence regressed for {table_name}: "
+                f"source_max_event_id={source_max}, bronze_last_event_id={cursor.last_event_id}. "
+                "The source was reset or replaced; reset lakehouse data and checkpoints before continuing."
+            )
     bounds = {
         str(row["source_table"]): (None if row["batch_upper_bound"] is None else int(row["batch_upper_bound"]))
         for row in rows
@@ -75,7 +85,9 @@ def batch_upper_bounds_query(
         "AND events.event_id > cursors.last_event_id "
         f"ORDER BY events.event_id LIMIT {config.postgres.max_events_per_batch}"
         ") bounded_events"
-        ") AS batch_upper_bound "
+        ") AS batch_upper_bound, "
+        f"(SELECT MAX(events.event_id) FROM {event_log} events "
+        "WHERE events.source_table = cursors.source_table) AS source_max_event_id "
         f"FROM (VALUES {values}) AS cursors(source_table, last_event_id)"
     )
     return query

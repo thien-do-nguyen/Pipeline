@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from delta.tables import DeltaTable
 
 DELTA_COMMIT_METADATA_KEY = "spark.databricks.delta.commitInfo.userMetadata"
+DELTA_TXN_APP_ID_KEY = "spark.databricks.delta.write.txnAppId"
+DELTA_TXN_VERSION_KEY = "spark.databricks.delta.write.txnVersion"
 PROGRESS_HISTORY_FALLBACK_LIMIT = 100
 
 
@@ -29,6 +31,14 @@ class DeltaTableState:
     version: int
     progress_version: int | None
     progress: dict[str, object] | None
+
+
+@dataclass(frozen=True)
+class DeltaPipelineCommit:
+    """A Delta version produced by one of the requested data pipelines."""
+
+    version: int
+    metadata: dict[str, object]
 
 
 @contextmanager
@@ -46,11 +56,79 @@ def delta_commit_metadata(spark: SparkSession, metadata: dict[str, object]) -> I
             spark.conf.set(DELTA_COMMIT_METADATA_KEY, previous)
 
 
+@contextmanager
+def delta_idempotent_transaction(
+    spark: SparkSession,
+    *,
+    application_id: str,
+    transaction_version: int,
+) -> Iterator[None]:
+    """Make a retried foreachBatch write a no-op for the same Delta table."""
+
+    previous_app_id = spark.conf.get(DELTA_TXN_APP_ID_KEY, None)
+    previous_version = spark.conf.get(DELTA_TXN_VERSION_KEY, None)
+    spark.conf.set(DELTA_TXN_APP_ID_KEY, application_id)
+    spark.conf.set(DELTA_TXN_VERSION_KEY, str(transaction_version))
+    try:
+        yield
+    finally:
+        if previous_app_id is None:
+            spark.conf.unset(DELTA_TXN_APP_ID_KEY)
+        else:
+            spark.conf.set(DELTA_TXN_APP_ID_KEY, previous_app_id)
+        if previous_version is None:
+            spark.conf.unset(DELTA_TXN_VERSION_KEY)
+        else:
+            spark.conf.set(DELTA_TXN_VERSION_KEY, previous_version)
+
+
 def latest_delta_version(spark: SparkSession, reference: TableReference | str) -> int:
     row = _delta_table(spark, reference).history(1).select("version").first()
     if row is None:
         raise RuntimeError(f"Delta history is empty: {_reference(reference).value}")
     return int(row["version"])
+
+
+def latest_delta_pipeline_commit(
+    spark: SparkSession,
+    reference: TableReference | str,
+    *,
+    pipelines: Sequence[str],
+) -> DeltaPipelineCommit:
+    """Return the latest data commit while ignoring OPTIMIZE and other maintenance versions."""
+
+    if not pipelines:
+        raise ValueError("pipelines must not be empty")
+    delta = _delta_table(spark, reference)
+    latest = delta.history(1).select("version", "userMetadata").first()
+    if latest is None:
+        raise RuntimeError(f"Delta history is empty: {_reference(reference).value}")
+    metadata = _metadata_for_pipelines(latest["userMetadata"], pipelines)
+    if metadata is not None:
+        return DeltaPipelineCommit(int(latest["version"]), metadata)
+
+    rows = delta.history(PROGRESS_HISTORY_FALLBACK_LIMIT).select("version", "userMetadata").collect()
+    for row in rows:
+        metadata = _metadata_for_pipelines(row["userMetadata"], pipelines)
+        if metadata is not None:
+            return DeltaPipelineCommit(int(row["version"]), metadata)
+    raise RuntimeError(
+        f"Delta data progress metadata is missing for {_reference(reference).value}; pipelines={list(pipelines)}"
+    )
+
+
+def try_latest_delta_pipeline_commit(
+    spark: SparkSession,
+    reference: TableReference | str,
+    *,
+    pipelines: Sequence[str],
+) -> DeltaPipelineCommit | None:
+    try:
+        return latest_delta_pipeline_commit(spark, reference, pipelines=pipelines)
+    except AnalysisException as exc:
+        if _is_missing_delta_table(exc):
+            return None
+        raise
 
 
 def delta_table_state(
@@ -164,7 +242,10 @@ class LakehouseAdapter:
             if version is None:
                 raise ValueError(f"Gold table is not part of the published snapshot: {table_name}")
             options["versionAsOf"] = version
-        return read_delta(self.spark, reference, options=options)
+        result = read_delta(self.spark, reference, options=options)
+        if layer == "silver" and isinstance(result.columns, list) and "_is_deleted" in result.columns:
+            result = result.where(~F.coalesce(F.col("_is_deleted"), F.lit(False)))
+        return result
 
     def table_exists(self, layer: str, table_name: str) -> bool:
         from delta.tables import DeltaTable
@@ -198,6 +279,7 @@ class LakehouseAdapter:
         delete_not_matched_by_source: bool = False,
         *,
         delete_keys: DataFrame | None = None,
+        sequence_columns: Sequence[str] = (),
         target_exists: bool | None = None,
         source_is_nonempty: bool = False,
     ) -> bool:
@@ -209,6 +291,9 @@ class LakehouseAdapter:
             missing_delete_keys = sorted(set(merge_keys) - set(delete_keys.columns))
             if missing_delete_keys:
                 raise ValueError(f"Missing delete keys for {layer}.{table_name}: {missing_delete_keys}")
+        missing_sequence_columns = sorted(set(sequence_columns) - set(df.columns))
+        if missing_sequence_columns:
+            raise ValueError(f"Missing sequence columns for {layer}.{table_name}: {missing_sequence_columns}")
 
         reference = self.config.lakehouse.table_reference(layer, table_name)
 
@@ -232,6 +317,7 @@ class LakehouseAdapter:
                 f"missing_from_source={missing_from_source}, missing_from_target={missing_from_target}. "
                 "Rebuild the affected layer explicitly."
             )
+        newer = _lexicographic_newer_condition(sequence_columns)
 
         ignored_for_comparison = {*merge_keys, "created_at", "_silver_updated_at"}
         if layer == "gold":
@@ -261,11 +347,14 @@ class LakehouseAdapter:
                 return False
             merge = _delta_table(self.spark, reference).alias("target").merge(changes.alias("source"), join_condition)
             if delete_condition is not None:
-                merge = merge.whenMatchedDelete(condition=delete_condition)
+                matched_delete = delete_condition if newer is None else f"({newer}) AND ({delete_condition})"
+                merge = merge.whenMatchedDelete(condition=matched_delete)
             not_delete = None if delete_condition is None else f"NOT ({delete_condition})"
             if compared:
                 equality = " AND ".join(f"target.`{name}` <=> source.`{name}`" for name in compared)
                 update_condition = f"NOT ({equality})"
+                if newer is not None:
+                    update_condition = f"({newer}) AND ({update_condition})"
                 if not_delete is not None:
                     update_condition = f"{not_delete} AND {update_condition}"
                 merge = merge.whenMatchedUpdate(condition=update_condition, set=update_values)
@@ -505,7 +594,28 @@ def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _lexicographic_newer_condition(sequence_columns: Sequence[str]) -> str | None:
+    """Build a null-safe, deterministic source-newer-than-target predicate."""
+
+    if not sequence_columns:
+        return None
+    clauses: list[str] = []
+    equal_prefix: list[str] = []
+    for name in sequence_columns:
+        source = f"source.`{name}`"
+        target = f"target.`{name}`"
+        greater = f"({source} IS NOT NULL AND ({target} IS NULL OR {source} > {target}))"
+        prefix = " AND ".join(equal_prefix)
+        clauses.append(greater if not prefix else f"({prefix} AND {greater})")
+        equal_prefix.append(f"{source} <=> {target}")
+    return " OR ".join(f"({clause})" for clause in clauses)
+
+
 def _pipeline_metadata(raw: str | None, pipeline: str) -> dict[str, object] | None:
+    return _metadata_for_pipelines(raw, (pipeline,))
+
+
+def _metadata_for_pipelines(raw: str | None, pipelines: Sequence[str]) -> dict[str, object] | None:
     if raw is None:
         return None
     try:
@@ -514,7 +624,7 @@ def _pipeline_metadata(raw: str | None, pipeline: str) -> dict[str, object] | No
         return None
     if not isinstance(payload, dict):
         return None
-    return payload if payload.get("pipeline") == pipeline else None
+    return payload if payload.get("pipeline") in pipelines else None
 
 
 def _is_missing_delta_table(exc: AnalysisException) -> bool:

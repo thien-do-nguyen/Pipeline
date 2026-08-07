@@ -210,11 +210,15 @@ def update_product_variant(
         """
         UPDATE product_variants
         SET unit_price = %s,
+            compare_at_price = CASE
+                WHEN compare_at_price IS NULL THEN NULL
+                ELSE GREATEST(compare_at_price, %s)
+            END,
             stock_quantity = GREATEST(stock_quantity + %s, 0),
             updated_at = %s
         WHERE product_variant_id = %s
         """,
-        (new_price, rng.randint(-5, 20), changed_at, variant.product_variant_id),
+        (new_price, new_price, rng.randint(-5, 20), changed_at, variant.product_variant_id),
     )
     return variant.product_variant_id
 

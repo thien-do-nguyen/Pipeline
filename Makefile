@@ -4,7 +4,11 @@ CLOUD_ENV ?= .env.cloud
 -include .env
 -include $(CLOUD_ENV)
 
-.PHONY: help setup env cloud-env pg-up pg-wait pg-down pg-reset lakehouse-reset seed seed-stream \
+.PHONY: help setup env cloud-env pg-up pg-wait pg-down pg-reset lakehouse-reset cdc-state-reset unified-state-reset \
+	cdc-up cdc-down cdc-status \
+	cdc-recover-offsets \
+	run-stream-local run-stream-local-once run-silver-stream-local run-silver-stream-local-once \
+	run-cdc-local-once reconcile-gold-local seed seed-reset-guard seed-stream \
 	run-batch-local run-batch-cloud validate-batch-cloud deploy-batch-cloud validate \
 	validate-batch-local lint format format-check type-check test test-integration test-e2e check \
 	smoke demo-batch-local build
@@ -13,14 +17,16 @@ VENV_PYTHON := .venv/bin/python
 VENV_PIP := $(VENV_PYTHON) -m pip
 VENV_BIN := .venv/bin
 DATABRICKS := databricks
+CONNECTOR_NAME ?= ecommerce-postgres-cdc
+CONNECT_URL ?= http://localhost:8083
 
 CONFIG ?= configs/local.yaml
-SEED ?= 42
-CUSTOMERS ?= 10000
-ORDERS ?= 50000
-SEED_BATCH_SIZE ?= 500
-ORDERS_PER_BATCH ?= 5
-INTERVAL_SECONDS ?= 5
+SEED ?= 999
+CUSTOMERS ?= 100
+ORDERS ?= 500
+SEED_BATCH_SIZE ?= 10000
+ORDERS_PER_BATCH ?= 2
+INTERVAL_SECONDS ?= 3
 MAX_BATCHES ?=
 DATABRICKS_FLAGS ?=
 
@@ -57,8 +63,8 @@ DATABRICKS_BUNDLE_VARS := \
 	--var="secret_scope=$(DATABRICKS_SECRET_SCOPE)"
 
 help:
-	@$(VENV_PYTHON) -c "print('Targets: setup env pg-up pg-reset seed run-batch-local run-batch-cloud validate check smoke demo-batch-local')" 2>/dev/null || \
-		python3 -c "print('Targets: setup env pg-up pg-reset seed run-batch-local run-batch-cloud validate check smoke demo-batch-local')"
+	@$(VENV_PYTHON) -c "print('Targets: setup env pg-up pg-reset cdc-up cdc-status cdc-recover-offsets run-stream-local run-silver-stream-local run-cdc-local-once seed run-batch-local validate check')" 2>/dev/null || \
+		python3 -c "print('Targets: setup env pg-up pg-reset cdc-up cdc-status cdc-recover-offsets run-stream-local run-silver-stream-local run-cdc-local-once seed run-batch-local validate check')"
 
 setup:
 	python3 -m venv --copies .venv
@@ -86,11 +92,81 @@ pg-down:
 pg-reset: env
 	docker compose down -v
 	docker compose up -d postgres
+	$(MAKE) lakehouse-reset
+	@test ! -d data/checkpoints || find data/checkpoints -depth -mindepth 1 -delete
 
 lakehouse-reset:
 	find data/lakehouse -depth -mindepth 1 ! -name .gitkeep -delete
 
-seed: env
+cdc-state-reset: unified-state-reset
+	@test ! -d data/lakehouse/bronze/streaming || find data/lakehouse/bronze/streaming -depth -delete
+	@test ! -d data/checkpoints/ecommerce-cdc-to-bronze || \
+		find data/checkpoints/ecommerce-cdc-to-bronze -depth -delete
+	@test ! -d data/checkpoints/ecommerce-cdc-to-silver || \
+		find data/checkpoints/ecommerce-cdc-to-silver -depth -delete
+
+unified-state-reset:
+	@test ! -d data/lakehouse/silver || find data/lakehouse/silver -depth -delete
+	@test ! -d data/lakehouse/gold || find data/lakehouse/gold -depth -delete
+	@test ! -d data/checkpoints/ecommerce-cdc-to-silver || \
+		find data/checkpoints/ecommerce-cdc-to-silver -depth -delete
+
+cdc-up: env
+	docker compose up -d --wait postgres
+	docker compose exec -T postgres bash /docker-entrypoint-initdb.d/02_cdc.sh
+	docker compose --profile cdc up -d --wait connect
+	docker compose --profile cdc run --rm connector-init
+
+cdc-down:
+	docker compose --profile cdc stop connect kafka
+
+cdc-status:
+	docker compose exec -T connect curl --fail --silent --show-error \
+		$(CONNECT_URL)/connectors/$(CONNECTOR_NAME)/status
+
+cdc-recover-offsets:
+	docker compose exec -T connect curl --fail-with-body --silent --show-error \
+		--request PUT $(CONNECT_URL)/connectors/$(CONNECTOR_NAME)/stop
+	docker compose exec -T connect curl --fail-with-body --silent --show-error \
+		--request DELETE $(CONNECT_URL)/connectors/$(CONNECTOR_NAME)/offsets
+	docker compose --profile cdc run --rm connector-init
+	docker compose exec -T connect curl --fail-with-body --silent --show-error \
+		--request PUT $(CONNECT_URL)/connectors/$(CONNECTOR_NAME)/resume
+	docker compose exec -T connect curl --fail-with-body --silent --show-error \
+		--request POST "$(CONNECT_URL)/connectors/$(CONNECTOR_NAME)/restart?includeTasks=true&onlyFailed=false"
+
+run-stream-local: env
+	SPARK_LOCAL_IP=127.0.0.1 $(VENV_PYTHON) -m ecommerce_pipeline.jobs.run_streaming --env configs/local.yaml
+
+run-stream-local-once: env
+	SPARK_LOCAL_IP=127.0.0.1 $(VENV_PYTHON) -m ecommerce_pipeline.jobs.run_streaming \
+		--env configs/local.yaml --available-now
+
+run-silver-stream-local: env
+	SPARK_LOCAL_IP=127.0.0.1 $(VENV_PYTHON) -m ecommerce_pipeline.jobs.run_silver_streaming \
+		--env configs/local.yaml
+
+run-silver-stream-local-once: env
+	SPARK_LOCAL_IP=127.0.0.1 $(VENV_PYTHON) -m ecommerce_pipeline.jobs.run_silver_streaming \
+		--env configs/local.yaml --available-now
+
+run-cdc-local-once:
+	$(MAKE) run-stream-local-once
+	$(MAKE) run-silver-stream-local-once
+
+reconcile-gold-local: env
+	SPARK_LOCAL_IP=127.0.0.1 $(VENV_PYTHON) -m ecommerce_pipeline.jobs.reconcile_streaming_gold \
+		--env configs/local.yaml
+
+seed-reset-guard:
+	@state="$$(find data/lakehouse data/checkpoints -mindepth 1 -type f ! -name .gitkeep -print -quit 2>/dev/null)"; \
+		test -z "$$state" || { \
+			echo "Refusing source reset while generated Lakehouse/checkpoint state exists: $$state"; \
+			echo "Run 'make pg-reset' first so PostgreSQL, Kafka, Lakehouse, and checkpoints start in one source epoch."; \
+			exit 1; \
+		}
+
+seed: env seed-reset-guard
 	$(VENV_PYTHON) -m ecommerce_pipeline.generator.cli \
 		--config $(CONFIG) \
 		--seed $(SEED) \
