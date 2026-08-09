@@ -218,7 +218,7 @@ def test_retry_same_incremental_batch_is_idempotent_by_customer_key(spark: Spark
             }
         ],
     )
-    upserts = build_dim_customer_incremental(initial, batch, spark)
+    upserts = build_dim_customer_incremental(initial, batch)
 
     once = _apply_upserts(initial, upserts)
     twice = _apply_upserts(once, upserts)
@@ -257,7 +257,6 @@ def test_full_rebuild_matches_incremental_customer_processing(spark: SparkSessio
     upserts = build_dim_customer_incremental(
         initial,
         all_history.where(F.col("_source_event_sequence") > 1),
-        spark,
     )
     incremental = _apply_upserts(initial, upserts)
     full = build_dim_customer_from_history(all_history, spark, include_unknown=False)

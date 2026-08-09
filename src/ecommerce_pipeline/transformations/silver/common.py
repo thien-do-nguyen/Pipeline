@@ -15,13 +15,6 @@ SILVER_SEQUENCE_COLUMNS = (
     "_source_event_sequence",
     "_source_event_subsequence",
 )
-SILVER_HISTORY_SEQUENCE_COLUMNS = (
-    "_event_occurred_at",
-    "_ingestion_priority",
-    "_source_event_sequence",
-    "_source_event_subsequence",
-    "_history_event_id",
-)
 
 DECIMAL_COLUMNS = {
     "unit_price",

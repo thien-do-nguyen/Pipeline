@@ -45,6 +45,9 @@ deployment chưa nằm trong phạm vi hiện tại.
   cùng ghi một Delta table cho mỗi entity.
 - Silver chọn event theo `event_occurred_at`, ưu tiên CDC khi hòa, rồi sequence của nguồn; tombstone được giữ vật lý
   để batch cũ không thể làm sống lại record đã bị CDC xóa.
+- Silver chỉ materialize append-only change-history cho 5 nguồn SCD2 (`app_users`, `shops`, `categories`, `products`,
+  `product_variants`). Bảy entity giao dịch còn lại dùng append-only Bronze làm audit trail và Silver CDF làm nguồn
+  incremental, tránh 7 Delta commits không có downstream consumer trong mỗi batch.
 - Reader nghiệp vụ loại `_is_deleted=true`; Gold chỉ đọc Unified Silver và không biết dữ liệu đến từ batch hay stream.
 - Một batch truyền Bronze Delta versions trực tiếp sang Silver và Silver versions trực tiếp sang Gold, tránh đọc
   lại history của 12 bảng ở layer kế tiếp.
@@ -290,7 +293,8 @@ logs/
 ```
 
 Mỗi batch status có `timings_ms.spark_startup`, `bronze`, `silver`, `gold` và `total` để xác định layer chậm mà
-không phải suy đoán từ số record. Chi tiết từng bảng nằm ở `bronze.table.<table>`, `silver.table.<table>` và
+không phải suy đoán từ số record. Chi tiết gồm `bronze.metadata`, `bronze.source_watermarks`,
+`bronze.extract_write`, `silver.history.<table>`, `silver.merge.<table>`, thời gian acquire/release cloud lock và
 `gold.table.<table>`; các timing đã hoàn tất vẫn được giữ nếu batch lỗi.
 
 ### Bước 6 — validate kết quả
@@ -601,9 +605,18 @@ Validate bundle, build wheel, deploy job rồi chạy và chờ kết quả:
 make run-batch-cloud
 ```
 
+Khi wheel và config hiện tại đã deploy, chạy lại dữ liệu mà không build/upload/deploy artifact:
+
+```bash
+make run-deployed-batch-cloud
+```
+
+So sánh thời gian Spark pipeline bằng `timings_ms.total` trong batch JSON, không dùng wall-clock của
+`make run-batch-cloud` vì target đó còn bao gồm build wheel, upload và bundle deploy.
+
 Target này không chạy Spark trên laptop. Laptop chỉ đóng gói wheel và upload artifact; toàn bộ JDBC ingestion và
-Bronze/Silver/Gold chạy trên existing compute `ecommerce-lakehouse-dev`
-(`0729-012731-0heucyp7`). Bundle không tạo hoặc xóa compute. Mỗi deploy tạo dynamic wheel version để existing
+Bronze/Silver/Gold chạy trên existing compute cấu hình trong bundle
+(`0804-071458-pswonf6z`). Bundle không tạo hoặc xóa compute. Mỗi deploy tạo dynamic wheel version để existing
 compute không tái sử dụng package cũ có cùng version.
 YAML chỉ tồn tại một bản trong `configs/`; bundle đồng bộ thư mục này lên workspace và truyền đường dẫn tuyệt đối
 `--base-config`/`--env` cho wheel task.
@@ -615,9 +628,10 @@ bị purge. Nếu cần giữ physical Delta history cũ, hãy migrate/register 
 Lệnh in URL của run. Mở URL đó để xem Spark UI, stdout/stderr, executor logs và stack trace trong lúc job chạy.
 Console chỉ in summary ngắn theo layer và trạng thái batch; JSON đầy đủ gồm từng table, output, timings và error
 được giữ tại
-`/Workspace/Users/2251120184@ut.edu.vn/ecommerce-pipeline/logs` và vẫn còn sau khi compute terminate. Databricks
-không dùng file lock vì Job đã đặt `max_concurrent_runs: 1`; local pipeline vẫn dùng `logs/_pipeline.lock`. Log
-driver/executor chính được giữ trong Databricks Job run. Muốn xem thêm log debug của Databricks CLI:
+`/Workspace/Users/2251120184@ut.edu.vn/ecommerce-pipeline/logs` và vẫn còn sau khi compute terminate. Job có
+`max_concurrent_runs: 1`; shared Silver còn dùng Delta-backed cloud lock để bảo vệ khi batch và CDC được triển khai
+thành hai jobs khác nhau. Local pipeline dùng `logs/_pipeline.lock`. Log driver/executor chính được giữ trong
+Databricks Job run. Muốn xem thêm log debug của Databricks CLI:
 
 ```bash
 make run-batch-cloud DATABRICKS_FLAGS=--debug

@@ -54,7 +54,6 @@ def build_dim_customer_from_history(
 def build_dim_customer_incremental(
     current_dimension: DataFrame,
     new_history: DataFrame,
-    spark: SparkSession,
 ) -> DataFrame:
     """Build idempotent customer SCD2 upserts from current Gold + new history only."""
 
@@ -203,7 +202,7 @@ def _replay_single_entity_scd2(
         .when(F.col("_version_number") == F.lit(1), F.coalesce(F.col(initial_effective_from), F.col("_event_time")))
         .otherwise(F.col("_event_time"))
     )
-    dimension = starts.select(
+    return starts.select(
         positive_hash_key(F.concat_ws("||", F.col(source_key), effective_from, F.col("attribute_hash"))).alias(
             surrogate_key
         ),
@@ -215,7 +214,6 @@ def _replay_single_entity_scd2(
         F.current_timestamp().alias("created_at"),
         F.current_timestamp().alias("updated_at"),
     )
-    return dimension
 
 
 def _event_order_columns() -> tuple[Column, ...]:

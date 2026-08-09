@@ -166,7 +166,10 @@ def run_mode(
             if getattr(getattr(config, "spark", None), "master", "local") is None
             else nullcontext()
         )
+        lock_started = perf_counter()
         with writer_lock:
+            timings_ms["coordination.lock_acquire"] = round((perf_counter() - lock_started) * 1000)
+            silver_compute_started = perf_counter()
             silver_manifest = build_silver(
                 spark,
                 config,
@@ -176,6 +179,9 @@ def run_mode(
                 bronze_manifest=bronze_manifest if args.mode == "all" else None,
                 timings_ms=timings_ms,
             )
+            timings_ms["silver.compute"] = round((perf_counter() - silver_compute_started) * 1000)
+            lock_release_started = perf_counter()
+        timings_ms["coordination.lock_release"] = round((perf_counter() - lock_release_started) * 1000)
         outputs["silver"] = silver_manifest.outputs
         timings_ms["silver"] = round((perf_counter() - started) * 1000)
         print(

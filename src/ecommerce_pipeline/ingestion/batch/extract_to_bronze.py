@@ -59,13 +59,18 @@ class BronzeExtractor:
         self.timings_ms = timings_ms
 
     def run(self, table_names: list[str]) -> BronzeBatchManifest:
+        metadata_started = perf_counter()
         with ThreadPoolExecutor(max_workers=self._worker_count(len(table_names))) as executor:
             states = list(executor.map(self._table_state_in_session, table_names))
+        self._record_timing("bronze.metadata", metadata_started)
+
+        watermarks_started = perf_counter()
         upper_bounds = read_batch_upper_bounds(
             self.reader,
             self.config,
             {state.table_name: state.cursor for state in states},
         )
+        self._record_timing("bronze.source_watermarks", watermarks_started)
 
         def process(state: _BronzeState) -> BronzeTableResult:
             worker = BronzeExtractor(self.spark.newSession(), self.config, self.batch_id, self.timings_ms)
@@ -76,8 +81,10 @@ class BronzeExtractor:
                 if self.timings_ms is not None:
                     self.timings_ms[f"bronze.table.{state.table_name}"] = round((perf_counter() - started) * 1000)
 
+        extraction_started = perf_counter()
         with ThreadPoolExecutor(max_workers=self._worker_count(len(states))) as executor:
             results = list(executor.map(process, states))
+        self._record_timing("bronze.extract_write", extraction_started)
         return BronzeBatchManifest.from_results(self.batch_id, results)
 
     def _table_state_in_session(self, table_name: str) -> _BronzeState:
@@ -86,6 +93,10 @@ class BronzeExtractor:
 
     def _worker_count(self, count: int) -> int:
         return max(1, min(count, self.config.spark.max_parallel_tables))
+
+    def _record_timing(self, name: str, started: float) -> None:
+        if self.timings_ms is not None:
+            self.timings_ms[name] = round((perf_counter() - started) * 1000)
 
     def _table_state(self, table_name: str) -> _BronzeState:
         reference = self.config.lakehouse.table_reference("bronze", table_name)
@@ -120,7 +131,6 @@ class BronzeExtractor:
                 write_append_only(
                     self.spark,
                     source_df,
-                    self.config,
                     state.reference,
                     table_exists,
                     table_name=table_name,

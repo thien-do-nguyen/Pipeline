@@ -67,8 +67,7 @@ def transform_sales_table(df: DataFrame, contract: SilverTableContract) -> DataF
     cleaned = current_state(df, contract)
     cleaned = clean_text(cleaned, sorted(TEXT_COLUMNS & set(cleaned.columns)))
     cleaned = normalize_lower(cleaned, sorted(LOWER_COLUMNS & set(cleaned.columns)))
-    cleaned = normalize_upper(cleaned, sorted(UPPER_COLUMNS & set(cleaned.columns)))
-    return cleaned
+    return normalize_upper(cleaned, sorted(UPPER_COLUMNS & set(cleaned.columns)))
 
 
 def transform_sales_history(df: DataFrame, contract: SilverTableContract) -> DataFrame:
@@ -77,5 +76,4 @@ def transform_sales_history(df: DataFrame, contract: SilverTableContract) -> Dat
     cleaned = change_history(df, contract)
     cleaned = clean_text(cleaned, sorted(TEXT_COLUMNS & set(cleaned.columns)))
     cleaned = normalize_lower(cleaned, sorted(LOWER_COLUMNS & set(cleaned.columns)))
-    cleaned = normalize_upper(cleaned, sorted(UPPER_COLUMNS & set(cleaned.columns)))
-    return cleaned
+    return normalize_upper(cleaned, sorted(UPPER_COLUMNS & set(cleaned.columns)))

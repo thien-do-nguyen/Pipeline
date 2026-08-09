@@ -136,51 +136,6 @@ def build_dim_time(orders: DataFrame, spark: SparkSession) -> DataFrame:
     return unknown.unionByName(times)
 
 
-def build_dim_customer(users: DataFrame, spark: SparkSession) -> DataFrame:
-    full_name = F.trim(F.concat_ws(" ", "first_name", "last_name"))
-    attrs = natural_hash(
-        F.col("username"),
-        F.col("email"),
-        F.col("first_name"),
-        F.col("last_name"),
-        F.col("phone_number"),
-        F.col("status"),
-    )
-    rows = users.select(
-        positive_hash_key(F.concat_ws("||", "user_id", "updated_at", attrs)).alias("customer_key"),
-        F.col("user_id").alias("source_customer_id"),
-        F.col("public_user_id").alias("public_customer_id"),
-        "username",
-        "email",
-        "first_name",
-        "last_name",
-        full_name.alias("full_name"),
-        "phone_number",
-        F.col("status").alias("customer_status"),
-        attrs.alias("attribute_hash"),
-        F.col("created_at").alias("registered_at"),
-        F.col("last_login").alias("last_login_at"),
-        F.coalesce("updated_at", "created_at").alias("effective_from"),
-        F.lit("9999-12-31").cast("timestamp").alias("effective_to"),
-        F.lit(True).alias("is_current"),
-        F.lit(False).alias("is_deleted"),
-        F.current_timestamp().alias("created_at"),
-        F.current_timestamp().alias("updated_at"),
-    )
-    unknown = spark.sql(
-        """
-        SELECT CAST(0 AS BIGINT) customer_key, CAST(NULL AS INT) source_customer_id,
-               CAST(NULL AS STRING) public_customer_id, 'unknown' username, CAST(NULL AS STRING) email,
-               CAST(NULL AS STRING) first_name, CAST(NULL AS STRING) last_name, 'Unknown Customer' full_name,
-               CAST(NULL AS STRING) phone_number, 'unknown' customer_status, CAST(NULL AS STRING) attribute_hash,
-               CAST(NULL AS TIMESTAMP) registered_at, CAST(NULL AS TIMESTAMP) last_login_at,
-               TIMESTAMP '1970-01-01' effective_from, TIMESTAMP '9999-12-31' effective_to, TRUE is_current,
-               FALSE is_deleted, current_timestamp() created_at, current_timestamp() updated_at
-        """
-    )
-    return unknown.unionByName(rows)
-
-
 def build_dim_location(addresses: DataFrame, orders: DataFrame, spark: SparkSession) -> DataFrame:
     natural = location_hash(*(F.col(name) for name in ADDRESS_FIELDS))
     rows = addresses.select(

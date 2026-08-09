@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from time import perf_counter
+from typing import cast
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -82,7 +83,8 @@ class GoldBuilder:
         if not changed_tables:
             return self._paths()
 
-        self._validate_scd2_schemas()
+        with self._timed("gold.scd2_schema_validation"):
+            self._validate_scd2_schemas()
         changes = {
             name: self._read_changes(name, previous_versions[name] + 1, current_versions[name])
             for name in changed_tables
@@ -113,7 +115,7 @@ class GoldBuilder:
             with self._timed(f"gold.table.{table_name}"):
                 if table_name == "dim_customer":
                     self.lakehouse.write_table(dimension, "gold", table_name)
-                    self._write_scd2_checkpoint_from_history("dim_customer", "app_users", customer_history)
+                    self._write_scd2_checkpoint("dim_customer", "app_users")
                 else:
                     self._merge_scd2(
                         table_name,
@@ -151,12 +153,13 @@ class GoldBuilder:
                         keys,
                         delete_not_matched_by_source=True,
                     )
+
         GoldQualityChecker(self.lakehouse).run(tables)
         return frozenset(GOLD_TABLES)
 
     def _run_incremental(self, changes: dict[str, DataFrame]) -> frozenset[str]:
         changed_order_ids = self._ids_if_changed(changes, "orders", "order_id")
-        affected_order_ids = self._affected_order_ids(changes).localCheckpoint(eager=True)
+        affected_order_ids = self._affected_order_ids(changes).cache()
         try:
             has_affected_orders = not affected_order_ids.isEmpty()
             return self._apply_incremental(
@@ -191,13 +194,12 @@ class GoldBuilder:
         if "app_users" in changes:
 
             def update_customer() -> None:
-                customer_history = self._read_scd2_history_increment("dim_customer", "app_users")
-                if customer_history.isEmpty():
+                customer_history, has_customer_history = self._read_scd2_history_increment("dim_customer", "app_users")
+                if not has_customer_history:
                     return
                 upserts = build_dim_customer_incremental(
                     self.lakehouse.read_table("gold", "dim_customer"),
                     customer_history,
-                    self.spark,
                 )
                 self.lakehouse.upsert_table(
                     upserts,
@@ -207,7 +209,7 @@ class GoldBuilder:
                     target_exists=True,
                     source_is_nonempty=True,
                 )
-                self._write_scd2_checkpoint_from_history("dim_customer", "app_users", customer_history)
+                self._write_scd2_checkpoint("dim_customer", "app_users", target_exists=True)
 
             add_job("dim_customer", update_customer, scd2=True)
 
@@ -340,8 +342,9 @@ class GoldBuilder:
             facts: DataFrame | None = None
             try:
                 # Quality rules and Delta MERGE both consume this dataframe.
-                # Cut its join/window lineage once instead of embedding that
-                # large plan into every downstream aggregate and merge command.
+                # An eager local checkpoint cuts the large join/window lineage;
+                # this avoids recomputation and cache spill across quality,
+                # stale-key detection, and the Delta MERGE.
                 with self._timed("gold.fact_materialize"):
                     facts = build_fact_sales(fact_sources, fact_dimensions).localCheckpoint(eager=True)
                 existing_facts = self._filter_gold(
@@ -458,14 +461,20 @@ class GoldBuilder:
         return self._silver_versions()
 
     def _silver_versions(self) -> dict[str, int]:
-        return {
-            table_name: latest_delta_pipeline_commit(
-                self.spark,
+        table_names = tuple(SILVER_TABLES)
+
+        def read_version(table_name: str) -> tuple[str, int]:
+            session = self.spark.newSession()
+            version = latest_delta_pipeline_commit(
+                session,
                 self.config.lakehouse.table_reference("silver", table_name),
                 pipelines=SILVER_DATA_PIPELINES,
             ).version
-            for table_name in SILVER_TABLES
-        }
+            return table_name, version
+
+        workers = max(1, min(len(table_names), self.config.spark.max_parallel_tables))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return dict(executor.map(read_version, table_names))
 
     @staticmethod
     def _validate_progress(previous: dict[str, int], current: dict[str, int]) -> None:
@@ -484,15 +493,19 @@ class GoldBuilder:
     ) -> None:
         previous_versions = {} if previous_release is None else dict(previous_release.gold_versions)
         gold_versions = dict(previous_versions)
-        gold_versions.update(
-            {
-                table_name: latest_delta_version(
-                    self.spark,
-                    self.config.lakehouse.table_reference("gold", table_name),
-                )
-                for table_name in changed_tables
-            }
-        )
+        changed_names = tuple(sorted(changed_tables))
+
+        def read_version(table_name: str) -> tuple[str, int]:
+            session = self.spark.newSession()
+            version = latest_delta_version(
+                session,
+                self.config.lakehouse.table_reference("gold", table_name),
+            )
+            return table_name, version
+
+        workers = max(1, min(len(changed_names), self.config.spark.max_parallel_tables))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            gold_versions.update(executor.map(read_version, changed_names))
         missing = sorted(set(GOLD_TABLES) - set(gold_versions))
         if missing:
             raise RuntimeError(f"Gold candidate is missing committed versions: {missing}")
@@ -522,17 +535,21 @@ class GoldBuilder:
             self.spark, self.config.lakehouse.table_reference("silver", silver_change_history_table_name(table_name))
         )
 
-    def _read_scd2_history_increment(self, dimension_name: str, source_table_name: str) -> DataFrame:
+    def _read_scd2_history_increment(
+        self,
+        dimension_name: str,
+        source_table_name: str,
+    ) -> tuple[DataFrame, bool]:
         checkpoint = self._scd2_checkpoint(dimension_name)
         if checkpoint is None:
             raise RuntimeError(f"Gold SCD2 checkpoint is missing for {dimension_name}; run with --full-rebuild-gold")
         history_table = silver_change_history_table_name(source_table_name)
         history_reference = self.config.lakehouse.table_reference("silver", history_table)
         latest_history_version = latest_delta_version(self.spark, history_reference)
-        last_processed = int(checkpoint["last_processed_history_version"])
+        last_processed = cast(int, checkpoint["last_processed_history_version"])
         if latest_history_version <= last_processed:
-            return self._read_silver_history(source_table_name).limit(0)
-        return (
+            return self._read_silver_history(source_table_name).limit(0), False
+        history = (
             read_delta(
                 self.spark,
                 history_reference,
@@ -545,6 +562,7 @@ class GoldBuilder:
             .where("_change_type = 'insert'")
             .drop("_change_type", "_commit_version", "_commit_timestamp")
         )
+        return history, True
 
     def _scd2_checkpoint(self, dimension_name: str) -> dict[str, object] | None:
         if not self.lakehouse.table_exists("gold", GOLD_SCD2_CHECKPOINT_TABLE):
@@ -558,39 +576,26 @@ class GoldBuilder:
         )
         return None if row is None else row.asDict(recursive=True)
 
-    def _write_scd2_checkpoint_from_history(
+    def _write_scd2_checkpoint(
         self,
         dimension_name: str,
         source_table_name: str,
-        history: DataFrame,
+        *,
+        target_exists: bool | None = None,
     ) -> None:
         history_reference = self.config.lakehouse.table_reference(
             "silver",
             silver_change_history_table_name(source_table_name),
         )
         history_version = latest_delta_version(self.spark, history_reference)
-        event_id_row = (
-            history.orderBy(
-                F.col("_event_occurred_at").desc_nulls_last(),
-                F.col("_ingestion_priority").desc_nulls_last(),
-                F.col("_source_event_sequence").desc_nulls_last(),
-                F.col("_source_event_subsequence").desc_nulls_last(),
-                F.col("_source_lsn").desc_nulls_last(),
-                F.col("_kafka_partition").desc_nulls_last(),
-                F.col("_kafka_offset").desc_nulls_last(),
-                F.col("_history_event_id").desc_nulls_last(),
-            )
-            .select(F.col("_history_event_id").alias("last_processed_event_id"))
-            .limit(1)
-            .first()
-        )
-        last_event_id = None if event_id_row is None else event_id_row["last_processed_event_id"]
+        # Keep the legacy event-id column for Delta schema compatibility. The
+        # table version is the authoritative, monotonic CDF checkpoint.
         checkpoint = self.spark.createDataFrame(
             [
                 (
                     dimension_name,
                     int(history_version),
-                    last_event_id,
+                    None,
                 )
             ],
             "dimension_name string, last_processed_history_version long, last_processed_event_id string",
@@ -600,7 +605,7 @@ class GoldBuilder:
             "gold",
             GOLD_SCD2_CHECKPOINT_TABLE,
             ["dimension_name"],
-            target_exists=self.lakehouse.table_exists("gold", GOLD_SCD2_CHECKPOINT_TABLE),
+            target_exists=target_exists,
             source_is_nonempty=True,
         )
 
@@ -715,11 +720,21 @@ class GoldBuilder:
         }
 
     def _validate_scd2_schemas(self) -> None:
-        for table_name, contract in SCD2_DIMENSIONS.items():
-            if not self.lakehouse.table_exists("gold", table_name):
+        def inspect(table_name: str) -> tuple[str, bool, list[str]]:
+            worker = LakehouseAdapter(self.spark.newSession(), self.config)
+            if not worker.table_exists("gold", table_name):
+                return table_name, False, []
+            contract = SCD2_DIMENSIONS[table_name]
+            columns = set(worker.read_table("gold", table_name).columns)
+            return table_name, True, sorted(contract.required_columns - columns)
+
+        table_names = tuple(SCD2_DIMENSIONS)
+        workers = max(1, min(len(table_names), self.config.spark.max_parallel_tables))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            inspections = list(executor.map(inspect, table_names))
+        for table_name, exists, missing in inspections:
+            if not exists:
                 raise RuntimeError(f"Gold SCD2 table is missing: {table_name}. Run with --full-rebuild-gold")
-            columns = set(self.lakehouse.read_table("gold", table_name).columns)
-            missing = sorted(contract.required_columns - columns)
             if missing:
                 raise RuntimeError(
                     f"Gold SCD2 schema is outdated for {table_name}; missing={missing}. Run with --full-rebuild-gold"

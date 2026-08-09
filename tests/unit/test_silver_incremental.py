@@ -12,7 +12,7 @@ from ecommerce_pipeline.pipelines import build_silver as silver_module
 from ecommerce_pipeline.pipelines.build_silver import SilverBuilder
 
 
-def _service() -> SilverBuilder:
+def _service(table_name: str = "orders") -> SilverBuilder:
     service = object.__new__(SilverBuilder)
     service.spark = Mock()
     service.config = SimpleNamespace(
@@ -25,8 +25,8 @@ def _service() -> SilverBuilder:
         [
             BronzeTableResult(
                 batch_id="batch",
-                table_name="orders",
-                output_path="lakehouse/bronze/orders",
+                table_name=table_name,
+                output_path=f"lakehouse/bronze/{table_name}",
                 record_count=3,
                 ingestion_type="incremental",
                 delta_version=25,
@@ -36,6 +36,7 @@ def _service() -> SilverBuilder:
         ],
     )
     service.lakehouse = Mock()
+    service.timings_ms = None
     return service
 
 
@@ -45,6 +46,7 @@ def _mock_progress(
     silver_version: int | None = 10,
 ) -> None:
     def table_state(_spark: object, _reference: TableReference, *, pipeline: str) -> DeltaTableState:
+        assert pipeline == silver_module.SILVER_PIPELINE_NAME
         metadata = None if silver_version is None else {"last_processed_bronze_version": silver_version}
         return DeltaTableState(silver_version or 0, silver_version, metadata)
 
@@ -78,15 +80,8 @@ def test_silver_processes_only_unapplied_delta_versions(monkeypatch: pytest.Monk
     assert result.source_record_count is None
     service.read_changes.assert_called_once_with("orders", starting_version=11, ending_version=25)
     assert service.transform.call_args.args[1] is changes
-    service.transform_history.assert_called_once()
-    service.append_change_history.assert_called_once_with(
-        silver_module.get_silver_contract("orders"),
-        history,
-        batch_id="batch-1",
-        bronze_version=25,
-        bronze_starting_version=11,
-        transaction_version=25,
-    )
+    service.transform_history.assert_not_called()
+    service.append_change_history.assert_not_called()
     service.lakehouse.upsert_table.assert_called_once_with(
         transformed,
         "silver",
@@ -102,6 +97,43 @@ def test_silver_processes_only_unapplied_delta_versions(monkeypatch: pytest.Monk
         target_exists=True,
         source_is_nonempty=True,
     )
+
+
+def test_silver_materializes_history_only_for_scd2_sources() -> None:
+    expected = {"app_users", "shops", "categories", "products", "product_variants"}
+
+    actual = {name for name, contract in silver_module.SILVER_TABLES.items() if contract.materialize_change_history}
+
+    assert actual == expected
+
+
+def test_silver_reuses_scd2_source_for_history_and_current_merge(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _service("app_users")
+    changes = Mock(is_cached=False)
+    changes.cache.return_value = changes
+    history = Mock()
+    transformed = Mock()
+    service.read_changes = Mock(return_value=changes)
+    service.transform_history = Mock(return_value=history)
+    service.transform = Mock(return_value=transformed)
+    service.append_change_history = Mock()
+    service._validate_schema_version = Mock()
+    _mock_progress(monkeypatch)
+
+    service.run_table("app_users", batch_id="batch-1")
+
+    changes.cache.assert_called_once_with()
+    service.transform_history.assert_called_once_with(silver_module.get_silver_contract("app_users"), changes)
+    service.transform.assert_called_once_with(silver_module.get_silver_contract("app_users"), changes)
+    service.append_change_history.assert_called_once_with(
+        silver_module.get_silver_contract("app_users"),
+        history,
+        batch_id="batch-1",
+        bronze_version=25,
+        bronze_starting_version=11,
+        transaction_version=25,
+    )
+    changes.unpersist.assert_called_once_with()
 
 
 def test_silver_skips_transform_when_delta_version_is_current(monkeypatch: pytest.MonkeyPatch) -> None:

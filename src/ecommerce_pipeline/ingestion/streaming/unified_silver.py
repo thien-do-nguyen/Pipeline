@@ -97,11 +97,12 @@ class UnifiedSilverMaterializer:
         histories = {
             table_name: self._transform_history_table(materialized.tables[table_name], table_name)
             for table_name in changed_tables
+            if get_silver_contract(table_name).materialize_change_history
         }
         with self._writer_lock(f"stream-batch-{batch_id}"):
             target_exists = self._preflight_targets(transformed)
             silver_started = perf_counter()
-            for table_name in changed_tables:
+            for table_name, history in histories.items():
                 contract = get_silver_contract(table_name)
                 history_app_id = (
                     f"{SILVER_CHANGE_HISTORY_PIPELINE_NAME}:"
@@ -109,7 +110,7 @@ class UnifiedSilverMaterializer:
                 )
                 self.silver.append_change_history(
                     contract,
-                    histories[table_name],
+                    history,
                     batch_id=f"cdc-stream-{batch_id}",
                     bronze_version=batch_id,
                     bronze_starting_version=None,
@@ -224,9 +225,7 @@ class UnifiedSilverMaterializer:
         if not self._pending_gold_requires_full_readiness and not self._pending_gold_order_ids:
             return "not_pending"
 
-        affected_order_ids = (
-            None if self._pending_gold_requires_full_readiness else set(self._pending_gold_order_ids)
-        )
+        affected_order_ids = None if self._pending_gold_requires_full_readiness else set(self._pending_gold_order_ids)
         status = self.reconcile_gold(
             batch_id=batch_id,
             raise_on_quality_error=False,

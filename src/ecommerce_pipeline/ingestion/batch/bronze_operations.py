@@ -77,7 +77,7 @@ def batch_upper_bounds_query(
         for table_name, cursor in cursors.items()
     )
     event_log = f"{config.postgres.source_schema}.{CHANGE_EVENT_TABLE}"
-    query = (
+    return (
         "SELECT cursors.source_table, ("
         "SELECT MAX(event_id) FROM ("
         f"SELECT events.event_id FROM {event_log} events "
@@ -90,7 +90,6 @@ def batch_upper_bounds_query(
         "WHERE events.source_table = cursors.source_table) AS source_max_event_id "
         f"FROM (VALUES {values}) AS cursors(source_table, last_event_id)"
     )
-    return query
 
 
 def change_event_query(
@@ -124,7 +123,6 @@ def jdbc_partition_count(config: AppConfig, cursor: EventCursor | None, batch_up
 def write_append_only(
     spark: SparkSession,
     df: DataFrame,
-    config: AppConfig,
     reference: TableReference,
     table_exists: bool,
     *,
