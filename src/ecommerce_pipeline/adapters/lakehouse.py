@@ -309,14 +309,7 @@ class LakehouseAdapter:
 
         join_condition = " AND ".join(f"target.`{key}` = source.`{key}`" for key in merge_keys)
         target_columns = set(self.read_table(layer, table_name).columns)
-        if source_columns != target_columns:
-            missing_from_source = sorted(target_columns - source_columns)
-            missing_from_target = sorted(source_columns - target_columns)
-            raise ValueError(
-                f"Schema mismatch for {layer}.{table_name}; "
-                f"missing_from_source={missing_from_source}, missing_from_target={missing_from_target}. "
-                "Rebuild the affected layer explicitly."
-            )
+        _validate_schema_match(layer, table_name, source_columns, target_columns)
         newer = _lexicographic_newer_condition(sequence_columns)
 
         ignored_for_comparison = {*merge_keys, "created_at", "_silver_updated_at"}
@@ -402,13 +395,7 @@ class LakehouseAdapter:
         target = self.read_table(layer, table_name)
         source_columns = set(df.columns)
         target_columns = set(target.columns)
-        if source_columns != target_columns:
-            raise ValueError(
-                f"Schema mismatch for {layer}.{table_name}; "
-                f"missing_from_source={sorted(target_columns - source_columns)}, "
-                f"missing_from_target={sorted(source_columns - target_columns)}. "
-                "Rebuild the affected layer explicitly."
-            )
+        _validate_schema_match(layer, table_name, source_columns, target_columns)
 
         join_condition = " AND ".join(f"target.`{key}` = source.`{key}`" for key in merge_keys)
         (
@@ -451,13 +438,7 @@ class LakehouseAdapter:
         target = self.read_table(layer, table_name)
         source_columns = set(df.columns)
         target_columns = set(target.columns)
-        if source_columns != target_columns:
-            raise ValueError(
-                f"Schema mismatch for {layer}.{table_name}; "
-                f"missing_from_source={sorted(target_columns - source_columns)}, "
-                f"missing_from_target={sorted(source_columns - target_columns)}. "
-                "Rebuild the affected layer explicitly."
-            )
+        _validate_schema_match(layer, table_name, source_columns, target_columns)
 
         staged = _stage_scd2_changes(
             df,
@@ -562,6 +543,22 @@ def _stage_scd2_changes(
         .otherwise(F.col(source_key))
         .alias("_merge_key"),
         "_action",
+    )
+
+
+def _validate_schema_match(
+    layer: str,
+    table_name: str,
+    source_columns: set[str],
+    target_columns: set[str],
+) -> None:
+    if source_columns == target_columns:
+        return
+    raise ValueError(
+        f"Schema mismatch for {layer}.{table_name}; "
+        f"missing_from_source={sorted(target_columns - source_columns)}, "
+        f"missing_from_target={sorted(source_columns - target_columns)}. "
+        "Rebuild the affected layer explicitly."
     )
 
 

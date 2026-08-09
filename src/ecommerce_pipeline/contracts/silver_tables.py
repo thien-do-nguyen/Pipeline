@@ -8,6 +8,7 @@ class SilverTableContract:
     table_name: str
     primary_keys: tuple[str, ...]
     columns: tuple[str, ...]
+    materialize_change_history: bool = False
 
 
 SILVER_TABLES: dict[str, SilverTableContract] = {
@@ -27,6 +28,7 @@ SILVER_TABLES: dict[str, SilverTableContract] = {
             "updated_at",
             "last_login",
         ),
+        materialize_change_history=True,
     ),
     "user_addresses": SilverTableContract(
         "user_addresses",
@@ -52,11 +54,13 @@ SILVER_TABLES: dict[str, SilverTableContract] = {
         "shops",
         ("shop_id",),
         ("shop_id", "public_shop_id", "shop_name", "shop_slug", "status", "created_at", "updated_at"),
+        materialize_change_history=True,
     ),
     "categories": SilverTableContract(
         "categories",
         ("category_id",),
         ("category_id", "parent_category_id", "category_name", "slug", "is_active", "created_at", "updated_at"),
+        materialize_change_history=True,
     ),
     "products": SilverTableContract(
         "products",
@@ -77,6 +81,7 @@ SILVER_TABLES: dict[str, SilverTableContract] = {
             "created_at",
             "updated_at",
         ),
+        materialize_change_history=True,
     ),
     "product_variants": SilverTableContract(
         "product_variants",
@@ -100,6 +105,7 @@ SILVER_TABLES: dict[str, SilverTableContract] = {
             "created_at",
             "updated_at",
         ),
+        materialize_change_history=True,
     ),
     "vouchers": SilverTableContract(
         "vouchers",

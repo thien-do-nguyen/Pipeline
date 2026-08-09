@@ -25,8 +25,7 @@ def transform_customer_table(df: DataFrame, contract: SilverTableContract) -> Da
     if contract.table_name == "app_users":
         cleaned = clean_text(cleaned, ["username", "email", "first_name", "last_name", "phone_number"])
         cleaned = normalize_lower(cleaned, ["username", "email", "status"])
-        cleaned = normalize_phone(cleaned)
-        return cleaned
+        return normalize_phone(cleaned)
 
     cleaned = clean_text(
         cleaned,
@@ -44,8 +43,7 @@ def transform_customer_table(df: DataFrame, contract: SilverTableContract) -> Da
         ],
     )
     cleaned = normalize_lower(cleaned, ["address_type"])
-    cleaned = normalize_phone(cleaned)
-    return cleaned
+    return normalize_phone(cleaned)
 
 
 def transform_customer_history(df: DataFrame, contract: SilverTableContract) -> DataFrame:
@@ -55,8 +53,7 @@ def transform_customer_history(df: DataFrame, contract: SilverTableContract) -> 
     if contract.table_name == "app_users":
         cleaned = clean_text(cleaned, ["username", "email", "first_name", "last_name", "phone_number"])
         cleaned = normalize_lower(cleaned, ["username", "email", "status"])
-        cleaned = normalize_phone(cleaned)
-        return cleaned
+        return normalize_phone(cleaned)
 
     cleaned = clean_text(
         cleaned,
@@ -74,5 +71,4 @@ def transform_customer_history(df: DataFrame, contract: SilverTableContract) -> 
         ],
     )
     cleaned = normalize_lower(cleaned, ["address_type"])
-    cleaned = normalize_phone(cleaned)
-    return cleaned
+    return normalize_phone(cleaned)

@@ -153,35 +153,47 @@ class SilverBuilder:
             starting_version=starting_version,
             ending_version=current_bronze_version,
         )
-        history = self.transform_history(contract, changes)
-        transformed = self.transform(contract, changes)
-        self.append_change_history(
-            contract,
-            history,
-            batch_id=batch_id,
-            bronze_version=current_bronze_version,
-            bronze_starting_version=starting_version,
-            transaction_version=current_bronze_version,
-        )
-        with delta_commit_metadata(
-            self.spark,
-            self._progress_metadata(
-                table_name,
-                current_bronze_version,
-                batch_id,
-                bronze_starting_version=starting_version,
-            ),
-        ):
-            self.lakehouse.upsert_table(
-                transformed,
-                "silver",
-                table_name,
-                contract.primary_keys,
-                delete_mode="soft",
-                sequence_columns=SILVER_SEQUENCE_COLUMNS,
-                target_exists=True,
-                source_is_nonempty=True,
-            )
+        owns_changes_cache = contract.materialize_change_history and not changes.is_cached
+        shared_changes = changes.cache() if owns_changes_cache else changes
+        try:
+            if contract.materialize_change_history:
+                history_started = perf_counter()
+                history = self.transform_history(contract, shared_changes)
+                self.append_change_history(
+                    contract,
+                    history,
+                    batch_id=batch_id,
+                    bronze_version=current_bronze_version,
+                    bronze_starting_version=starting_version,
+                    transaction_version=current_bronze_version,
+                )
+                self._record_timing(f"silver.history.{table_name}", history_started)
+
+            merge_started = perf_counter()
+            transformed = self.transform(contract, shared_changes)
+            with delta_commit_metadata(
+                self.spark,
+                self._progress_metadata(
+                    table_name,
+                    current_bronze_version,
+                    batch_id,
+                    bronze_starting_version=starting_version,
+                ),
+            ):
+                self.lakehouse.upsert_table(
+                    transformed,
+                    "silver",
+                    table_name,
+                    contract.primary_keys,
+                    delete_mode="soft",
+                    sequence_columns=SILVER_SEQUENCE_COLUMNS,
+                    target_exists=True,
+                    source_is_nonempty=True,
+                )
+            self._record_timing(f"silver.merge.{table_name}", merge_started)
+        finally:
+            if owns_changes_cache:
+                shared_changes.unpersist()
         return self._result(
             contract,
             silver_reference.value,
@@ -243,38 +255,50 @@ class SilverBuilder:
         batch_id: str,
     ) -> None:
         source = self.read_snapshot(contract.table_name)
-        snapshot = self.transform(contract, source)
-        history = self.transform_history(contract, source)
-        with delta_commit_metadata(
-            self.spark,
-            self._progress_metadata(
-                contract.table_name,
-                bronze_version,
-                batch_id,
-                bronze_starting_version=None,
-            ),
-        ):
-            self.lakehouse.write_table(
-                snapshot,
-                "silver",
-                contract.table_name,
-                enable_change_data_feed=True,
-            )
-        with delta_commit_metadata(
-            self.spark,
-            self._history_progress_metadata(
-                contract.table_name,
-                bronze_version,
-                batch_id,
-                bronze_starting_version=None,
-            ),
-        ):
-            self.lakehouse.write_table(
-                history,
-                "silver",
-                silver_change_history_table_name(contract.table_name),
-                enable_change_data_feed=True,
-            )
+        owns_source_cache = contract.materialize_change_history and not source.is_cached
+        shared_source = source.cache() if owns_source_cache else source
+        try:
+            snapshot_started = perf_counter()
+            snapshot = self.transform(contract, shared_source)
+            with delta_commit_metadata(
+                self.spark,
+                self._progress_metadata(
+                    contract.table_name,
+                    bronze_version,
+                    batch_id,
+                    bronze_starting_version=None,
+                ),
+            ):
+                self.lakehouse.write_table(
+                    snapshot,
+                    "silver",
+                    contract.table_name,
+                    enable_change_data_feed=True,
+                )
+            self._record_timing(f"silver.snapshot.{contract.table_name}", snapshot_started)
+            if not contract.materialize_change_history:
+                return
+            history_started = perf_counter()
+            history = self.transform_history(contract, shared_source)
+            with delta_commit_metadata(
+                self.spark,
+                self._history_progress_metadata(
+                    contract.table_name,
+                    bronze_version,
+                    batch_id,
+                    bronze_starting_version=None,
+                ),
+            ):
+                self.lakehouse.write_table(
+                    history,
+                    "silver",
+                    silver_change_history_table_name(contract.table_name),
+                    enable_change_data_feed=True,
+                )
+            self._record_timing(f"silver.history.{contract.table_name}", history_started)
+        finally:
+            if owns_source_cache:
+                shared_source.unpersist()
 
     def append_change_history(
         self,
@@ -417,6 +441,10 @@ class SilverBuilder:
             source_record_count=source_record_count,
             source_operation_counts=source_operation_counts,
         )
+
+    def _record_timing(self, name: str, started: float) -> None:
+        if self.timings_ms is not None:
+            self.timings_ms[name] = round((perf_counter() - started) * 1000)
 
 
 def build_silver(

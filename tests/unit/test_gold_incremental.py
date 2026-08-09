@@ -178,7 +178,7 @@ def test_incremental_checkpoints_reused_affected_order_ids() -> None:
     changed_order_ids = Mock()
     affected_plan = Mock()
     affected_ids = Mock()
-    affected_plan.localCheckpoint.return_value = affected_ids
+    affected_plan.cache.return_value = affected_ids
     affected_ids.isEmpty.return_value = False
     builder._ids_if_changed = Mock(return_value=changed_order_ids)
     builder._affected_order_ids = Mock(return_value=affected_plan)
@@ -188,7 +188,7 @@ def test_incremental_checkpoints_reused_affected_order_ids() -> None:
 
     assert builder._run_incremental(changes) == changed_gold_tables
 
-    affected_plan.localCheckpoint.assert_called_once_with(eager=True)
+    affected_plan.cache.assert_called_once_with()
     builder._apply_incremental.assert_called_once_with(
         changes,
         changed_order_ids,
@@ -202,9 +202,10 @@ def test_publisher_reads_versions_only_for_changed_gold_tables(monkeypatch: pyte
     builder = object.__new__(GoldBuilder)
     builder.spark = Mock()
     builder.config = SimpleNamespace(
+        spark=SimpleNamespace(max_parallel_tables=4),
         lakehouse=SimpleNamespace(
             table_reference=lambda layer, table: f"{layer}.{table}",
-        )
+        ),
     )
     builder.releases = Mock()
     previous = _release({"orders": 4})
@@ -218,7 +219,7 @@ def test_publisher_reads_versions_only_for_changed_gold_tables(monkeypatch: pyte
         previous,
     )
 
-    version_reader.assert_called_once_with(builder.spark, "gold.dim_payment")
+    version_reader.assert_called_once_with(builder.spark.newSession.return_value, "gold.dim_payment")
     candidate = builder.releases.publish.call_args.args[0]
     assert candidate.previous_versions == previous.gold_versions
     assert candidate.committed_versions["dim_payment"] == 99

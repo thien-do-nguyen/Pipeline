@@ -55,8 +55,8 @@ def test_foreach_batch_reads_materialized_typed_bronze_and_stops_at_shared_silve
         target_exists=True,
     )
     materializer._transform_table.assert_called_once_with("typed-orders", "orders")
-    materializer._transform_history_table.assert_called_once_with("typed-orders", "orders")
-    materializer.silver.append_change_history.assert_called_once()
+    materializer._transform_history_table.assert_not_called()
+    materializer.silver.append_change_history.assert_not_called()
     gold.run.assert_not_called()
 
 

@@ -46,11 +46,8 @@ streaming:
     # v3 replays Raw Bronze after fixing foreachBatch writer-session transactions.
     checkpoint_version: v3
     max_files_per_trigger: 4
-    max_bytes_per_trigger: 32m
     reconcile_gold_each_batch: true
-    max_gold_readiness_order_ids: 5000
     gold_deferred_retry_seconds: 30
-    gold_deferred_retry_interval_seconds: 2
 
 coordination:
   # Local CDC owns Gold; local batch --mode all intentionally stops at Silver.

@@ -9,7 +9,7 @@ CLOUD_ENV ?= .env.cloud
 	cdc-recover-offsets \
 	run-stream-local run-stream-local-once run-silver-stream-local run-silver-stream-local-once \
 	run-cdc-local-once reconcile-gold-local seed seed-reset-guard seed-stream \
-	run-batch-local run-batch-cloud validate-batch-cloud deploy-batch-cloud validate \
+	run-batch-local run-batch-cloud run-deployed-batch-cloud validate-batch-cloud deploy-batch-cloud validate \
 	validate-batch-local lint format format-check type-check test test-integration test-e2e check \
 	smoke demo-batch-local build
 
@@ -22,10 +22,10 @@ CONNECT_URL ?= http://localhost:8083
 
 CONFIG ?= configs/local.yaml
 SEED ?= 999
-CUSTOMERS ?= 100
-ORDERS ?= 500
+CUSTOMERS ?= 10000
+ORDERS ?= 50000
 SEED_BATCH_SIZE ?= 10000
-ORDERS_PER_BATCH ?= 2
+ORDERS_PER_BATCH ?= 5
 INTERVAL_SECONDS ?= 3
 MAX_BATCHES ?=
 DATABRICKS_FLAGS ?=
@@ -194,6 +194,10 @@ deploy-batch-cloud: validate-batch-cloud
 	$(DATABRICKS) $(DATABRICKS_FLAGS) bundle deploy --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) --auto-approve $(DATABRICKS_BUNDLE_VARS)
 
 run-batch-cloud: deploy-batch-cloud
+	$(DATABRICKS) $(DATABRICKS_FLAGS) bundle run --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) $(DATABRICKS_BUNDLE_VARS) ecommerce_pipeline
+
+# Fast data-only rerun. Use only when the current wheel/config was already deployed.
+run-deployed-batch-cloud: cloud-env
 	$(DATABRICKS) $(DATABRICKS_FLAGS) bundle run --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) $(DATABRICKS_BUNDLE_VARS) ecommerce_pipeline
 
 validate validate-batch-local: env

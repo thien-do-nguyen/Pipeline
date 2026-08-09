@@ -48,6 +48,9 @@ jobs:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: admin
       PGPASSWORD: admin
+      PGHOST: localhost
+      PGPORT: "5432"
+      CDC_POSTGRES_PASSWORD: cdc-ci-only
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -64,5 +67,6 @@ jobs:
           key: ivy-${{ runner.os }}-delta-3.2.0-postgresql-42.7.3
       - run: make setup
       - run: psql -v ON_ERROR_STOP=1 -h localhost -U admin -d ecommerce -f schema/oltpSchema.sql
+      - run: bash infra/local/postgres/02_cdc.sh
       - run: make test-integration
       - run: make test-e2e
