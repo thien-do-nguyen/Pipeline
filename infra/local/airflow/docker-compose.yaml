@@ -1,0 +1,135 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: infra/local/airflow/Dockerfile
+    args:
+      AIRFLOW_VERSION: ${AIRFLOW_VERSION:-3.3.0}
+  image: ecommerce-pipeline-airflow:${AIRFLOW_VERSION:-3.3.0}
+  profiles: [airflow]
+  user: "${AIRFLOW_UID:-50000}:0"
+  working_dir: /opt/airflow/project
+  environment: &airflow-common-environment
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__PARALLELISM: "1"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "1"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+    AIRFLOW__CORE__FERNET_KEY: ""
+    # Shared keys are required across Airflow 3 components. These defaults are local-only.
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-local-airflow-jwt-key-do-not-use-in-cloud}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:-local-airflow-api-key-do-not-use-in-cloud}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+    ECOMMERCE_PROJECT_ROOT: /opt/airflow/project
+    ECOMMERCE_CONFIG_PATH: /opt/airflow/project/configs/local.yaml
+    ECOMMERCE_BASE_CONFIG_PATH: /opt/airflow/project/configs/base.yaml
+    ECOMMERCE_BATCH_SCHEDULE: ${AIRFLOW_BATCH_SCHEDULE:-}
+    ECOMMERCE_CLOUD_BATCH_SCHEDULE: ${AIRFLOW_CLOUD_BATCH_SCHEDULE:-}
+    DATABRICKS_HOST: ${DATABRICKS_HOST:-}
+    DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
+    DATABRICKS_JOB_ID: ${DATABRICKS_JOB_ID:-}
+    DATABRICKS_POLL_SECONDS: ${DATABRICKS_POLL_SECONDS:-20}
+    DATABRICKS_RUN_TIMEOUT_SECONDS: ${DATABRICKS_RUN_TIMEOUT_SECONDS:-7200}
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: ${POSTGRES_DB:-ecommerce}
+    POSTGRES_USER: ${POSTGRES_USER:-admin}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin}
+    SPARK_CONFIGURE_DELTA_PACKAGE: "false"
+    # A whitespace override bypasses the YAML default; SparkSessionBuilder drops blank values.
+    SPARK_JARS_PACKAGES: " "
+    SPARK_JARS: >-
+      /opt/airflow/spark-jars/delta-spark_2.12-3.2.0.jar,
+      /opt/airflow/spark-jars/delta-storage-3.2.0.jar,
+      /opt/airflow/spark-jars/antlr4-runtime-4.9.3.jar,
+      /opt/airflow/spark-jars/postgresql-42.7.3.jar
+    SPARK_LOCAL_IP: 127.0.0.1
+    PYTHONPATH: /opt/airflow/project/src
+  volumes:
+    - ./infra/local/airflow/dags:/opt/airflow/dags:ro
+    - ./src:/opt/airflow/project/src:ro
+    - ./configs:/opt/airflow/project/configs:ro
+    - ./infra/local/spark:/opt/airflow/project/infra/local/spark:ro
+    - ./data:/opt/airflow/project/data
+    - ./logs:/opt/airflow/project/logs
+    - ./logs/airflow:/opt/airflow/logs
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+
+services:
+  airflow-db:
+    image: postgres:16-bookworm
+    profiles: [airflow]
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow_metadata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    command: db migrate
+    restart: "no"
+
+  airflow-api-server:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "127.0.0.1:${AIRFLOW_PORT:-8080}:8080"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-api-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-api-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  airflow_metadata:

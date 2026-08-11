@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter
-from typing import Literal
 
 from pyspark.sql import DataFrame, SparkSession
 
@@ -87,10 +86,7 @@ class SilverBuilder:
         workers = max(1, min(len(tables), self.config.spark.max_parallel_tables))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             results = list(executor.map(process, tables))
-        return SilverBatchManifest(
-            batch_id=batch_id,
-            tables=dict(zip(tables, results, strict=True)),
-        )
+        return SilverBatchManifest(tables=dict(zip(tables, results, strict=True)))
 
     def run_table(self, table_name: str, *, batch_id: str, full_rebuild: bool = False) -> SilverTableResult:
         contract = get_silver_contract(table_name)
@@ -107,10 +103,6 @@ class SilverBuilder:
             version = 0 if silver_state is None else silver_state.version + 1
             return self._result(
                 contract,
-                silver_reference.value,
-                "snapshot",
-                None,
-                current_bronze_version,
                 version,
             )
 
@@ -119,10 +111,6 @@ class SilverBuilder:
             self._replace_from_snapshot(contract, current_bronze_version, batch_id)
             return self._result(
                 contract,
-                silver_reference.value,
-                "snapshot",
-                None,
-                current_bronze_version,
                 silver_state.version + 1,
             )
         if previous_bronze_version > current_bronze_version:
@@ -135,10 +123,6 @@ class SilverBuilder:
                 raise RuntimeError(f"Silver progress version is missing for table: {table_name}")
             return self._result(
                 contract,
-                silver_reference.value,
-                "no_change",
-                None,
-                current_bronze_version,
                 latest_delta_pipeline_commit(
                     self.spark,
                     silver_reference,
@@ -196,10 +180,6 @@ class SilverBuilder:
                 shared_changes.unpersist()
         return self._result(
             contract,
-            silver_reference.value,
-            "cdf",
-            starting_version,
-            current_bronze_version,
             silver_state.version + 1,
         )
 
@@ -413,33 +393,12 @@ class SilverBuilder:
     def _result(
         self,
         contract: SilverTableContract,
-        output_path: str,
-        processing_mode: Literal["snapshot", "cdf", "no_change"],
-        bronze_starting_version: int | None,
-        bronze_ending_version: int,
         committed_version: int,
     ) -> SilverTableResult:
-        source_record_count: int | None = None
-        source_operation_counts: dict[str, int] = {}
-        if self.bronze_manifest is not None and processing_mode != "snapshot":
-            source = self.bronze_manifest.tables[contract.table_name]
-            exact_current_commit = processing_mode == "no_change" or (
-                bronze_starting_version == source.delta_version
-                and source.previous_delta_version + 1 == source.delta_version
-            )
-            if exact_current_commit:
-                source_record_count = source.record_count
-                source_operation_counts = dict(source.operation_counts)
         return SilverTableResult(
             table_name=contract.table_name,
-            output_path=output_path,
-            processing_mode=processing_mode,
-            bronze_starting_version=bronze_starting_version,
-            bronze_ending_version=bronze_ending_version,
             committed_version=committed_version,
             schema_version=SILVER_SCHEMA_VERSION,
-            source_record_count=source_record_count,
-            source_operation_counts=source_operation_counts,
         )
 
     def _record_timing(self, name: str, started: float) -> None:

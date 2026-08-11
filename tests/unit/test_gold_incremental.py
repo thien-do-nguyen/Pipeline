@@ -221,7 +221,6 @@ def test_publisher_reads_versions_only_for_changed_gold_tables(monkeypatch: pyte
 
     version_reader.assert_called_once_with(builder.spark.newSession.return_value, "gold.dim_payment")
     candidate = builder.releases.publish.call_args.args[0]
-    assert candidate.previous_versions == previous.gold_versions
     assert candidate.committed_versions["dim_payment"] == 99
     assert candidate.committed_versions["dim_customer"] == previous.gold_versions["dim_customer"]
     assert candidate.quality_status == "PASSED"

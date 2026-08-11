@@ -101,11 +101,9 @@ def test_all_mode_stops_after_unchanged_bronze(monkeypatch: pytest.MonkeyPatch) 
     result = BronzeTableResult(
         batch_id="batch",
         table_name="orders",
-        output_path="catalog.bronze.orders",
         record_count=0,
         ingestion_type="incremental",
         delta_version=7,
-        previous_delta_version=7,
     )
     bronze_manifest = BronzeBatchManifest.from_results("batch", [result])
     monkeypatch.setattr(run_batch, "extract_all_to_bronze", Mock(return_value=bronze_manifest))
@@ -113,7 +111,7 @@ def test_all_mode_stops_after_unchanged_bronze(monkeypatch: pytest.MonkeyPatch) 
     gold = Mock()
     monkeypatch.setattr(run_batch, "build_silver", silver)
     monkeypatch.setattr(run_batch, "build_gold", gold)
-    monkeypatch.setattr(run_batch, "write_batch_run_status", Mock())
+    monkeypatch.setattr(run_batch, "log_batch_run_status", Mock())
     downstream_is_current = Mock(return_value=True)
     monkeypatch.setattr(run_batch, "_downstream_is_current", downstream_is_current)
     args = Namespace(
@@ -126,10 +124,9 @@ def test_all_mode_stops_after_unchanged_bronze(monkeypatch: pytest.MonkeyPatch) 
         application=SimpleNamespace(logs_path="logs", timezone="Asia/Ho_Chi_Minh"),
     )
 
-    results, outputs = run_batch.run_mode(Mock(), args, config, "batch", {})
+    results = run_batch.run_mode(Mock(), args, config, "batch", {})
 
     assert results == [result]
-    assert outputs == {"bronze": ["catalog.bronze.orders"]}
     silver.assert_not_called()
     gold.assert_not_called()
     downstream_is_current.assert_called_once()
@@ -141,21 +138,19 @@ def test_all_mode_bootstraps_missing_downstream_after_unchanged_bronze(
     result = BronzeTableResult(
         batch_id="batch",
         table_name="orders",
-        output_path="catalog.bronze.orders",
         record_count=0,
         ingestion_type="incremental",
         delta_version=7,
-        previous_delta_version=7,
     )
     bronze_manifest = BronzeBatchManifest.from_results("batch", [result])
     monkeypatch.setattr(run_batch, "extract_all_to_bronze", Mock(return_value=bronze_manifest))
     monkeypatch.setattr(run_batch, "_downstream_is_current", Mock(return_value=False))
-    silver_manifest = Mock(outputs=[])
+    silver_manifest = Mock(tables={})
     silver = Mock(return_value=silver_manifest)
     gold = Mock(return_value=[])
     monkeypatch.setattr(run_batch, "build_silver", silver)
     monkeypatch.setattr(run_batch, "build_gold", gold)
-    monkeypatch.setattr(run_batch, "write_batch_run_status", Mock())
+    monkeypatch.setattr(run_batch, "log_batch_run_status", Mock())
     args = Namespace(
         mode="all",
         tables=None,
@@ -172,32 +167,65 @@ def test_all_mode_bootstraps_missing_downstream_after_unchanged_bronze(
     gold.assert_called_once()
 
 
+def test_validate_mode_runs_quality_without_writing_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    report = Mock()
+    report.as_dict.return_value = {"gold": {"status": "passed"}}
+    validate = Mock(return_value=report)
+    monkeypatch.setattr(run_batch, "validate_batch_lakehouse", validate)
+    args = Namespace(
+        mode="validate",
+        tables=None,
+        full_rebuild_silver=False,
+        full_rebuild_gold=False,
+    )
+    timings: dict[str, int] = {}
+    spark = Mock()
+    config = SimpleNamespace(coordination=SimpleNamespace(gold_owner="batch"))
+
+    results = run_batch.run_mode(spark, args, config, "batch", timings)
+
+    assert results == []
+    assert "validation" in timings
+    validate.assert_called_once_with(spark, config)
+
+
+def test_preflight_mode_does_not_write_lakehouse_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    check = Mock(return_value={"status": "passed"})
+    monkeypatch.setattr(run_batch, "check_postgres_source", check)
+    args = Namespace(
+        mode="check_postgres",
+        tables=None,
+        full_rebuild_silver=False,
+        full_rebuild_gold=False,
+    )
+    timings: dict[str, int] = {}
+    spark = Mock()
+    config = SimpleNamespace(coordination=SimpleNamespace(gold_owner="batch"))
+
+    results = run_batch.run_mode(spark, args, config, "batch", timings)
+
+    assert results == []
+    assert "preflight.postgres" in timings
+    check.assert_called_once_with(config)
+
+
 def test_all_mode_propagates_layer_versions(monkeypatch: pytest.MonkeyPatch) -> None:
     bronze = BronzeTableResult(
         batch_id="batch",
         table_name="orders",
-        output_path="catalog.bronze.orders",
         record_count=2,
         ingestion_type="incremental",
         delta_version=8,
-        previous_delta_version=7,
         operation_counts={"INSERT": 2},
     )
     bronze_manifest = BronzeBatchManifest.from_results("batch", [bronze])
     monkeypatch.setattr(run_batch, "extract_all_to_bronze", Mock(return_value=bronze_manifest))
     silver_manifest = SilverBatchManifest(
-        batch_id="batch",
         tables={
             "orders": SilverTableResult(
                 table_name="orders",
-                output_path="catalog.silver.orders",
-                processing_mode="cdf",
-                bronze_starting_version=8,
-                bronze_ending_version=8,
                 committed_version=5,
                 schema_version=1,
-                source_record_count=2,
-                source_operation_counts={"INSERT": 2},
             )
         },
     )
@@ -205,7 +233,7 @@ def test_all_mode_propagates_layer_versions(monkeypatch: pytest.MonkeyPatch) -> 
     gold = Mock(return_value=["catalog.gold.fact_sales"])
     monkeypatch.setattr(run_batch, "build_silver", silver)
     monkeypatch.setattr(run_batch, "build_gold", gold)
-    monkeypatch.setattr(run_batch, "write_batch_run_status", Mock())
+    monkeypatch.setattr(run_batch, "log_batch_run_status", Mock())
     args = Namespace(
         mode="all",
         tables=None,
@@ -223,7 +251,7 @@ def test_all_mode_propagates_layer_versions(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_all_mode_stops_at_silver_when_streaming_owns_gold(monkeypatch: pytest.MonkeyPatch) -> None:
-    silver_manifest = Mock(outputs=["silver/orders"])
+    silver_manifest = Mock(tables={"orders": Mock()})
     monkeypatch.setattr(
         run_batch,
         "extract_all_to_bronze",
@@ -232,7 +260,7 @@ def test_all_mode_stops_at_silver_when_streaming_owns_gold(monkeypatch: pytest.M
     monkeypatch.setattr(run_batch, "build_silver", Mock(return_value=silver_manifest))
     gold = Mock()
     monkeypatch.setattr(run_batch, "build_gold", gold)
-    monkeypatch.setattr(run_batch, "write_batch_run_status", Mock())
+    monkeypatch.setattr(run_batch, "log_batch_run_status", Mock())
     args = Namespace(
         mode="all",
         tables=None,
@@ -245,8 +273,6 @@ def test_all_mode_stops_at_silver_when_streaming_owns_gold(monkeypatch: pytest.M
         coordination=SimpleNamespace(gold_owner="streaming"),
     )
 
-    _, outputs = run_batch.run_mode(Mock(), args, config, "batch", {})
+    run_batch.run_mode(Mock(), args, config, "batch", {})
 
-    assert outputs["silver"] == ["silver/orders"]
-    assert "gold" not in outputs
     gold.assert_not_called()

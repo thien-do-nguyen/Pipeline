@@ -46,6 +46,8 @@ class SparkSessionBuilder:
         for key, value in self.config.spark.config.items():
             if key == "spark.jars.packages" and (self.config.spark.configure_delta_package or self.extra_packages):
                 continue
+            if key in {"spark.jars", "spark.jars.packages"} and not value.strip():
+                continue
             self.builder = self.builder.config(key, value)
 
         if self.config.spark.master and SPARK_WAREHOUSE_CONFIG not in self.config.spark.config:

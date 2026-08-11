@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -15,7 +16,7 @@ from ecommerce_pipeline.adapters.lakehouse import try_latest_delta_pipeline_comm
 from ecommerce_pipeline.config.loader import load_config
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
-from ecommerce_pipeline.control.batch_runs import local_pipeline_lock, new_batch_id, write_batch_run_status
+from ecommerce_pipeline.control.batch_runs import local_pipeline_lock, log_batch_run_status, new_batch_id
 from ecommerce_pipeline.control.cloud_lock import cloud_pipeline_lock
 from ecommerce_pipeline.control.gold_releases import GoldReleaseStore
 from ecommerce_pipeline.control.manifests import BronzeBatchManifest, BronzeTableResult, SilverBatchManifest
@@ -23,6 +24,8 @@ from ecommerce_pipeline.ingestion.batch.extract_to_bronze import extract_all_to_
 from ecommerce_pipeline.pipelines.build_gold import build_gold
 from ecommerce_pipeline.pipelines.build_silver import SILVER_DATA_PIPELINES, build_silver
 from ecommerce_pipeline.runtime.spark import build_spark
+from ecommerce_pipeline.validation.batch import validate_batch_lakehouse
+from ecommerce_pipeline.validation.preflight import check_postgres_source
 
 
 class _DatabricksSecrets(Protocol):
@@ -41,7 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run batch pipeline jobs.")
     parser.add_argument("--env", default="local", help="Config environment name or YAML path.")
     parser.add_argument("--base-config", help="Base YAML path; defaults to configs/base.yaml in the project.")
-    parser.add_argument("--mode", default="bronze", choices=["bronze", "silver", "gold", "all"])
+    parser.add_argument(
+        "--mode",
+        default="bronze",
+        choices=["check_postgres", "bronze", "silver", "gold", "validate", "all"],
+    )
     parser.add_argument("--batch-id")
     parser.add_argument("--tables", nargs="*", help="Optional source table names to extract.")
     parser.add_argument("--postgres-host")
@@ -116,10 +123,15 @@ def run_mode(
     config: AppConfig,
     batch_id: str,
     timings_ms: dict[str, int],
-) -> tuple[list[BronzeTableResult], dict[str, list[str]]]:
+) -> list[BronzeTableResult]:
     bronze_results: list[BronzeTableResult] = []
     bronze_manifest: BronzeBatchManifest | None = None
-    outputs: dict[str, list[str]] = {}
+    if args.mode == "check_postgres":
+        started = perf_counter()
+        preflight_report = check_postgres_source(config)
+        timings_ms["preflight.postgres"] = round((perf_counter() - started) * 1000)
+        print(f"[preflight] check=postgres status=passed report={json.dumps(preflight_report, separators=(',', ':'))}")
+        return bronze_results
     if args.mode in {"bronze", "all"}:
         started = perf_counter()
         bronze_manifest = extract_all_to_bronze(
@@ -131,20 +143,17 @@ def run_mode(
         )
         bronze_results = bronze_manifest.results
         timings_ms["bronze"] = round((perf_counter() - started) * 1000)
-        outputs["bronze"] = [result.output_path for result in bronze_results]
         changed = [f"{result.table_name}:{result.record_count}" for result in bronze_results if result.record_count]
         print(
             f"[bronze] tables={len(bronze_results)} records={sum(result.record_count for result in bronze_results)} "
             f"changed={','.join(changed) if changed else 'none'} elapsed={_seconds(timings_ms['bronze'])}",
             flush=True,
         )
-        write_batch_run_status(
-            config.application.logs_path,
+        log_batch_run_status(
             batch_id,
             "RUNNING",
             config.application.timezone,
-            results=bronze_results,
-            outputs=outputs,
+            total_records=sum(result.record_count for result in bronze_results),
             timings_ms=timings_ms,
         )
         if (
@@ -155,7 +164,7 @@ def run_mode(
             and _downstream_is_current(spark, config)
         ):
             print("[pipeline] no changes; skipped=silver,gold", flush=True)
-            return bronze_results, outputs
+            return bronze_results
 
     silver_manifest: SilverBatchManifest | None = None
     if args.mode in {"silver", "all"}:
@@ -182,19 +191,16 @@ def run_mode(
             timings_ms["silver.compute"] = round((perf_counter() - silver_compute_started) * 1000)
             lock_release_started = perf_counter()
         timings_ms["coordination.lock_release"] = round((perf_counter() - lock_release_started) * 1000)
-        outputs["silver"] = silver_manifest.outputs
         timings_ms["silver"] = round((perf_counter() - started) * 1000)
         print(
-            f"[silver] tables={len(outputs['silver'])} elapsed={_seconds(timings_ms['silver'])}",
+            f"[silver] tables={len(silver_manifest.tables)} elapsed={_seconds(timings_ms['silver'])}",
             flush=True,
         )
-        write_batch_run_status(
-            config.application.logs_path,
+        log_batch_run_status(
             batch_id,
             "RUNNING",
             config.application.timezone,
-            results=bronze_results,
-            outputs=outputs,
+            total_records=sum(result.record_count for result in bronze_results),
             timings_ms=timings_ms,
         )
 
@@ -205,7 +211,7 @@ def run_mode(
         )
     if args.mode in {"gold", "all"} and gold_owner == "batch":
         started = perf_counter()
-        outputs["gold"] = build_gold(
+        gold_outputs = build_gold(
             spark,
             config,
             batch_id=batch_id,
@@ -215,21 +221,29 @@ def run_mode(
         )
         timings_ms["gold"] = round((perf_counter() - started) * 1000)
         print(
-            f"[gold] tables={len(outputs['gold'])} elapsed={_seconds(timings_ms['gold'])}",
+            f"[gold] tables={len(gold_outputs)} elapsed={_seconds(timings_ms['gold'])}",
             flush=True,
         )
-        write_batch_run_status(
-            config.application.logs_path,
+        log_batch_run_status(
             batch_id,
             "RUNNING",
             config.application.timezone,
-            results=bronze_results,
-            outputs=outputs,
+            total_records=sum(result.record_count for result in bronze_results),
             timings_ms=timings_ms,
         )
     elif args.mode == "all":
         print("[gold] skipped owner=streaming; batch pipeline stops at Unified Silver", flush=True)
-    return bronze_results, outputs
+
+    if args.mode == "validate":
+        started = perf_counter()
+        validation_report = validate_batch_lakehouse(spark, config)
+        timings_ms["validation"] = round((perf_counter() - started) * 1000)
+        print(
+            f"[validation] status=passed elapsed={_seconds(timings_ms['validation'])} "
+            f"report={json.dumps(validation_report.as_dict(), separators=(',', ':'))}",
+            flush=True,
+        )
+    return bronze_results
 
 
 def _is_no_change_batch(results: list[BronzeTableResult]) -> bool:
@@ -271,7 +285,7 @@ def main() -> None:
     _prepare_databricks_environment(args)
     if args.tables == []:
         raise SystemExit("--tables requires at least one table name")
-    if args.tables and args.mode in {"gold", "all"}:
+    if args.tables and args.mode not in {"bronze", "silver"}:
         raise SystemExit("--tables is supported only for bronze or silver mode")
     if args.full_rebuild_silver and args.mode not in {"silver", "all"}:
         raise SystemExit("--full-rebuild-silver requires --mode silver or --mode all")
@@ -295,6 +309,7 @@ def main() -> None:
     )
     with pipeline_lock:
         try:
+            print(f"[spark] status=STARTING mode={args.mode}", flush=True)
             spark_started = perf_counter()
             spark = build_spark(config)
             config = _apply_databricks_postgres_secret(
@@ -303,28 +318,30 @@ def main() -> None:
                 args.secret_scope,
             )
             timings_ms["spark_startup"] = round((perf_counter() - spark_started) * 1000)
-            write_batch_run_status(
-                config.application.logs_path,
+            print(
+                f"[spark] status=RUNNING mode={args.mode} version={spark.version} "
+                f"application_id={spark.sparkContext.applicationId} "
+                f"startup={_seconds(timings_ms['spark_startup'])}",
+                flush=True,
+            )
+            log_batch_run_status(
                 batch_id,
                 "RUNNING",
                 config.application.timezone,
                 timings_ms=timings_ms,
             )
-            results, outputs = run_mode(spark, args, config, batch_id, timings_ms)
+            results = run_mode(spark, args, config, batch_id, timings_ms)
             timings_ms["total"] = round((perf_counter() - run_started) * 1000)
-            write_batch_run_status(
-                config.application.logs_path,
+            log_batch_run_status(
                 batch_id,
                 "SUCCEEDED",
                 config.application.timezone,
-                results=results,
-                outputs=outputs,
+                total_records=sum(result.record_count for result in results),
                 timings_ms=timings_ms,
             )
         except Exception as exc:
             timings_ms["total"] = round((perf_counter() - run_started) * 1000)
-            write_batch_run_status(
-                config.application.logs_path,
+            log_batch_run_status(
                 batch_id,
                 "FAILED",
                 config.application.timezone,

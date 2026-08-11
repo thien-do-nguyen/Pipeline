@@ -5,16 +5,16 @@ Repo này chạy batch pipeline trên Spark local/Azure Databricks và PostgreSQ
 ```text
                          PostgreSQL OLTP
                          /             \
-          JDBC full snapshot          WAL / Debezium / Kafka
+       JDBC trigger/outbox CDC        WAL / Debezium / Kafka
                    │                           │
                    ▼                           ▼
        Bronze Batch Raw              Bronze Streaming Raw CDC
        bronze/batch/<table>           bronze/streaming/cdc_events
-                   \                 │
+                   \                         /
                     \       12 Typed Bronze + quarantine
                      \      bronze/streaming/<table>
-                      \               /
-                     ▼                       ▼
+                      \                  /
+                       ▼                ▼
                   Unified Silver (một row hiện tại/PK + tombstone)
                                   │
                                   ▼
@@ -23,6 +23,10 @@ Repo này chạy batch pipeline trên Spark local/Azure Databricks và PostgreSQ
                                   ▼
                        Analytics-ready Lakehouse
 ```
+
+Nhánh batch không quét full 12 bảng OLTP: trigger ghi outbox `change_events`, Spark/JDBC chỉ đọc khoảng
+`event_id` sau cursor của từng bảng. Full snapshot chỉ là thao tác bootstrap/backfill có chủ đích, không phải
+chế độ batch thường xuyên.
 
 Spark/JDBC compute có thể chạy local hoặc trên Databricks. Local dùng filesystem; cloud dùng external Delta tables
 trên StorageV2/ADLS Gen2 do project sở hữu. Unity Catalog quản lý metadata, permissions, lineage và governance.
@@ -87,6 +91,7 @@ azure-lakehouse-pipeline/
 │   ├── oltpSchema.sql            # PostgreSQL source schema
 │   └── dwhSchema.sql             # physical reference cho Gold star schema
 ├── infra/local/
+│   ├── airflow/                  # local scheduler + DAG gọi batch entry point hiện có
 │   ├── postgres/                 # idempotent CDC role + publication bootstrap
 │   ├── kafka/                    # Kafka topics, gồm compacted Connect state topics
 │   └── connect/                  # Debezium connector config + registration
@@ -262,7 +267,7 @@ Job thực hiện tuần tự:
 3. Nếu batch là Gold owner, dựng candidate dimensions + `fact_sales`; local mặc định bỏ qua vì streaming là owner.
 4. Khi batch là Gold owner, chạy quality gate và source-to-Gold reconciliation.
 5. Khi batch là Gold owner, atomically publish release marker chứa Delta version của toàn bộ Gold tables.
-6. Ghi run status JSON ở `logs/batch_runs/`, tách khỏi dữ liệu Lakehouse.
+6. Ghi structured log `[batch-run]` vào task log; không tạo file run JSON.
 
 Output chính:
 
@@ -284,18 +289,126 @@ data/lakehouse/
     └── fact_sales/               # active release nằm trong Delta table property
 ```
 
-Metadata vận hành nằm ngoài Lakehouse:
+### Quản lý batch local bằng Airflow
+
+Airflow là lớp orchestration; transformation vẫn nằm trong package `ecommerce_pipeline`. DAG tách các
+stage để mỗi layer có status, retry, timeout và task log riêng:
+
+```text
+check_postgres_source
+            │
+            ▼
+start_spark_and_ingest_bronze
+            │
+            ▼
+   build_unified_silver
+            │
+            ▼
+     select_gold_owner
+       /           \
+      ▼             ▼
+build_gold_curated  gold_owned_by_streaming
+      │
+      ▼
+validate_gold_release
+```
+
+Mỗi stage dùng một `batch_id` có cùng run prefix và layer suffix, nên có thể truy vết từ Airflow run
+sang structured task log và Delta commit. Tách process làm local khởi tạo Spark nhiều lần hơn; trên cloud các
+task nên dùng chung Databricks job cluster/existing cluster để giữ observability mà giảm startup cost.
+
+`check_postgres_source` kết nối read-only bằng psycopg, xác nhận database/user, quyền
+`USAGE`/`SELECT` và contract cột của `customer_app.change_events`. Task
+`start_spark_and_ingest_bronze` khởi tạo SparkSession rồi dùng ngay session đó để ingest Bronze; không tạo
+một Spark check process rồi tắt trước khi xử lý dữ liệu. Log task in `STARTING`, `RUNNING`, Spark version,
+application ID và `spark_startup`.
+
+Khởi động Airflow local cùng source PostgreSQL:
+
+```bash
+make airflow-up
+make airflow-check
+```
+
+UI chỉ bind local tại `http://localhost:8080`. Runtime dùng metadata PostgreSQL riêng (`airflow-db`), không ghi bảng
+Airflow vào source e-commerce. Image đã có Java 17, PySpark và các Delta/PostgreSQL JAR đã pin checksum; task không
+phải tải Maven dependency lúc khởi động. Source/config được mount read-only, còn
+`data/` và `logs/` dùng chung với lệnh batch chạy trực tiếp.
+Compose này chỉ dành cho local: UI không yêu cầu đăng nhập và các internal signing key có default local. Khi đưa
+orchestration lên cloud phải dùng secret manager/SSO và thay task bằng Databricks job trigger, không deploy nguyên
+stack Compose này.
+
+DAG mặc định không có lịch để tránh tự động chạy ngoài ý muốn. Trigger từ UI hoặc CLI:
+
+```bash
+make airflow-trigger
+make airflow-status
+make airflow-logs
+```
+
+Airflow local cũng có thể quản lý batch job trên Databricks, nhưng lúc đó nó chỉ đóng vai trò scheduler/monitor,
+không chạy Spark trong container. Deploy cloud job trước bằng bundle, sau đó đặt các biến sau trong `.env`:
+
+```dotenv
+DATABRICKS_HOST=https://<workspace>.azuredatabricks.net
+DATABRICKS_TOKEN=<personal-access-token-or-service-principal-token>
+DATABRICKS_JOB_ID=<deployed-job-id>
+```
+
+Trigger cloud job từ Airflow local:
+
+```bash
+make airflow-trigger-cloud
+```
+
+DAG `ecommerce_databricks_batch_cloud` hiển thị bốn task riêng trong Airflow:
+
+```text
+run_cloud_check_postgres → run_cloud_bronze → run_cloud_silver
+                         → run_cloud_gold → run_cloud_validate
+```
+
+Mỗi task gọi Databricks Jobs API 2.2 `run-now` với `pipeline_mode` và `batch_id` riêng, sau đó poll
+run đến khi thành công hoặc fail. Cùng một job ID được tái sử dụng; Databricks Bundle khai báo job
+parameters và chuyển mode vào Python wheel task. Idempotency token bao gồm Airflow run và stage, nên retry
+request không tạo job run trùng. Nếu chưa set đủ biến, task cloud sẽ skip để không làm hỏng
+stack local.
+
+Sau khi thay đổi job parameters phải chạy `make deploy-batch-cloud` trước khi trigger DAG cloud.
+
+Muốn đặt lịch, thêm cron vào `.env`, ví dụ chạy mỗi giờ:
+
+```dotenv
+AIRFLOW_BATCH_SCHEDULE=0 * * * *
+```
+
+Sau khi đổi schedule, chạy lại `make airflow-up`. DAG đặt `max_active_runs=1`, LocalExecutor chỉ cấp một worker,
+retry một lần và timeout hai giờ để không có hai batch Airflow cùng ghi Lakehouse. File lock hiện có vẫn bảo vệ khi ai đó đồng thời chạy
+`make run-batch-local` ngoài Airflow.
+
+`configs/local.yaml` hiện giao Gold ownership cho streaming. Sau Unified Silver, task `select_gold_owner` sẽ
+skip nhánh `build_gold_curated` và đánh dấu `gold_owned_by_streaming` thành công; DAG không tạo Gold writer
+thứ hai. Chỉ khi chủ động đổi `coordination.gold_owner` sang `batch` và dừng Gold streaming thì
+nhánh Gold batch và full validation mới chạy.
+
+Tắt Airflow nhưng giữ metadata history:
+
+```bash
+make airflow-down
+```
+
+Local chỉ tạo file lock tạm để ngăn hai writer chạy đồng thời:
 
 ```text
 logs/
-├── batch_runs/<batch_id>.json
 └── _pipeline.lock               # chỉ tồn tại trong lúc local job đang chạy
 ```
 
-Mỗi batch status có `timings_ms.spark_startup`, `bronze`, `silver`, `gold` và `total` để xác định layer chậm mà
-không phải suy đoán từ số record. Chi tiết gồm `bronze.metadata`, `bronze.source_watermarks`,
-`bronze.extract_write`, `silver.history.<table>`, `silver.merge.<table>`, thời gian acquire/release cloud lock và
-`gold.table.<table>`; các timing đã hoàn tất vẫn được giữ nếu batch lỗi.
+Pipeline không tạo `logs/batch_runs/*.json` ở local hoặc Azure. Trạng thái cuối được in thành một dòng JSON có
+prefix `[batch-run]` trong task log. Payload vẫn có `timings_ms.spark_startup`, `bronze`, `silver`, `gold`, `total`
+và timing chi tiết từng bước; không serialize danh sách `tables` hoặc `outputs` để log ngắn và dễ đọc.
+Airflow/Databricks quản lý task state và retry; Databricks system tables và Azure Monitor dùng cho lịch sử vận hành
+tập trung. Cursor/version phục vụ tính đúng dữ liệu vẫn nằm trong Delta commit metadata, không phụ thuộc file log.
 
 ### Bước 6 — validate kết quả
 
@@ -514,16 +627,15 @@ Mỗi bảng có progress độc lập nhưng progress nằm hoàn toàn trong D
 PostgreSQL → Bronze:
   Bronze commitInfo.userMetadata.last_event_id
   BronzeBatchManifest:
-    batch_id, changed_tables, record/operation counts,
-    event_id ranges, previous/committed versions, schema versions
+    batch_id, table_name, record/operation counts,
+    committed Delta version, schema version
 
 Bronze → Silver:
   Silver commitInfo.userMetadata.last_processed_bronze_version
   Silver commitInfo.userMetadata.silver_schema_version
   + Bronze Change Data Feed [lastProcessedVersion + 1, latestVersion]
   SilverBatchManifest:
-    batch_id, changed_tables, processed Bronze CDF ranges,
-    committed versions, schema versions, propagated source counts
+    table_name, committed versions, schema versions
 
 Silver → Gold:
   fact_sales TBLPROPERTIES.pipeline.goldActiveRelease.{silver_versions, gold_versions}
@@ -531,7 +643,7 @@ Silver → Gold:
 
 Gold write → Publisher:
   GoldCandidateManifest:
-    changed tables, previous/committed Gold versions,
+    changed tables, committed Gold versions, Silver versions,
     quality status, release batch_id
 ```
 
@@ -611,8 +723,8 @@ Khi wheel và config hiện tại đã deploy, chạy lại dữ liệu mà khô
 make run-deployed-batch-cloud
 ```
 
-So sánh thời gian Spark pipeline bằng `timings_ms.total` trong batch JSON, không dùng wall-clock của
-`make run-batch-cloud` vì target đó còn bao gồm build wheel, upload và bundle deploy.
+So sánh thời gian Spark pipeline bằng `timings_ms.total` trong dòng `[batch-run]` của Airflow/Databricks task log.
+Không dùng wall-clock của `make run-batch-cloud` vì target đó còn bao gồm build wheel, upload và bundle deploy.
 
 Target này không chạy Spark trên laptop. Laptop chỉ đóng gói wheel và upload artifact; toàn bộ JDBC ingestion và
 Bronze/Silver/Gold chạy trên existing compute cấu hình trong bundle

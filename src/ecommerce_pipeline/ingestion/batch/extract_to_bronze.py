@@ -116,8 +116,6 @@ class BronzeExtractor:
         if table_exists and upper_bound is None:
             return self._result(
                 state,
-                previous,
-                None,
                 0,
                 {operation.value: 0 for operation in ChangeOperation},
             )
@@ -142,8 +140,6 @@ class BronzeExtractor:
 
         return self._result(
             state,
-            current,
-            upper_bound,
             stats.record_count,
             stats.operation_counts,
         )
@@ -151,8 +147,6 @@ class BronzeExtractor:
     def _result(
         self,
         state: _BronzeState,
-        current: EventCursor | None,
-        upper_bound: int | None,
         record_count: int,
         operation_counts: dict[str, int],
     ) -> BronzeTableResult:
@@ -163,16 +157,11 @@ class BronzeExtractor:
         return BronzeTableResult(
             batch_id=self.batch_id,
             table_name=state.table_name,
-            output_path=state.reference.value,
             record_count=record_count,
             ingestion_type="incremental" if table_exists else "initial",
             delta_version=delta_version,
-            previous_delta_version=physical_version,
             operation_counts=operation_counts,
             schema_version=BRONZE_SCHEMA_VERSION,
-            batch_upper_bound_event_id=upper_bound,
-            previous_event_id=state.cursor.last_event_id if state.cursor else None,
-            current_event_id=current.last_event_id if current else None,
         )
 
     def _read_events(
