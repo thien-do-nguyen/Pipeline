@@ -6,13 +6,14 @@ application:
 spark:
   # Bound local concurrency so decoded Debezium JSON cannot exhaust driver heap.
   master: "local[4]"
-  configure_delta_package: true
+  configure_delta_package: "${SPARK_CONFIGURE_DELTA_PACKAGE:-true}"
   stop_session: true
   config:
     spark.sql.extensions: io.delta.sql.DeltaSparkSessionExtension
     spark.sql.catalog.spark_catalog: org.apache.spark.sql.delta.catalog.DeltaCatalog
     spark.sql.shuffle.partitions: "4"
-    spark.jars.packages: org.postgresql:postgresql:42.7.3
+    spark.jars: "${SPARK_JARS:-}"
+    spark.jars.packages: "${SPARK_JARS_PACKAGES:-org.postgresql:postgresql:42.7.3}"
     spark.ui.enabled: "false"
     spark.ui.showConsoleProgress: "false"
     spark.driver.bindAddress: "127.0.0.1"

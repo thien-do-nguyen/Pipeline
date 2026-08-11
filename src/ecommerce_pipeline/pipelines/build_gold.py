@@ -512,7 +512,6 @@ class GoldBuilder:
         candidate = GoldCandidateManifest(
             batch_id=batch_id,
             changed_tables=changed_tables,
-            previous_versions=previous_versions,
             committed_versions=gold_versions,
             silver_versions=silver_versions,
             quality_status="PASSED",

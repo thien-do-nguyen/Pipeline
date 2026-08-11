@@ -10,6 +10,7 @@ CLOUD_ENV ?= .env.cloud
 	run-stream-local run-stream-local-once run-silver-stream-local run-silver-stream-local-once \
 	run-cdc-local-once reconcile-gold-local seed seed-reset-guard seed-stream \
 	run-batch-local run-batch-cloud run-deployed-batch-cloud validate-batch-cloud deploy-batch-cloud validate \
+	airflow-build airflow-up airflow-down airflow-status airflow-check airflow-trigger airflow-trigger-cloud airflow-logs \
 	validate-batch-local lint format format-check type-check test test-integration test-e2e check \
 	smoke demo-batch-local build
 
@@ -17,6 +18,8 @@ VENV_PYTHON := .venv/bin/python
 VENV_PIP := $(VENV_PYTHON) -m pip
 VENV_BIN := .venv/bin
 DATABRICKS := databricks
+AIRFLOW_UID ?= $(shell id -u)
+AIRFLOW_COMPOSE := AIRFLOW_UID=$(AIRFLOW_UID) docker compose -f docker-compose.yaml -f infra/local/airflow/docker-compose.yaml --profile airflow
 CONNECTOR_NAME ?= ecommerce-postgres-cdc
 CONNECT_URL ?= http://localhost:8083
 
@@ -63,8 +66,8 @@ DATABRICKS_BUNDLE_VARS := \
 	--var="secret_scope=$(DATABRICKS_SECRET_SCOPE)"
 
 help:
-	@$(VENV_PYTHON) -c "print('Targets: setup env pg-up pg-reset cdc-up cdc-status cdc-recover-offsets run-stream-local run-silver-stream-local run-cdc-local-once seed run-batch-local validate check')" 2>/dev/null || \
-		python3 -c "print('Targets: setup env pg-up pg-reset cdc-up cdc-status cdc-recover-offsets run-stream-local run-silver-stream-local run-cdc-local-once seed run-batch-local validate check')"
+	@$(VENV_PYTHON) -c "print('Targets: setup env pg-up pg-reset cdc-up cdc-status cdc-recover-offsets run-stream-local run-silver-stream-local run-cdc-local-once seed run-batch-local airflow-up airflow-trigger airflow-down validate check')" 2>/dev/null || \
+		python3 -c "print('Targets: setup env pg-up pg-reset cdc-up cdc-status cdc-recover-offsets run-stream-local run-silver-stream-local run-cdc-local-once seed run-batch-local airflow-up airflow-trigger airflow-down validate check')"
 
 setup:
 	python3 -m venv --copies .venv
@@ -186,6 +189,32 @@ seed-stream: env
 
 run-batch-local: env
 	SPARK_LOCAL_IP=127.0.0.1 $(VENV_PYTHON) -m ecommerce_pipeline.jobs.run_batch --env configs/local.yaml --mode all
+
+airflow-build: env
+	$(AIRFLOW_COMPOSE) build airflow-init
+
+airflow-up: env
+	mkdir -p logs/airflow
+	$(AIRFLOW_COMPOSE) up -d --build --wait postgres airflow-api-server airflow-scheduler airflow-dag-processor
+
+airflow-down:
+	$(AIRFLOW_COMPOSE) stop airflow-api-server airflow-scheduler airflow-dag-processor airflow-db
+	$(AIRFLOW_COMPOSE) rm -f airflow-api-server airflow-scheduler airflow-dag-processor airflow-init airflow-db
+
+airflow-status:
+	$(AIRFLOW_COMPOSE) ps
+
+airflow-check:
+	$(AIRFLOW_COMPOSE) exec -T airflow-scheduler airflow dags list-import-errors
+
+airflow-trigger:
+	$(AIRFLOW_COMPOSE) exec -T airflow-scheduler airflow dags trigger ecommerce_batch_local
+
+airflow-trigger-cloud:
+	$(AIRFLOW_COMPOSE) exec -T airflow-scheduler airflow dags trigger ecommerce_databricks_batch_cloud
+
+airflow-logs:
+	$(AIRFLOW_COMPOSE) logs --tail=200 airflow-scheduler airflow-dag-processor
 
 validate-batch-cloud: cloud-env
 	$(DATABRICKS) $(DATABRICKS_FLAGS) bundle validate --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) $(DATABRICKS_BUNDLE_VARS)

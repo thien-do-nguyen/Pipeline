@@ -6,6 +6,12 @@ resources:
       run_as:
         user_name: ${var.run_principal}
 
+      parameters:
+        - name: pipeline_mode
+          default: all
+        - name: batch_id
+          default: databricks-{{job.run_id}}
+
       tasks:
         - task_key: run_pipeline
           existing_cluster_id: 0804-071458-pswonf6z
@@ -18,7 +24,9 @@ resources:
               - --base-config
               - ${workspace.file_path}/configs/base.yaml
               - --mode
-              - all
+              - "{{job.parameters.pipeline_mode}}"
+              - --batch-id
+              - "{{job.parameters.batch_id}}"
               - --postgres-host
               - ${var.postgres_host}
               - --postgres-port
