@@ -1,0 +1,8 @@
+subscription_id       = "00000000-0000-0000-0000-000000000000"
+resource_group_name   = "rg-tk1-student-cdc-dev"
+name_prefix           = "tk1-ecommerce-cdc-dev"
+postgres_host         = "your-postgres.postgres.database.azure.com"
+postgres_port         = 5432
+postgres_database     = "postgres"
+postgres_cdc_user     = "ecommerce_cdc"
+# Supply postgres_cdc_password through TF_VAR_postgres_cdc_password, never here.

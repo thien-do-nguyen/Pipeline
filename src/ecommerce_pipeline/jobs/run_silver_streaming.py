@@ -40,7 +40,7 @@ def run(spark: SparkSession, config: AppConfig, *, available_now: bool) -> None:
     if not settings.enabled:
         raise RuntimeError(f"Streaming Silver is not enabled for environment: {config.environment}")
 
-    raw_reference = config.lakehouse.streaming_bronze_reference(config.streaming.bronze_table)
+    raw_reference = config.lakehouse.raw_cdc_bronze_reference(config.streaming.bronze_table)
     assert_local_delta_target_matches_checkpoints(
         raw_reference,
         (config.streaming.checkpoint_location, config.streaming.silver_checkpoint_location),

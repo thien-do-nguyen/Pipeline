@@ -4,8 +4,6 @@ import os
 from datetime import UTC, datetime, timedelta
 
 from airflow.providers.standard.operators.bash import BashOperator
-from airflow.providers.standard.operators.empty import EmptyOperator
-from airflow.providers.standard.operators.python import BranchPythonOperator
 from airflow.sdk import DAG
 
 PROJECT_ROOT = os.getenv("ECOMMERCE_PROJECT_ROOT", "/opt/airflow/project")
@@ -20,14 +18,15 @@ COMMON_ENV = {
 }
 
 
-def _batch_command(mode: str) -> str:
-    return (
+def _batch_command(mode: str, *, emit_manifest: bool = False) -> str:
+    command = (
         "python -m ecommerce_pipeline.jobs.run_batch "
         ' --env "$ECOMMERCE_CONFIG_PATH"'
         ' --base-config "$ECOMMERCE_BASE_CONFIG_PATH"'
         f" --mode {mode}"
         ' --batch-id "$BATCH_ID"'
     )
+    return f"{command} --emit-manifest" if emit_manifest else command
 
 
 def _preflight_command(check: str) -> str:
@@ -39,15 +38,11 @@ def _preflight_command(check: str) -> str:
     )
 
 
-def _select_gold_owner() -> str:
-    from ecommerce_pipeline.config.loader import load_config
-
-    config = load_config(CONFIG_PATH, base_path=BASE_CONFIG_PATH)
-    return "build_gold_curated" if config.coordination.gold_owner == "batch" else "gold_owned_by_streaming"
-
-
-def _layer_env(layer: str) -> dict[str, str]:
-    return {**COMMON_ENV, "BATCH_ID": f"{RUN_ID}-{layer}"}
+def _layer_env(layer: str, *, upstream_task_id: str | None = None) -> dict[str, str]:
+    environment = {**COMMON_ENV, "BATCH_ID": f"{RUN_ID}-{layer}"}
+    if upstream_task_id is not None:
+        environment["ECOMMERCE_UPSTREAM_MANIFEST"] = f"{{{{ ti.xcom_pull(task_ids='{upstream_task_id}') }}}}"
+    return environment
 
 
 with DAG(
@@ -79,51 +74,40 @@ with DAG(
 
     start_spark_and_ingest_bronze = BashOperator(
         task_id="start_spark_and_ingest_bronze",
-        bash_command=_batch_command("bronze"),
+        bash_command=_batch_command("bronze", emit_manifest=True),
         cwd=PROJECT_ROOT,
         env=_layer_env("bronze"),
         append_env=True,
-        do_xcom_push=False,
+        do_xcom_push=True,
     )
 
     build_unified_silver = BashOperator(
         task_id="build_unified_silver",
-        bash_command=_batch_command("silver"),
+        bash_command=_batch_command("silver", emit_manifest=True),
         cwd=PROJECT_ROOT,
-        env=_layer_env("silver"),
+        env=_layer_env("silver", upstream_task_id="start_spark_and_ingest_bronze"),
         append_env=True,
-        do_xcom_push=False,
-    )
-
-    select_gold_owner = BranchPythonOperator(
-        task_id="select_gold_owner",
-        python_callable=_select_gold_owner,
-        retries=0,
+        do_xcom_push=True,
     )
 
     build_gold_curated = BashOperator(
         task_id="build_gold_curated",
         bash_command=_batch_command("gold"),
         cwd=PROJECT_ROOT,
-        env=_layer_env("gold"),
+        env=_layer_env("gold", upstream_task_id="build_unified_silver"),
         append_env=True,
         do_xcom_push=False,
     )
 
     validate_gold_release = BashOperator(
         task_id="validate_gold_release",
-        bash_command=_batch_command("validate"),
+        bash_command=_batch_command("validate_release"),
         cwd=PROJECT_ROOT,
-        env=_layer_env("validate"),
+        env=_layer_env("validate", upstream_task_id="build_unified_silver"),
         append_env=True,
         do_xcom_push=False,
         retries=0,
     )
 
-    gold_owned_by_streaming = EmptyOperator(
-        task_id="gold_owned_by_streaming",
-    )
-
-    check_postgres_source >> start_spark_and_ingest_bronze >> build_unified_silver >> select_gold_owner
-    select_gold_owner >> build_gold_curated >> validate_gold_release
-    select_gold_owner >> gold_owned_by_streaming
+    check_postgres_source >> start_spark_and_ingest_bronze >> build_unified_silver
+    build_unified_silver >> build_gold_curated >> validate_gold_release

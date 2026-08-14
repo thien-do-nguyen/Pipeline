@@ -31,13 +31,16 @@ def run(spark: SparkSession, config: AppConfig, *, available_now: bool) -> None:
     if not streaming.enabled or streaming.kafka is None:
         raise RuntimeError(f"Streaming is not enabled for environment: {config.environment}")
 
-    reference = config.lakehouse.streaming_bronze_reference(streaming.bronze_table)
+    reference = config.lakehouse.raw_cdc_bronze_reference(streaming.bronze_table)
     assert_local_delta_target_matches_checkpoints(
         reference,
         (streaming.checkpoint_location,),
         target_label="Raw CDC Bronze",
     )
-    events = normalize_debezium_events(read_kafka_stream(spark, streaming.kafka))
+    events = normalize_debezium_events(
+        read_kafka_stream(spark, streaming.kafka),
+        source_id=streaming.kafka.source_id,
+    )
     query = start_bronze_stream(events, reference, streaming, available_now=available_now)
     print(
         f"[streaming] query={streaming.query_name} {streaming.kafka.subscribe_key}={streaming.kafka.subscription} "

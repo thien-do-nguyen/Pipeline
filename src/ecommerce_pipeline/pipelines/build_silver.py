@@ -108,10 +108,8 @@ class SilverBuilder:
 
         previous_bronze_version = self._processed_version(table_name, silver_state.progress)
         if previous_bronze_version is None:
-            self._replace_from_snapshot(contract, current_bronze_version, batch_id)
-            return self._result(
-                contract,
-                silver_state.version + 1,
+            raise RuntimeError(
+                f"Silver progress metadata is missing for {table_name}; reset Silver or run with --full-rebuild-silver"
             )
         if previous_bronze_version > current_bronze_version:
             raise RuntimeError(
@@ -359,14 +357,6 @@ class SilverBuilder:
 
     def _validate_schema_version(self, table_name: str, metadata: dict[str, object] | None) -> None:
         version = None if metadata is None else metadata.get("silver_schema_version")
-        if version is None:
-            silver = self.lakehouse.read_table("silver", table_name)
-            if "_silver_schema_version" not in silver.columns:
-                raise RuntimeError(
-                    f"Silver schema metadata is missing for {table_name}; run with --full-rebuild-silver"
-                )
-            row = silver.select("_silver_schema_version").limit(1).first()
-            version = None if row is None else row["_silver_schema_version"]
         if version != SILVER_SCHEMA_VERSION:
             raise RuntimeError(f"Silver schema version is outdated for {table_name}; run with --full-rebuild-silver")
 

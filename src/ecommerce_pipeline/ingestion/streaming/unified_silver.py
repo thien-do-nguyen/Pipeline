@@ -249,8 +249,6 @@ class UnifiedSilverMaterializer:
     ) -> str:
         """Build Gold from Unified Silver after CDC has committed Silver changes."""
 
-        if self.config.coordination.gold_owner != "streaming":
-            return "skipped_not_owner"
         if defer_if_source_incomplete and not self._source_fact_ready_for_gold(affected_order_ids):
             return "deferred_source_incomplete"
         with self._writer_lock(f"gold-{batch_id}"):
@@ -317,7 +315,9 @@ class UnifiedSilverMaterializer:
     def _source_fact_ready_for_gold(self, affected_order_ids: set[int] | None = None) -> bool:
         if affected_order_ids is not None and not affected_order_ids:
             return True
-        orders = self.lakehouse.read_table("silver", "orders").select(
+        # Read physical Silver state here: tombstones distinguish a completed DELETE
+        # from a source row that has not arrived yet. Business readers hide them.
+        orders = self.lakehouse.read_table("silver", "orders", include_deleted=True).select(
             "order_id",
             "_is_deleted",
             "subtotal_amount",
@@ -333,7 +333,7 @@ class UnifiedSilverMaterializer:
             orders = orders.filter(~F.col("_is_deleted"))
 
         item_totals = (
-            self.lakehouse.read_table("silver", "order_items")
+            self.lakehouse.read_table("silver", "order_items", include_deleted=True)
             .filter(~F.col("_is_deleted"))
             .groupBy("order_id")
             .agg(
@@ -383,7 +383,7 @@ class UnifiedSilverMaterializer:
     def _writer_lock(self, owner: str) -> AbstractContextManager[None]:
         if self.config.spark.master:
             return local_pipeline_lock(
-                self.config.application.logs_path,
+                self.config.coordination.local_lock_path,
                 owner,
                 wait_timeout_seconds=self.config.coordination.lock_wait_seconds,
             )

@@ -22,20 +22,19 @@ from ecommerce_pipeline.control.gold_releases import GoldRelease, GoldReleaseSto
 from ecommerce_pipeline.control.manifests import GoldCandidateManifest, SilverBatchManifest
 from ecommerce_pipeline.pipelines.quality import GoldQualityChecker
 from ecommerce_pipeline.transformations.gold.dimensions import (
-    build_dim_category,
     build_dim_date,
     build_dim_location,
     build_dim_payment,
-    build_dim_product,
     build_dim_promotion,
     build_dim_shipping,
-    build_dim_shop,
     build_dim_time,
 )
 from ecommerce_pipeline.transformations.gold.fact_sales import build_fact_sales
 from ecommerce_pipeline.transformations.gold.scd2 import (
+    build_dim_category_from_history,
     build_dim_customer_from_history,
-    build_dim_customer_incremental,
+    build_dim_product_from_history,
+    build_dim_shop_from_history,
 )
 from ecommerce_pipeline.transformations.silver.common import SILVER_SCHEMA_VERSION, silver_change_history_table_name
 
@@ -68,8 +67,10 @@ class GoldBuilder:
 
     def run(self, *, batch_id: str = "standalone", full_rebuild: bool = False) -> list[str]:
         with self._timed("gold.metadata"):
-            current_versions = self._current_silver_versions()
-            previous_release = self.releases.latest()
+            with self._timed("gold.metadata.silver_versions"):
+                current_versions = self._current_silver_versions()
+            with self._timed("gold.metadata.active_release"):
+                previous_release = self.releases.latest()
         previous_versions = None if previous_release is None else previous_release.silver_versions
         if full_rebuild or previous_versions is None:
             with self._timed("gold.full_build"):
@@ -104,24 +105,23 @@ class GoldBuilder:
 
     def _run_full(self, *, replace: bool = False) -> frozenset[str]:
         tables = self._read_sources()
-        customer_history = self._read_silver_history("app_users")
+        histories = {
+            name: self._read_silver_history(name)
+            for name in ("app_users", "shops", "categories", "products", "product_variants")
+        }
         scd2_outputs = {
-            "dim_customer": build_dim_customer_from_history(customer_history, self.spark),
-            "dim_shop": build_dim_shop(tables["shops"], self.spark),
-            "dim_category": build_dim_category(tables["categories"], self.spark),
-            "dim_product": build_dim_product(tables["products"], tables["product_variants"], self.spark),
+            "dim_customer": build_dim_customer_from_history(histories["app_users"], self.spark),
+            "dim_shop": build_dim_shop_from_history(histories["shops"], self.spark),
+            "dim_category": build_dim_category_from_history(histories["categories"], self.spark),
+            "dim_product": build_dim_product_from_history(
+                histories["products"], histories["product_variants"], self.spark
+            ),
         }
         for table_name, dimension in scd2_outputs.items():
             with self._timed(f"gold.table.{table_name}"):
+                self.lakehouse.write_table(dimension, "gold", table_name)
                 if table_name == "dim_customer":
-                    self.lakehouse.write_table(dimension, "gold", table_name)
                     self._write_scd2_checkpoint("dim_customer", "app_users")
-                else:
-                    self._merge_scd2(
-                        table_name,
-                        dimension,
-                        replace=replace or self._scd2_requires_replacement(table_name),
-                    )
         fact_dimensions = self._read_fact_dimensions()
         outputs: dict[str, tuple[DataFrame, list[str]]] = {
             "dim_date": (build_dim_date(tables["orders"], self.spark), ["date_key"]),
@@ -194,20 +194,29 @@ class GoldBuilder:
         if "app_users" in changes:
 
             def update_customer() -> None:
-                customer_history, has_customer_history = self._read_scd2_history_increment("dim_customer", "app_users")
+                customer_history, has_customer_history = self._read_scd2_history_increment(
+                    "dim_customer",
+                    "app_users",
+                )
                 if not has_customer_history:
                     return
-                upserts = build_dim_customer_incremental(
-                    self.lakehouse.read_table("gold", "dim_customer"),
-                    customer_history,
+                customer_ids = self._ids(customer_history, "user_id")
+                full_customer_history = self._filter_history(
+                    "app_users",
+                    "user_id",
+                    customer_ids,
                 )
-                self.lakehouse.upsert_table(
-                    upserts,
-                    "gold",
+                self._upsert_replayed_scd2(
                     "dim_customer",
-                    ["customer_key"],
-                    target_exists=True,
-                    source_is_nonempty=True,
+                    build_dim_customer_from_history(
+                        full_customer_history,
+                        self.spark,
+                        include_unknown=False,
+                    ),
+                    "customer_key",
+                    "source_customer_id",
+                    customer_ids,
+                    "user_id",
                 )
                 self._write_scd2_checkpoint("dim_customer", "app_users", target_exists=True)
 
@@ -252,17 +261,43 @@ class GoldBuilder:
 
             def update_shop() -> None:
                 shop_ids = self._ids(changes["shops"], "shop_id")
-                shops = self._filter_current("shops", "shop_id", shop_ids)
-                self._merge_scd2("dim_shop", build_dim_shop(shops, self.spark))
+                history = self._filter_history("shops", "shop_id", shop_ids)
+                self._upsert_replayed_scd2(
+                    "dim_shop",
+                    build_dim_shop_from_history(history, self.spark, include_unknown=False),
+                    "shop_key",
+                    "source_shop_id",
+                    shop_ids,
+                    "shop_id",
+                )
 
             add_job("dim_shop", update_shop, scd2=True)
 
         if "categories" in changes:
 
             def update_category() -> None:
-                category_ids = self._affected_category_ids(changes["categories"])
-                categories = self._category_scope(category_ids)
-                self._merge_scd2("dim_category", build_dim_category(categories, self.spark))
+                changed_ids = self._ids(changes["categories"], "category_id")
+                history = self._read_silver_history("categories")
+                children = history.join(
+                    F.broadcast(changed_ids.select(F.col("category_id").alias("parent_category_id"))),
+                    "parent_category_id",
+                    "left_semi",
+                ).select("category_id")
+                affected_ids = self._union_ids([changed_ids, children], "category_id")
+                affected_history = history.join(F.broadcast(affected_ids), "category_id", "left_semi")
+                parent_ids = affected_history.select(F.col("parent_category_id").alias("category_id")).where(
+                    "category_id IS NOT NULL"
+                )
+                scope_ids = self._union_ids([affected_ids, parent_ids], "category_id")
+                scoped_history = history.join(F.broadcast(scope_ids), "category_id", "left_semi")
+                self._upsert_replayed_scd2(
+                    "dim_category",
+                    build_dim_category_from_history(scoped_history, self.spark, include_unknown=False),
+                    "category_key",
+                    "source_category_id",
+                    affected_ids,
+                    "category_id",
+                )
 
             add_job("dim_category", update_category, scd2=True)
 
@@ -270,11 +305,20 @@ class GoldBuilder:
 
             def update_product() -> None:
                 product_ids = self._affected_product_ids(changes)
-                products = self._filter_current("products", "product_id", product_ids)
-                variants = self._filter_current("product_variants", "product_id", product_ids)
-                self._merge_scd2(
+                product_history = self._filter_history("products", "product_id", product_ids)
+                variant_history = self._filter_history("product_variants", "product_id", product_ids)
+                self._upsert_replayed_scd2(
                     "dim_product",
-                    build_dim_product(products, variants, self.spark),
+                    build_dim_product_from_history(
+                        product_history,
+                        variant_history,
+                        self.spark,
+                        include_unknown=False,
+                    ),
+                    "product_key",
+                    "source_product_id",
+                    product_ids,
+                    "product_id",
                 )
 
             add_job("dim_product", update_product, scd2=True)
@@ -400,20 +444,6 @@ class GoldBuilder:
             return self._empty_current("orders").select("order_id")
         return self._union_ids(frames, "order_id")
 
-    def _affected_category_ids(self, category_changes: DataFrame) -> DataFrame:
-        changed = self._ids(category_changes, "category_id")
-        children = self._filter_current("categories", "parent_category_id", changed, "category_id").select(
-            "category_id"
-        )
-        return self._union_ids([changed, children], "category_id")
-
-    def _category_scope(self, affected_ids: DataFrame) -> DataFrame:
-        current = self.lakehouse.read_table("silver", "categories")
-        affected = current.join(F.broadcast(affected_ids), "category_id", "left_semi")
-        parent_ids = affected.select(F.col("parent_category_id").alias("category_id")).where("category_id IS NOT NULL")
-        scope_ids = self._union_ids([affected_ids, parent_ids], "category_id")
-        return current.join(F.broadcast(scope_ids), "category_id", "left_semi")
-
     def _affected_product_ids(self, changes: dict[str, DataFrame]) -> DataFrame:
         frames: list[DataFrame] = []
         if "products" in changes:
@@ -446,10 +476,12 @@ class GoldBuilder:
     def _current_silver_versions(self) -> dict[str, int]:
         if self.silver_manifest is not None:
             versions = self.silver_manifest.committed_versions
-            if set(versions) != set(SILVER_TABLES):
-                missing = sorted(set(SILVER_TABLES) - set(versions))
-                extra = sorted(set(versions) - set(SILVER_TABLES))
-                raise ValueError(f"Invalid propagated Silver versions: missing={missing}, extra={extra}")
+            expected = set(SILVER_TABLES)
+            if set(versions) != expected:
+                raise ValueError(
+                    "Invalid propagated Silver versions: "
+                    f"missing={sorted(expected - set(versions))}, unexpected={sorted(set(versions) - expected)}"
+                )
             invalid_schemas = {
                 name: result.schema_version
                 for name, result in self.silver_manifest.tables.items()
@@ -587,17 +619,14 @@ class GoldBuilder:
             silver_change_history_table_name(source_table_name),
         )
         history_version = latest_delta_version(self.spark, history_reference)
-        # Keep the legacy event-id column for Delta schema compatibility. The
-        # table version is the authoritative, monotonic CDF checkpoint.
         checkpoint = self.spark.createDataFrame(
             [
                 (
                     dimension_name,
                     int(history_version),
-                    None,
                 )
             ],
-            "dimension_name string, last_processed_history_version long, last_processed_event_id string",
+            "dimension_name string, last_processed_history_version long",
         ).withColumn("processed_at", F.current_timestamp())
         self.lakehouse.upsert_table(
             checkpoint,
@@ -628,6 +657,15 @@ class GoldBuilder:
             table_column,
             "left_semi",
         )
+
+    def _filter_history(
+        self,
+        table_name: str,
+        table_column: str,
+        ids: DataFrame,
+    ) -> DataFrame:
+        key_set = ids.where(F.col(table_column).isNotNull()).select(table_column).distinct()
+        return self._read_silver_history(table_name).join(F.broadcast(key_set), table_column, "left_semi")
 
     def _filter_gold(
         self,
@@ -671,20 +709,44 @@ class GoldBuilder:
             target_exists=True,
         )
 
-    def _merge_scd2(self, table_name: str, dimension: DataFrame, *, replace: bool = False) -> bool:
-        contract = SCD2_DIMENSIONS[table_name]
-        if not replace:
-            dimension = dimension.filter(F.col(contract.source_key).isNotNull())
-        return self.lakehouse.merge_scd2(
-            dimension,
-            "gold",
-            table_name,
-            contract.source_key,
-            contract.attribute_hash,
-            contract.initial_effective_from,
-            type1_columns=contract.type1_columns,
-            replace=replace,
-        )
+    def _upsert_replayed_scd2(
+        self,
+        table_name: str,
+        dimension: DataFrame,
+        surrogate_key: str,
+        source_key: str,
+        affected_ids: DataFrame,
+        affected_id_column: str,
+    ) -> bool:
+        """Replace the replayed entity scope and remove obsolete deterministic keys."""
+
+        # Event-level SCD2 replay creates a deep event/window/join plan. Cut the
+        # lineage once before stale-key detection and the Delta merge both use it.
+        replayed = dimension.localCheckpoint(eager=True)
+        try:
+            existing = self._filter_gold(
+                table_name,
+                source_key,
+                affected_ids,
+                affected_id_column,
+            )
+            stale_keys = existing.select(surrogate_key).join(
+                replayed.select(surrogate_key),
+                surrogate_key,
+                "left_anti",
+            )
+
+            return self.lakehouse.upsert_table(
+                replayed,
+                "gold",
+                table_name,
+                [surrogate_key],
+                delete_keys=stale_keys,
+                target_exists=True,
+                source_is_nonempty=True,
+            )
+        finally:
+            replayed.unpersist()
 
     def _read_fact_dimensions(self) -> dict[str, DataFrame]:
         return {name: self.lakehouse.read_table("gold", name) for name in SCD2_DIMENSIONS}
@@ -738,13 +800,6 @@ class GoldBuilder:
                 raise RuntimeError(
                     f"Gold SCD2 schema is outdated for {table_name}; missing={missing}. Run with --full-rebuild-gold"
                 )
-
-    def _scd2_requires_replacement(self, table_name: str) -> bool:
-        if not self.lakehouse.table_exists("gold", table_name):
-            return True
-        contract = SCD2_DIMENSIONS[table_name]
-        columns = set(self.lakehouse.read_table("gold", table_name).columns)
-        return not contract.required_columns <= columns
 
     def _paths(self) -> list[str]:
         return [self.config.lakehouse.table_reference("gold", name).value for name in GOLD_TABLES]

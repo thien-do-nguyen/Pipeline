@@ -1,8 +1,5 @@
 environment: local
 
-application:
-  logs_path: "logs"
-
 spark:
   # Bound local concurrency so decoded Debezium JSON cannot exhaust driver heap.
   master: "local[4]"
@@ -30,14 +27,14 @@ lakehouse:
 streaming:
   enabled: true
   trigger_interval: 2 seconds
-  # v2: reset after migrating local CDC from one routed topic to 12 per-table Debezium topics.
-  checkpoint_version: v2
+  # Increment only when intentionally starting a fresh Kafka source epoch.
+  checkpoint_version: v3
   checkpoint_root: data/checkpoints
   spark_packages:
     - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.2
   kafka:
     bootstrap_servers: localhost:29092
-    topic_pattern: "ecommerce\\.customer_app\\..*"
+    topic_pattern: "ecommerce\\.domain\\..*"
     starting_offsets: earliest
     fail_on_data_loss: true
     max_offsets_per_trigger: 100000
@@ -51,5 +48,6 @@ streaming:
     gold_deferred_retry_seconds: 30
 
 coordination:
-  # Local CDC owns Gold; local batch --mode all intentionally stops at Silver.
-  gold_owner: streaming
+  # Batch and streaming both trigger the shared, idempotent GoldBuilder under this local writer lock.
+  # Keep it in the writable shared data mount so host CLI and Airflow coordinate on the same lock.
+  local_lock_path: data/runtime

@@ -17,6 +17,7 @@ from pyspark.sql.types import (
 )
 
 from ecommerce_pipeline.contracts.bronze_tables import BRONZE_TABLES
+from ecommerce_pipeline.contracts.cdc_routing import cdc_topic_for_table
 from ecommerce_pipeline.contracts.cdc_tables import (
     TYPED_CDC_TABLES,
     get_typed_cdc_contract,
@@ -57,7 +58,7 @@ def _raw_row(
         "before": payload if operation == "d" else None,
         "after": None if operation == "d" else payload,
     }
-    topic = f"ecommerce.customer_app.{table_name}"
+    topic = cdc_topic_for_table(table_name)
     return Row(
         _transport_event_id=f"{topic}:1:{offset}",
         topic=topic,
@@ -126,7 +127,7 @@ def test_create_event_becomes_typed_row(spark: SparkSession) -> None:
     assert row["order_id"] == 42
     assert row["total_amount"] == Decimal("125.50")
     assert row["created_at"] == "2026-07-04 01:04:42.250070"
-    assert row["_event_id"] == "ecommerce.customer_app.orders:1:8"
+    assert row["_event_id"] == "ecommerce.domain.sales:1:8"
     assert row["_operation"] == "INSERT"
     assert len(row["_record_hash"]) == 64
     assert row["_batch_id"] == "cdc-to-silver:v1:7"

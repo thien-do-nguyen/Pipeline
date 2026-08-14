@@ -19,23 +19,17 @@ create_topic() {
         --config "cleanup.policy=${cleanup_policy}"
 }
 
-readonly CDC_TABLES=(
-    app_users
-    user_addresses
-    shops
-    categories
-    products
-    product_variants
-    vouchers
-    orders
-    order_items
-    order_vouchers
-    payments
-    shipments
+readonly CDC_DOMAINS=(
+    customer
+    catalog
+    promotion
+    sales
+    payment
+    shipping
 )
 
-for table_name in "${CDC_TABLES[@]}"; do
-    create_topic "ecommerce.customer_app.${table_name}" 3 "delete"
+for domain in "${CDC_DOMAINS[@]}"; do
+    create_topic "ecommerce.domain.${domain}" 1 "delete"
 done
 create_topic "ecommerce.heartbeat.v1" 1 "delete"
 create_topic "ecommerce.transaction.v1" 1 "delete"

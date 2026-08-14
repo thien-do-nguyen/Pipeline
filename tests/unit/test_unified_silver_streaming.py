@@ -1,9 +1,10 @@
 from contextlib import nullcontext
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
-from pyspark.sql import Row
+from pyspark.sql import Row, SparkSession
 
 from ecommerce_pipeline.ingestion.streaming import unified_silver
 from ecommerce_pipeline.ingestion.streaming.unified_silver import UnifiedSilverMaterializer
@@ -25,9 +26,8 @@ def test_foreach_batch_reads_materialized_typed_bronze_and_stops_at_shared_silve
     materializer.spark = Mock()
     materializer.settings = SimpleNamespace(query_name="cdc-to-silver", checkpoint_version="v1")
     materializer.config = SimpleNamespace(
-        application=SimpleNamespace(logs_path="logs"),
         spark=SimpleNamespace(master="local[2]", max_parallel_tables=1),
-        coordination=SimpleNamespace(gold_owner="streaming", lock_wait_seconds=0),
+        coordination=SimpleNamespace(local_lock_path="data/runtime", lock_wait_seconds=0),
     )
     prepared = Mock()
     prepared.persist.return_value = prepared
@@ -80,9 +80,8 @@ def test_foreach_batch_reconciles_gold_when_enabled(monkeypatch: pytest.MonkeyPa
         reconcile_gold_each_batch=True,
     )
     materializer.config = SimpleNamespace(
-        application=SimpleNamespace(logs_path="logs"),
         spark=SimpleNamespace(master="local[2]", max_parallel_tables=1),
-        coordination=SimpleNamespace(gold_owner="streaming", lock_wait_seconds=0),
+        coordination=SimpleNamespace(local_lock_path="data/runtime", lock_wait_seconds=0),
     )
     prepared = Mock()
     prepared.persist.return_value = prepared
@@ -113,10 +112,9 @@ def test_gold_reconcile_defers_when_source_fact_is_incomplete(monkeypatch: pytes
     materializer = object.__new__(UnifiedSilverMaterializer)
     materializer.spark = Mock()
     materializer.config = SimpleNamespace(
-        application=SimpleNamespace(logs_path="logs"),
         spark=SimpleNamespace(master="local[2]"),
         coordination=SimpleNamespace(
-            gold_owner="streaming",
+            local_lock_path="data/runtime",
             lock_wait_seconds=0,
         ),
     )
@@ -128,6 +126,67 @@ def test_gold_reconcile_defers_when_source_fact_is_incomplete(monkeypatch: pytes
 
     assert status == "deferred_source_incomplete"
     gold_builder.assert_not_called()
+
+
+def test_delete_readiness_completes_after_order_and_items_are_tombstoned(spark: SparkSession) -> None:
+    materializer = object.__new__(UnifiedSilverMaterializer)
+    materializer.spark = spark
+    materializer.lakehouse = Mock()
+    orders = spark.createDataFrame(
+        [(42, True, Decimal("100.00"), Decimal("8.00"))],
+        "order_id long, _is_deleted boolean, subtotal_amount decimal(18,2), tax_amount decimal(18,2)",
+    )
+    items = spark.createDataFrame(
+        [(42, True, 1, Decimal("100.00"), Decimal("8.00"))],
+        "order_id long, _is_deleted boolean, quantity int, unit_price decimal(18,2), tax_amount decimal(18,2)",
+    )
+    materializer.lakehouse.read_table.side_effect = lambda _layer, table_name, **_kwargs: (
+        orders if table_name == "orders" else items
+    )
+
+    assert materializer._source_fact_ready_for_gold({42}) is True
+    assert materializer.lakehouse.read_table.call_args_list == [
+        call("silver", "orders", include_deleted=True),
+        call("silver", "order_items", include_deleted=True),
+    ]
+
+
+def test_delete_readiness_waits_when_order_tombstone_arrives_before_item_delete(spark: SparkSession) -> None:
+    materializer = object.__new__(UnifiedSilverMaterializer)
+    materializer.spark = spark
+    materializer.lakehouse = Mock()
+    orders = spark.createDataFrame(
+        [(42, True, Decimal("100.00"), Decimal("8.00"))],
+        "order_id long, _is_deleted boolean, subtotal_amount decimal(18,2), tax_amount decimal(18,2)",
+    )
+    active_items = spark.createDataFrame(
+        [(42, False, 1, Decimal("100.00"), Decimal("8.00"))],
+        "order_id long, _is_deleted boolean, quantity int, unit_price decimal(18,2), tax_amount decimal(18,2)",
+    )
+    materializer.lakehouse.read_table.side_effect = lambda _layer, table_name, **_kwargs: (
+        orders if table_name == "orders" else active_items
+    )
+
+    assert materializer._source_fact_ready_for_gold({42}) is False
+
+
+def test_delete_readiness_waits_when_item_delete_arrives_before_order_delete(spark: SparkSession) -> None:
+    materializer = object.__new__(UnifiedSilverMaterializer)
+    materializer.spark = spark
+    materializer.lakehouse = Mock()
+    active_order = spark.createDataFrame(
+        [(42, False, Decimal("100.00"), Decimal("8.00"))],
+        "order_id long, _is_deleted boolean, subtotal_amount decimal(18,2), tax_amount decimal(18,2)",
+    )
+    deleted_items = spark.createDataFrame(
+        [(42, True, 1, Decimal("100.00"), Decimal("8.00"))],
+        "order_id long, _is_deleted boolean, quantity int, unit_price decimal(18,2), tax_amount decimal(18,2)",
+    )
+    materializer.lakehouse.read_table.side_effect = lambda _layer, table_name, **_kwargs: (
+        active_order if table_name == "orders" else deleted_items
+    )
+
+    assert materializer._source_fact_ready_for_gold({42}) is False
 
 
 def test_per_batch_gold_reconcile_retries_deferred_source(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -193,10 +252,9 @@ def test_per_batch_gold_reconcile_skips_failed_publish_without_rebuild(monkeypat
     materializer = object.__new__(UnifiedSilverMaterializer)
     materializer.spark = Mock()
     materializer.config = SimpleNamespace(
-        application=SimpleNamespace(logs_path="logs"),
         spark=SimpleNamespace(master="local[2]"),
         coordination=SimpleNamespace(
-            gold_owner="streaming",
+            local_lock_path="data/runtime",
             lock_wait_seconds=0,
         ),
     )
@@ -222,10 +280,9 @@ def test_final_gold_reconcile_recovers_a_dirty_candidate_with_full_rebuild(
     materializer = object.__new__(UnifiedSilverMaterializer)
     materializer.spark = Mock()
     materializer.config = SimpleNamespace(
-        application=SimpleNamespace(logs_path="logs"),
         spark=SimpleNamespace(master="local[2]"),
         coordination=SimpleNamespace(
-            gold_owner="streaming",
+            local_lock_path="data/runtime",
             lock_wait_seconds=0,
         ),
     )
@@ -243,7 +300,7 @@ def test_final_gold_reconcile_recovers_a_dirty_candidate_with_full_rebuild(
         "full_rebuild": True,
     }
     pipeline_lock.assert_called_once_with(
-        "logs",
+        "data/runtime",
         "gold-cdc-final-reconcile",
         wait_timeout_seconds=0,
     )

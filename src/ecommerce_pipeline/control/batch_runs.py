@@ -26,7 +26,7 @@ def log_batch_run_status(
     batch_id: str,
     status: str,
     timezone_name: str = DEFAULT_TIMEZONE,
-    total_records: int = 0,
+    total_records: int | None = None,
     error: str | None = None,
     timings_ms: dict[str, int] | None = None,
 ) -> None:
@@ -38,9 +38,10 @@ def log_batch_run_status(
         "batch_id": batch_id,
         "status": status,
         "event_at": timestamp,
-        "total_records": total_records,
         "timings_ms": timings_ms or {},
     }
+    if total_records is not None:
+        payload["total_records"] = total_records
     if error:
         payload["error"] = error
     _print_batch_status(payload)
@@ -54,8 +55,10 @@ def _print_batch_status(payload: dict[str, object]) -> None:
         "[batch]",
         f"status={status}",
         f"id={payload['batch_id']}",
-        f"records={payload['total_records']}",
     ]
+    total_records = payload.get("total_records")
+    if isinstance(total_records, int):
+        parts.append(f"records={total_records}")
     timings = payload.get("timings_ms")
     if isinstance(timings, dict):
         total_ms = timings.get("total")
@@ -75,14 +78,14 @@ def _validate_safe_name(value: str, label: str) -> None:
 
 @contextmanager
 def local_pipeline_lock(
-    logs_path: str,
+    lock_directory: str,
     batch_id: str,
     *,
     wait_timeout_seconds: int = 0,
 ) -> Iterator[None]:
     """Prevent concurrent writers for the local filesystem implementation."""
 
-    lock_path = Path(logs_path) / "_pipeline.lock"
+    lock_path = Path(lock_directory) / "_pipeline.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = monotonic() + wait_timeout_seconds
     while True:

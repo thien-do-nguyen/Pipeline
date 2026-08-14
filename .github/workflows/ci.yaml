@@ -1,4 +1,4 @@
-name: batch-local-ci
+name: lakehouse-batch-cdc-ci
 
 on:
   pull_request:
@@ -11,6 +11,7 @@ permissions:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -27,6 +28,7 @@ jobs:
   e2e:
     needs: quality
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16-bookworm
@@ -51,6 +53,7 @@ jobs:
       PGHOST: localhost
       PGPORT: "5432"
       CDC_POSTGRES_PASSWORD: cdc-ci-only
+      SPARK_LOCAL_IP: 127.0.0.1
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6

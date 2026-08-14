@@ -3,11 +3,14 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from pyspark.errors import AnalysisException
 from pyspark.sql import Row
 
 from ecommerce_pipeline.adapters.lakehouse import (
     LakehouseAdapter,
     _delta_sql_identifier,
+    _drop_dangling_catalog_registration,
+    _is_missing_delta_table,
     _lexicographic_newer_condition,
     _sql_identifier,
     latest_delta_pipeline_commit,
@@ -26,6 +29,23 @@ def test_delta_sql_identifier_preserves_cloud_uri() -> None:
     path = "abfss://lakehouse@example.dfs.core.windows.net/silver/orders"
 
     assert _delta_sql_identifier(path) == f"delta.`{path}`"
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "DELTA_TABLE_NOT_FOUND",
+        "DELTA_PATH_DOES_NOT_EXIST",
+        "DELTA_MISSING_DELTA_TABLE",
+        "TABLE_OR_VIEW_NOT_FOUND",
+        "PATH_NOT_FOUND",
+    ],
+)
+def test_missing_delta_table_recognizes_spark_and_databricks_conditions(condition: str) -> None:
+    error = Mock()
+    error.getCondition.return_value = condition
+
+    assert _is_missing_delta_table(error)
 
 
 def test_merge_sequence_predicate_is_lexicographic_and_null_safe() -> None:
@@ -102,6 +122,29 @@ def test_unity_catalog_reads_and_writes_three_level_table_names() -> None:
     assert _sql_identifier(TableReference("catalog.gold.fact_sales", True)) == ("`catalog`.`gold`.`fact_sales`")
 
 
+def test_silver_business_reader_hides_tombstones_but_control_reader_can_include_them(
+    spark,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    physical = spark.createDataFrame(
+        [(1, False), (2, True)],
+        "order_id long, _is_deleted boolean",
+    )
+    monkeypatch.setattr("ecommerce_pipeline.adapters.lakehouse.read_delta", Mock(return_value=physical))
+    config = Mock()
+    config.lakehouse = LakehouseConfig(base_path="data/lakehouse")
+    adapter = LakehouseAdapter(spark, config)
+
+    business_ids = [row.order_id for row in adapter.read_table("silver", "orders").collect()]
+    physical_ids = [
+        row.order_id
+        for row in adapter.read_table("silver", "orders", include_deleted=True).orderBy("order_id").collect()
+    ]
+
+    assert business_ids == [1]
+    assert physical_ids == [1, 2]
+
+
 def test_unity_catalog_external_table_uses_owned_adls_path() -> None:
     writer = Mock()
     writer.option.return_value = writer
@@ -115,6 +158,27 @@ def test_unity_catalog_external_table_uses_owned_adls_path() -> None:
 
     writer.option.assert_called_once_with("path", reference.storage_path)
     writer.saveAsTable.assert_called_once_with(reference.value)
+
+
+def test_dangling_external_table_registration_is_dropped_before_recreate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = AnalysisException("missing Delta path")
+    error.getCondition = Mock(return_value="DELTA_PATH_DOES_NOT_EXIST")
+    monkeypatch.setattr(
+        "ecommerce_pipeline.adapters.lakehouse._delta_table",
+        Mock(side_effect=error),
+    )
+    spark = Mock()
+    reference = TableReference(
+        "catalog.gold.gold_scd2_checkpoint",
+        True,
+        "abfss://lakehouse@example/gold/gold_scd2_checkpoint",
+    )
+
+    _drop_dangling_catalog_registration(spark, reference)
+
+    spark.sql.assert_called_once_with("DROP TABLE IF EXISTS `catalog`.`gold`.`gold_scd2_checkpoint`")
 
 
 def test_known_nonempty_source_skips_the_extra_spark_action(monkeypatch: pytest.MonkeyPatch) -> None:
