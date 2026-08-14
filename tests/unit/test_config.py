@@ -153,7 +153,7 @@ def test_checkpoint_location_preserves_cloud_uri() -> None:
         checkpoint_root="abfss://lakehouse@account.dfs.core.windows.net/_checkpoints",
         kafka={
             "bootstrap_servers": "namespace.servicebus.windows.net:9093",
-                "topic_pattern": r"ecommerce\.domain\..*",
+            "topic_pattern": r"ecommerce\.domain\..*",
         },
     )
 
@@ -188,9 +188,7 @@ def test_azure_config_uses_unity_catalog_identifiers(monkeypatch: pytest.MonkeyP
         "abfss://lakehouse@storage.dfs.core.windows.net/ecommerce/dev/bronze/batch/orders"
     )
     raw_cdc = config.lakehouse.raw_cdc_bronze_reference("cdc_events")
-    assert raw_cdc.storage_path == (
-        "abfss://lakehouse@storage.dfs.core.windows.net/ecommerce/dev/bronze/cdc_events"
-    )
+    assert raw_cdc.storage_path == ("abfss://lakehouse@storage.dfs.core.windows.net/ecommerce/dev/bronze/cdc_events")
     typed = config.lakehouse.streaming_typed_bronze_reference("orders")
     assert typed.value == "catalog.bronze.cdc_typed_orders"
     assert typed.storage_path.endswith("/bronze/streaming/orders")

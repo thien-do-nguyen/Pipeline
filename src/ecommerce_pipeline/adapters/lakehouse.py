@@ -442,6 +442,7 @@ class LakehouseAdapter:
         )
         return True
 
+
 def _validate_schema_match(
     layer: str,
     table_name: str,

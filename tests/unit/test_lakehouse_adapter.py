@@ -178,9 +178,7 @@ def test_dangling_external_table_registration_is_dropped_before_recreate(
 
     _drop_dangling_catalog_registration(spark, reference)
 
-    spark.sql.assert_called_once_with(
-        "DROP TABLE IF EXISTS `catalog`.`gold`.`gold_scd2_checkpoint`"
-    )
+    spark.sql.assert_called_once_with("DROP TABLE IF EXISTS `catalog`.`gold`.`gold_scd2_checkpoint`")
 
 
 def test_known_nonempty_source_skips_the_extra_spark_action(monkeypatch: pytest.MonkeyPatch) -> None:

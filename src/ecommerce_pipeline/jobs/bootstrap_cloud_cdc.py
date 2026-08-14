@@ -36,16 +36,19 @@ def bootstrap(args: argparse.Namespace) -> None:
     admin_password = _required("POSTGRES_PASSWORD")
     table_names = [table for tables in CDC_DOMAIN_TABLES.values() for table in tables]
     tables = [sql.Identifier("customer_app", table) for table in table_names]
-    with psycopg.connect(
-        host=host,
-        port=port,
-        dbname=database,
-        user=admin_user,
-        password=admin_password,
-        sslmode="require",
-        connect_timeout=15,
-        autocommit=True,
-    ) as connection, connection.cursor() as cursor:
+    with (
+        psycopg.connect(
+            host=host,
+            port=port,
+            dbname=database,
+            user=admin_user,
+            password=admin_password,
+            sslmode="require",
+            connect_timeout=15,
+            autocommit=True,
+        ) as connection,
+        connection.cursor() as cursor,
+    ):
         cursor.execute("SHOW wal_level")
         wal_level_row = cursor.fetchone()
         if wal_level_row is None:
@@ -72,14 +75,14 @@ def bootstrap(args: argparse.Namespace) -> None:
                     sql.Literal(cdc_password),
                 )
             )
-        cursor.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
-            sql.Identifier(database), sql.Identifier(args.cdc_user)
-        ))
+        cursor.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                sql.Identifier(database), sql.Identifier(args.cdc_user)
+            )
+        )
         cursor.execute(sql.SQL("GRANT USAGE ON SCHEMA customer_app TO {}").format(sql.Identifier(args.cdc_user)))
         cursor.execute(
-            sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(
-                sql.SQL(", ").join(tables), sql.Identifier(args.cdc_user)
-            )
+            sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(sql.SQL(", ").join(tables), sql.Identifier(args.cdc_user))
         )
         cursor.execute(
             sql.SQL("CREATE SCHEMA IF NOT EXISTS cdc_control AUTHORIZATION {}").format(sql.Identifier(args.cdc_user))

@@ -155,10 +155,7 @@ def _string_field(values: object, field_name: str, table_name: object) -> str:
 def _operation_counts(values: object, table_name: object) -> dict[str, int]:
     raw = _table_values(values, table_name).get("operation_counts")
     if not isinstance(raw, dict) or any(
-        not isinstance(name, str)
-        or not isinstance(count, int)
-        or isinstance(count, bool)
-        or count < 0
+        not isinstance(name, str) or not isinstance(count, int) or isinstance(count, bool) or count < 0
         for name, count in raw.items()
     ):
         raise ValueError(f"Invalid manifest operation_counts: {table_name!r}")

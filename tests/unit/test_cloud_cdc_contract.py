@@ -25,8 +25,6 @@ def test_databricks_event_hubs_jaas_uses_shaded_kafka_login_module() -> None:
 
     jaas = _event_hubs_jaas(connection)
 
-    assert jaas.startswith(
-        "kafkashaded.org.apache.kafka.common.security.plain.PlainLoginModule required "
-    )
+    assert jaas.startswith("kafkashaded.org.apache.kafka.common.security.plain.PlainLoginModule required ")
     assert 'username="$ConnectionString"' in jaas
     assert f'password="{connection}";' in jaas

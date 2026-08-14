@@ -119,7 +119,5 @@ def test_cloud_lock_recreates_dangling_catalog_registration(monkeypatch: pytest.
 
     _ensure_lock_table(template, reference)
 
-    spark.sql.assert_called_once_with(
-        "DROP TABLE IF EXISTS `catalog`.`silver`.`_pipeline_writer_locks`"
-    )
+    spark.sql.assert_called_once_with("DROP TABLE IF EXISTS `catalog`.`silver`.`_pipeline_writer_locks`")
     write.assert_called_once_with(dataframe.write.format.return_value.mode.return_value, reference)

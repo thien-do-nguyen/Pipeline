@@ -110,9 +110,7 @@ def _apply_cloud_secrets(
             "secret_options": {"kafka.sasl.jaas.config": SecretStr(jaas)},
         }
     )
-    checkpoint_root = "/".join(
-        (args.external_storage_root.rstrip("/"), "_checkpoints", "cdc", namespace)
-    )
+    checkpoint_root = "/".join((args.external_storage_root.rstrip("/"), "_checkpoints", "cdc", namespace))
     streaming = config.streaming.model_copy(update={"checkpoint_root": checkpoint_root, "kafka": cloud_kafka})
     postgres = config.postgres.model_copy(update={"password": SecretStr(postgres_password)})
     return config.model_copy(update={"streaming": streaming, "postgres": postgres})

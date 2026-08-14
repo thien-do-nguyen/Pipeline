@@ -64,9 +64,7 @@ def test_latest_release_reads_properties_once_without_separate_existence_check(
     }
     read_properties = Mock(return_value={GOLD_RELEASE_PROPERTY: json.dumps(metadata)})
     monkeypatch.setattr(gold_releases, "try_delta_table_properties", read_properties)
-    config = SimpleNamespace(
-        lakehouse=SimpleNamespace(table_reference=lambda _layer, _table: "gold/fact_sales")
-    )
+    config = SimpleNamespace(lakehouse=SimpleNamespace(table_reference=lambda _layer, _table: "gold/fact_sales"))
 
     release = GoldReleaseStore(Mock(), config).latest()
 

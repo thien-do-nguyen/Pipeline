@@ -98,9 +98,7 @@ def test_transport_event_id_includes_cloud_source_epoch(spark: SparkSession) -> 
     ).first()
 
     assert row is not None
-    assert row["_transport_event_id"] == (
-        "tk1-ecommerce-cdc-dev-a1b2c3:ecommerce.domain.sales:2:7"
-    )
+    assert row["_transport_event_id"] == ("tk1-ecommerce-cdc-dev-a1b2c3:ecommerce.domain.sales:2:7")
 
 
 def test_kafka_source_uses_only_protocol_options() -> None:
