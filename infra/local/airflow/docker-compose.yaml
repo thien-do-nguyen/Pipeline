@@ -32,7 +32,7 @@ x-airflow-common: &airflow-common
     DATABRICKS_HOST: ${DATABRICKS_HOST:-}
     DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
     DATABRICKS_JOB_ID: ${DATABRICKS_JOB_ID:-}
-    DATABRICKS_POLL_SECONDS: ${DATABRICKS_POLL_SECONDS:-20}
+    DATABRICKS_POLL_SECONDS: ${DATABRICKS_POLL_SECONDS:-5}
     DATABRICKS_RUN_TIMEOUT_SECONDS: ${DATABRICKS_RUN_TIMEOUT_SECONDS:-7200}
     POSTGRES_HOST: postgres
     POSTGRES_PORT: "5432"
@@ -55,8 +55,7 @@ x-airflow-common: &airflow-common
     - ./configs:/opt/airflow/project/configs:ro
     - ./infra/local/spark:/opt/airflow/project/infra/local/spark:ro
     - ./data:/opt/airflow/project/data
-    - ./logs:/opt/airflow/project/logs
-    - ./logs/airflow:/opt/airflow/logs
+    - airflow_logs:/opt/airflow/logs
   depends_on:
     airflow-db:
       condition: service_healthy
@@ -133,3 +132,4 @@ services:
 
 volumes:
   airflow_metadata:
+  airflow_logs:

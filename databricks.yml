@@ -39,6 +39,9 @@ variables:
     description: Unity Catalog schema for Gold tables.
   secret_scope:
     description: Databricks secret scope containing the PostgreSQL password.
+  event_hubs_namespace:
+    description: Ephemeral Event Hubs namespace and CDC source epoch.
+    default: not-configured
 
 targets:
   dev:

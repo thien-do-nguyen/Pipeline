@@ -12,7 +12,7 @@ def test_missing_bronze_target_is_created_with_cdf(monkeypatch: pytest.MonkeyPat
     writer = empty.write.format.return_value
     writer.mode.return_value = writer
     writer.option.return_value = writer
-    reference = TableReference("data/lakehouse/bronze/streaming/cdc_events", False)
+    reference = TableReference("data/lakehouse/bronze/cdc_events", False)
     write_delta = Mock()
     monkeypatch.setattr(bronze, "_is_delta_path", Mock(return_value=False))
     monkeypatch.setattr(bronze, "write_delta", write_delta)
@@ -25,7 +25,7 @@ def test_missing_bronze_target_is_created_with_cdf(monkeypatch: pytest.MonkeyPat
 
 def test_existing_bronze_target_enables_cdf_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     df = Mock()
-    reference = TableReference("data/lakehouse/bronze/streaming/cdc_events", False)
+    reference = TableReference("data/lakehouse/bronze/cdc_events", False)
     set_property = Mock()
     monkeypatch.setattr(bronze, "_is_delta_path", Mock(return_value=True))
     monkeypatch.setattr(bronze, "delta_table_properties", Mock(return_value={}))

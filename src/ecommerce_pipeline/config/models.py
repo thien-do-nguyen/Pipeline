@@ -22,7 +22,6 @@ class ApplicationConfig(FrozenConfigModel):
     name: str = Field(min_length=1)
     source_system: str = Field(min_length=1)
     timezone: str = Field(min_length=1)
-    logs_path: str = Field(default="logs", min_length=1)
 
     @field_validator("timezone")
     @classmethod
@@ -103,6 +102,7 @@ class SparkConfig(FrozenConfigModel):
 class KafkaSourceConfig(FrozenConfigModel):
     """Kafka protocol settings shared by local Kafka and Azure Event Hubs."""
 
+    source_id: str | None = Field(default=None, min_length=1)
     bootstrap_servers: str = Field(min_length=1)
     topic: str | None = Field(default=None, min_length=1)
     topic_pattern: str | None = Field(default=None, min_length=1)
@@ -152,6 +152,7 @@ class UnifiedSilverStreamingConfig(FrozenConfigModel):
 
     enabled: bool = False
     query_name: str = Field(default="ecommerce-cdc-to-silver", min_length=1)
+    checkpoint_root: str | None = Field(default=None, min_length=1)
     checkpoint_version: str = Field(default="v1", pattern=r"^v[1-9][0-9]*$")
     trigger_interval: str = Field(default="1 minute", min_length=1)
     max_files_per_trigger: int = Field(default=8, ge=1, le=10_000)
@@ -163,10 +164,10 @@ class UnifiedSilverStreamingConfig(FrozenConfigModel):
 
 
 class PipelineCoordinationConfig(FrozenConfigModel):
-    """Single-writer policy shared by batch and streaming runtimes."""
+    """Serialize shared Silver/Gold publications across every pipeline trigger."""
 
-    gold_owner: Literal["batch", "streaming"] = "batch"
-    cloud_lock_name: str = Field(default="unified_silver_writer", min_length=1)
+    local_lock_path: str = Field(default="data/runtime", min_length=1)
+    cloud_lock_name: str = Field(default="unified_lakehouse_writer", min_length=1)
     cloud_lock_ttl_seconds: int = Field(default=21_600, ge=300, le=86_400)
     lock_wait_seconds: int = Field(default=600, ge=0, le=3600)
 
@@ -214,11 +215,12 @@ class StreamingConfig(FrozenConfigModel):
 
     @property
     def silver_checkpoint_location(self) -> str:
-        if self.checkpoint_root is None:
+        checkpoint_root = self.silver.checkpoint_root or self.checkpoint_root
+        if checkpoint_root is None:
             raise ValueError("Streaming checkpoint_root is not configured")
         return "/".join(
             (
-                self.checkpoint_root.rstrip("/"),
+                checkpoint_root.rstrip("/"),
                 self.silver.query_name,
                 self.silver.checkpoint_version,
             )
@@ -265,14 +267,15 @@ class LakehouseConfig(FrozenConfigModel):
             if not _IDENTIFIER.fullmatch(value):
                 raise ValueError(f"Unsafe {label}: {value}")
         if self.catalog is not None:
+            storage_parts = [self.external_root.rstrip("/"), layer] if self.external_root is not None else None
+            if storage_parts is not None and layer == "bronze":
+                storage_parts.append("batch")
+            if storage_parts is not None:
+                storage_parts.append(table_name)
             return TableReference(
                 value=f"{self.catalog}.{self.schemas[layer]}.{table_name}",
                 is_catalog=True,
-                storage_path=(
-                    None
-                    if self.external_root is None
-                    else "/".join((self.external_root.rstrip("/"), layer, table_name))
-                ),
+                storage_path=None if storage_parts is None else "/".join(storage_parts),
             )
         assert self.base_path is not None
         parts = [self.base_path.rstrip("/"), layer]
@@ -281,8 +284,8 @@ class LakehouseConfig(FrozenConfigModel):
         parts.append(table_name)
         return TableReference(value="/".join(parts), is_catalog=False)
 
-    def streaming_bronze_reference(self, table_name: str) -> TableReference:
-        """Resolve the raw CDC table without changing the batch Bronze layout."""
+    def raw_cdc_bronze_reference(self, table_name: str) -> TableReference:
+        """Resolve raw CDC separately from batch snapshots and typed streaming data."""
 
         if not _IDENTIFIER.fullmatch(table_name):
             raise ValueError(f"Unsafe table_name: {table_name}")
@@ -293,12 +296,12 @@ class LakehouseConfig(FrozenConfigModel):
                 storage_path=(
                     None
                     if self.external_root is None
-                    else "/".join((self.external_root.rstrip("/"), "bronze", "streaming", table_name))
+                    else "/".join((self.external_root.rstrip("/"), "bronze", table_name))
                 ),
             )
         assert self.base_path is not None
         return TableReference(
-            value="/".join((self.base_path.rstrip("/"), "bronze", "streaming", table_name)),
+            value="/".join((self.base_path.rstrip("/"), "bronze", table_name)),
             is_catalog=False,
         )
 

@@ -1,8 +1,5 @@
 environment: azure
 
-application:
-  logs_path: "/Workspace/Users/2251120184@ut.edu.vn/ecommerce-pipeline/logs"
-
 postgres:
   sslmode: require
 
@@ -12,6 +9,37 @@ spark:
   config:
     spark.sql.shuffle.partitions: "auto"
     spark.databricks.delta.snapshotPartitions: "2"
+
+streaming:
+  enabled: true
+  trigger_interval: 30 seconds
+  checkpoint_version: v1
+  checkpoint_root: "${DATABRICKS_EXTERNAL_STORAGE_ROOT}/_checkpoints/cdc/not-configured"
+  kafka:
+    # The cloud entry point replaces these placeholders from task parameters
+    # and the Databricks secret scope before constructing the Kafka source.
+    source_id: event-hubs-not-configured
+    bootstrap_servers: not-configured.servicebus.windows.net:9093
+    topic_pattern: "ecommerce\\.domain\\..*"
+    starting_offsets: earliest
+    fail_on_data_loss: true
+    max_offsets_per_trigger: 100000
+    options:
+      kafka.security.protocol: SASL_SSL
+      kafka.sasl.mechanism: PLAIN
+      kafka.request.timeout.ms: "60000"
+      kafka.session.timeout.ms: "30000"
+  silver:
+    enabled: true
+    # Stable across Event Hubs destroy/apply because the Delta Raw Bronze source
+    # is persistent and must not be replayed from version zero each epoch.
+    checkpoint_root: "${DATABRICKS_EXTERNAL_STORAGE_ROOT}/_checkpoints/cdc-downstream"
+    trigger_interval: 30 seconds
+    checkpoint_version: v1
+    max_files_per_trigger: 8
+    max_bytes_per_trigger: 64m
+    reconcile_gold_each_batch: true
+    gold_deferred_retry_seconds: 30
 
 lakehouse:
   catalog: "${DATABRICKS_CATALOG}"

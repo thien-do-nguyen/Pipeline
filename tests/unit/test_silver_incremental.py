@@ -143,12 +143,12 @@ def test_silver_skips_transform_when_delta_version_is_current(monkeypatch: pytes
     service.lakehouse.upsert_table.assert_not_called()
 
 
-def test_silver_recovers_missing_progress_by_rebuilding_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_silver_rejects_existing_table_without_progress(monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service()
     service._replace_from_snapshot = Mock()
     _mock_progress(monkeypatch, silver_version=None)
 
-    result = service.run_table("orders", batch_id="batch-2")
+    with pytest.raises(RuntimeError, match="Silver progress metadata is missing"):
+        service.run_table("orders", batch_id="batch-2")
 
-    assert result.committed_version == 1
-    service._replace_from_snapshot.assert_called_once()
+    service._replace_from_snapshot.assert_not_called()

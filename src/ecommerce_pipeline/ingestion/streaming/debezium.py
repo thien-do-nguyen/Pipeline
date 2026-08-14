@@ -1,4 +1,4 @@
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     ArrayType,
@@ -67,7 +67,7 @@ _KAFKA_INPUT_SCHEMA = StructType(
 )
 
 
-def normalize_debezium_events(df: DataFrame) -> DataFrame:
+def normalize_debezium_events(df: DataFrame, *, source_id: str | None = None) -> DataFrame:
     """Normalize transport metadata while retaining the complete Debezium JSON envelope."""
 
     decoded = (
@@ -85,10 +85,16 @@ def normalize_debezium_events(df: DataFrame) -> DataFrame:
         .when(~has_source, F.lit("missing_source_metadata"))
     )
 
+    transport_event_id_parts: list[Column | str] = [
+        "topic",
+        F.col("partition").cast("string"),
+        F.col("offset").cast("string"),
+    ]
+    if source_id is not None:
+        transport_event_id_parts.insert(0, F.lit(source_id))
+
     return decoded.select(
-        F.concat_ws(":", "topic", F.col("partition").cast("string"), F.col("offset").cast("string")).alias(
-            "_transport_event_id"
-        ),
+        F.concat_ws(":", *transport_event_id_parts).alias("_transport_event_id"),
         "topic",
         "partition",
         "offset",

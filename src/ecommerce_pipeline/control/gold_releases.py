@@ -8,8 +8,8 @@ from pyspark.sql import SparkSession
 from ecommerce_pipeline.adapters.lakehouse import (
     LakehouseAdapter,
     delta_commit_metadata,
-    delta_table_properties,
     set_delta_table_property,
+    try_delta_table_properties,
 )
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.gold_tables import GOLD_TABLES
@@ -37,9 +37,10 @@ class GoldReleaseStore:
 
     def latest(self) -> GoldRelease | None:
         fact_path = self.config.lakehouse.table_reference("gold", "fact_sales")
-        if not self.lakehouse.table_exists("gold", "fact_sales"):
+        properties = try_delta_table_properties(self.spark, fact_path)
+        if properties is None:
             return None
-        raw_release = delta_table_properties(self.spark, fact_path).get(GOLD_RELEASE_PROPERTY)
+        raw_release = properties.get(GOLD_RELEASE_PROPERTY)
         return None if raw_release is None else _release_from_json(raw_release)
 
     def publish(

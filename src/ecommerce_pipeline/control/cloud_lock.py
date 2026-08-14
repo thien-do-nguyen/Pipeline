@@ -6,10 +6,11 @@ from time import monotonic, sleep
 from uuid import uuid4
 
 from delta.tables import DeltaTable
+from pyspark.errors import AnalysisException
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from ecommerce_pipeline.adapters.lakehouse import read_delta, write_delta
+from ecommerce_pipeline.adapters.lakehouse import _is_missing_delta_table, read_delta, write_delta
 from ecommerce_pipeline.config.models import AppConfig, TableReference
 
 
@@ -80,23 +81,35 @@ def cloud_pipeline_lock(spark: SparkSession, config: AppConfig, owner: str) -> I
 def _ensure_lock_table(template: DataFrame, reference: TableReference) -> None:
     dataframe = template.limit(0)
     spark = dataframe.sparkSession
-    exists = (
-        spark.catalog.tableExists(reference.value)
-        if reference.is_catalog
-        else DeltaTable.isDeltaTable(spark, reference.value)
-    )
-    if exists:
+    if _lock_table_exists(spark, reference):
         return
+    # A Unity Catalog external table can outlive its deleted ADLS directory.
+    # Drop only this internal control-table registration before recreating it.
+    if reference.is_catalog:
+        spark.sql(f"DROP TABLE IF EXISTS {_catalog_identifier(reference.value)}")
     try:
         write_delta(dataframe.write.format("delta").mode("append"), reference)
     except Exception:
-        exists = (
+        # Another writer may have won the initial table-creation race.
+        if not _lock_table_exists(spark, reference):
+            raise
+
+
+def _lock_table_exists(spark: SparkSession, reference: TableReference) -> bool:
+    try:
+        return (
             spark.catalog.tableExists(reference.value)
             if reference.is_catalog
             else DeltaTable.isDeltaTable(spark, reference.value)
         )
-        if not exists:
-            raise
+    except AnalysisException as exc:
+        if _is_missing_delta_table(exc):
+            return False
+        raise
+
+
+def _catalog_identifier(value: str) -> str:
+    return ".".join(f"`{part.replace('`', '``')}`" for part in value.split("."))
 
 
 def _delta_table(spark: SparkSession, reference: TableReference) -> DeltaTable:

@@ -5,57 +5,11 @@ from decimal import Decimal
 
 from pyspark.sql import SparkSession
 
-from ecommerce_pipeline.adapters.lakehouse import _stage_scd2_changes
 from ecommerce_pipeline.transformations.gold.dimensions import (
     build_dim_category,
     build_dim_product,
     build_dim_shop,
 )
-
-
-def test_scd2_stages_close_insert_and_type1_as_one_merge_source(spark: SparkSession) -> None:
-    schema = """
-        source_id int, surrogate_key long, attribute_hash string, current_value int,
-        initial_at timestamp, effective_from timestamp, effective_to timestamp,
-        is_current boolean, updated_at timestamp
-    """
-    end = datetime(9999, 12, 31)
-    current = spark.createDataFrame(
-        [
-            (1, 101, "old-1", 10, datetime(2025, 1, 1), datetime(2025, 1, 1), end, True, datetime(2025, 1, 1)),
-            (2, 201, "same-2", 10, datetime(2025, 1, 1), datetime(2025, 1, 1), end, True, datetime(2025, 1, 1)),
-            (4, 401, "same-4", 10, datetime(2025, 1, 1), datetime(2025, 1, 1), end, True, datetime(2025, 1, 1)),
-        ],
-        schema,
-    )
-    source = spark.createDataFrame(
-        [
-            (1, 102, "new-1", 11, datetime(2025, 1, 1), datetime(2026, 1, 1), end, True, datetime(2026, 1, 1)),
-            (2, 202, "same-2", 20, datetime(2025, 1, 1), datetime(2026, 1, 1), end, True, datetime(2026, 1, 1)),
-            (3, 301, "new-3", 30, datetime(2025, 3, 1), datetime(2026, 1, 1), end, True, datetime(2026, 1, 1)),
-            (4, 402, "same-4", 10, datetime(2025, 1, 1), datetime(2026, 1, 1), end, True, datetime(2026, 1, 1)),
-        ],
-        schema,
-    )
-
-    staged = _stage_scd2_changes(
-        source,
-        current,
-        source_key="source_id",
-        attribute_hash="attribute_hash",
-        initial_effective_from="initial_at",
-        type1_columns=("current_value",),
-    )
-    actions = {
-        (row["source_id"], row["_action"]): (row["_merge_key"], row["effective_from"]) for row in staged.collect()
-    }
-
-    assert actions == {
-        (1, "CLOSE"): (1, datetime(2026, 1, 1)),
-        (1, "INSERT"): (None, datetime(2026, 1, 1)),
-        (2, "TYPE1"): (2, datetime(2026, 1, 1)),
-        (3, "INSERT"): (None, datetime(2025, 3, 1)),
-    }
 
 
 def test_shop_and_category_dimensions_expose_scd2_contract(spark: SparkSession) -> None:

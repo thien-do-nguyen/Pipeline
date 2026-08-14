@@ -14,6 +14,7 @@ from ecommerce_pipeline.adapters.lakehouse import (
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
 from ecommerce_pipeline.control.gold_releases import GoldReleaseStore
+from ecommerce_pipeline.control.manifests import SilverBatchManifest
 from ecommerce_pipeline.pipelines.build_silver import SILVER_DATA_PIPELINES, SILVER_PIPELINE_NAME
 from ecommerce_pipeline.pipelines.quality import GoldQualityChecker, GoldQualityReport
 
@@ -32,6 +33,31 @@ class BatchValidationReport:
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+def validate_gold_release(
+    spark: SparkSession,
+    config: AppConfig,
+    silver_manifest: SilverBatchManifest,
+) -> dict[str, object]:
+    """Verify the atomic Gold marker without repeating the full data-quality scan."""
+
+    expected_versions = silver_manifest.committed_versions
+    if set(expected_versions) != set(SILVER_TABLES):
+        raise ValueError("Silver manifest does not contain every contracted table")
+    release = GoldReleaseStore(spark, config).latest()
+    if release is None:
+        raise RuntimeError("Gold has no published release")
+    if release.silver_versions != expected_versions:
+        raise ValueError(
+            "Gold progress is not aligned with the orchestrated Silver output: "
+            f"published={release.silver_versions}, expected={expected_versions}"
+        )
+    return {
+        "batch_id": release.batch_id,
+        "silver_table_count": len(release.silver_versions),
+        "gold_table_count": len(release.gold_versions),
+    }
 
 
 def validate_batch_lakehouse(spark: SparkSession, config: AppConfig) -> BatchValidationReport:
@@ -142,7 +168,7 @@ def validate_batch_lakehouse(spark: SparkSession, config: AppConfig) -> BatchVal
 def _streaming_event_counts(spark: SparkSession, config: AppConfig) -> dict[str, int]:
     from delta.tables import DeltaTable
 
-    reference = config.lakehouse.streaming_bronze_reference(config.streaming.bronze_table)
+    reference = config.lakehouse.raw_cdc_bronze_reference(config.streaming.bronze_table)
     exists = (
         spark.catalog.tableExists(reference.value)
         if reference.is_catalog

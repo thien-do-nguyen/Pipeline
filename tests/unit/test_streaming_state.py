@@ -9,8 +9,8 @@ from ecommerce_pipeline.ingestion.streaming.state import assert_local_delta_targ
 
 
 def test_missing_local_delta_target_with_checkpoint_fails_fast(tmp_path: Path) -> None:
-    target = TableReference(str(tmp_path / "lakehouse" / "bronze" / "streaming" / "cdc_events"), False)
-    checkpoint = tmp_path / "checkpoints" / "ecommerce-cdc-to-bronze" / "v2"
+    target = TableReference(str(tmp_path / "lakehouse" / "bronze" / "cdc_events"), False)
+    checkpoint = tmp_path / "checkpoints" / "ecommerce-cdc-to-bronze" / "v3"
     checkpoint.mkdir(parents=True)
     (checkpoint / "metadata").write_text("{}", encoding="utf-8")
 
@@ -23,7 +23,7 @@ def test_missing_local_delta_target_with_checkpoint_fails_fast(tmp_path: Path) -
 
 
 def test_missing_local_delta_target_without_checkpoint_is_allowed(tmp_path: Path) -> None:
-    target = TableReference(str(tmp_path / "lakehouse" / "bronze" / "streaming" / "cdc_events"), False)
+    target = TableReference(str(tmp_path / "lakehouse" / "bronze" / "cdc_events"), False)
 
     assert_local_delta_target_matches_checkpoints(
         target,

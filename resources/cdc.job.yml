@@ -1,32 +1,34 @@
 resources:
   jobs:
-    ecommerce_pipeline:
-      name: ecommerce-lakehouse-pipeline
+    ecommerce_cdc:
+      name: ecommerce-lakehouse-cdc
       max_concurrent_runs: 1
       run_as:
         user_name: ${var.run_principal}
 
-      parameters:
-        - name: pipeline_mode
-          default: workflow
-        - name: batch_id
-          default: databricks-{{job.run_id}}
+      # Kept paused by default so destroying Event Hubs cannot accidentally
+      # start the shared cluster. Trigger manually or enable the schedule only
+      # while the ephemeral CDC infrastructure exists.
+      schedule:
+        quartz_cron_expression: "0 0/2 * * * ?"
+        timezone_id: Asia/Ho_Chi_Minh
+        pause_status: PAUSED
 
       tasks:
-        - task_key: run_pipeline
+        - task_key: process_cdc_available_now
           existing_cluster_id: 0804-071458-pswonf6z
           python_wheel_task:
             package_name: ecommerce_pipeline
-            entry_point: ecommerce-batch
+            entry_point: ecommerce-cdc-cloud
             parameters:
               - --env
               - ${workspace.file_path}/configs/azure.yaml
               - --base-config
               - ${workspace.file_path}/configs/base.yaml
-              - --mode
-              - "{{job.parameters.pipeline_mode}}"
-              - --batch-id
-              - "{{job.parameters.batch_id}}"
+              - --event-hubs-namespace
+              - ${var.event_hubs_namespace}
+              - --secret-scope
+              - ${var.secret_scope}
               - --postgres-host
               - ${var.postgres_host}
               - --postgres-port
@@ -45,7 +47,5 @@ resources:
               - ${resources.schemas.gold.name}
               - --external-storage-root
               - ${resources.external_locations.pipeline.url}
-              - --secret-scope
-              - ${var.secret_scope}
           libraries:
             - whl: ../dist/*.whl

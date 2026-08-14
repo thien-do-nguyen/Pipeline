@@ -124,11 +124,11 @@ def test_local_streaming_config_is_cloud_protocol_compatible(monkeypatch: pytest
     assert config.streaming.enabled is True
     assert config.streaming.kafka is not None
     assert config.streaming.kafka.topic is None
-    assert config.streaming.kafka.topic_pattern == r"ecommerce\.customer_app\..*"
+    assert config.streaming.kafka.topic_pattern == r"ecommerce\.domain\..*"
     assert config.streaming.kafka.subscribe_key == "subscribePattern"
     assert config.streaming.kafka.spark_options()["kafka.bootstrap.servers"] == "localhost:29092"
     assert config.streaming.trigger_interval == "2 seconds"
-    assert config.streaming.checkpoint_location == "data/checkpoints/ecommerce-cdc-to-bronze/v2"
+    assert config.streaming.checkpoint_location == "data/checkpoints/ecommerce-cdc-to-bronze/v3"
     assert config.streaming.silver.enabled is True
     assert config.streaming.silver.trigger_interval == "5 seconds"
     assert config.streaming.silver_checkpoint_location == "data/checkpoints/ecommerce-cdc-to-silver/v3"
@@ -140,9 +140,9 @@ def test_local_streaming_config_is_cloud_protocol_compatible(monkeypatch: pytest
     assert config.streaming.silver.gold_deferred_retry_interval_seconds == 2
     assert config.spark.config["spark.sql.debug.maxToStringFields"] == "2000"
     assert config.spark.config["spark.driver.extraJavaOptions"].endswith("infra/local/spark/log4j2.properties")
-    assert config.lakehouse.streaming_bronze_reference("cdc_events").value.endswith("/bronze/streaming/cdc_events")
+    assert config.lakehouse.raw_cdc_bronze_reference("cdc_events").value.endswith("/bronze/cdc_events")
     assert config.lakehouse.streaming_typed_bronze_reference("orders").value.endswith("/bronze/streaming/orders")
-    assert config.coordination.gold_owner == "streaming"
+    assert config.coordination.cloud_lock_name == "unified_lakehouse_writer"
 
 
 def test_checkpoint_location_preserves_cloud_uri() -> None:
@@ -153,7 +153,7 @@ def test_checkpoint_location_preserves_cloud_uri() -> None:
         checkpoint_root="abfss://lakehouse@account.dfs.core.windows.net/_checkpoints",
         kafka={
             "bootstrap_servers": "namespace.servicebus.windows.net:9093",
-            "topic_pattern": r"ecommerce\.customer_app\..*",
+                "topic_pattern": r"ecommerce\.domain\..*",
         },
     )
 
@@ -183,14 +183,31 @@ def test_azure_config_uses_unity_catalog_identifiers(monkeypatch: pytest.MonkeyP
     assert reference.value == "catalog.silver.orders"
     assert reference.is_catalog is True
     assert reference.storage_path == ("abfss://lakehouse@storage.dfs.core.windows.net/ecommerce/dev/silver/orders")
+    batch_bronze = config.lakehouse.table_reference("bronze", "orders")
+    assert batch_bronze.storage_path == (
+        "abfss://lakehouse@storage.dfs.core.windows.net/ecommerce/dev/bronze/batch/orders"
+    )
+    raw_cdc = config.lakehouse.raw_cdc_bronze_reference("cdc_events")
+    assert raw_cdc.storage_path == (
+        "abfss://lakehouse@storage.dfs.core.windows.net/ecommerce/dev/bronze/cdc_events"
+    )
     typed = config.lakehouse.streaming_typed_bronze_reference("orders")
     assert typed.value == "catalog.bronze.cdc_typed_orders"
     assert typed.storage_path.endswith("/bronze/streaming/orders")
-    assert config.coordination.gold_owner == "batch"
-    assert config.application.logs_path == ("/Workspace/Users/2251120184@ut.edu.vn/ecommerce-pipeline/logs")
+    assert config.coordination.cloud_lock_name == "unified_lakehouse_writer"
+    assert config.coordination.local_lock_path == "data/runtime"
     assert config.spark.master is None
     assert config.spark.configure_delta_package is False
     assert config.spark.stop_session is False
+    assert config.streaming.enabled is True
+    assert config.streaming.checkpoint_location == (
+        "abfss://lakehouse@storage.dfs.core.windows.net/ecommerce/dev/"
+        "_checkpoints/cdc/not-configured/ecommerce-cdc-to-bronze/v1"
+    )
+    assert config.streaming.silver_checkpoint_location == (
+        "abfss://lakehouse@storage.dfs.core.windows.net/ecommerce/dev/"
+        "_checkpoints/cdc-downstream/ecommerce-cdc-to-silver/v1"
+    )
     assert not any(key.startswith("spark.hadoop.fs.azure.account") for key in config.spark.config)
 
 

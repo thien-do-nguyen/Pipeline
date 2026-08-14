@@ -5,13 +5,9 @@ from dataclasses import dataclass
 from time import perf_counter
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
 
 from ecommerce_pipeline.adapters.lakehouse import (
     DeltaTableState,
-    delta_commit_metadata,
-    read_delta,
-    set_delta_table_property,
     try_delta_table_state,
 )
 from ecommerce_pipeline.adapters.postgres import PostgresReader
@@ -101,7 +97,7 @@ class BronzeExtractor:
     def _table_state(self, table_name: str) -> _BronzeState:
         reference = self.config.lakehouse.table_reference("bronze", table_name)
         state = try_delta_table_state(self.spark, reference, pipeline="postgres_to_bronze")
-        cursor, processed_version = self._read_cursor(table_name, reference, state)
+        cursor, processed_version = self._read_cursor(table_name, state)
         return _BronzeState(table_name, reference, state, cursor, processed_version)
 
     def _run_table(
@@ -206,45 +202,21 @@ class BronzeExtractor:
     def _read_cursor(
         self,
         table_name: str,
-        reference: TableReference,
         state: DeltaTableState | None,
     ) -> tuple[EventCursor | None, int]:
         if state is None:
             return None, -1
         metadata = state.progress
         if metadata is None:
-            return self._migrate_legacy_cursor(table_name, reference), state.version + 1
+            raise RuntimeError(
+                f"Bronze progress metadata is missing for {table_name}; reset Bronze before change-event ingestion"
+            )
         last_event_id = metadata.get("last_event_id")
         if not isinstance(last_event_id, int) or isinstance(last_event_id, bool) or last_event_id < 0:
             raise ValueError(f"Invalid Bronze Delta progress metadata for table: {table_name}")
         if state.progress_version is None:
             raise RuntimeError(f"Bronze progress version is missing for table: {table_name}")
         return EventCursor(last_event_id), state.progress_version
-
-    def _migrate_legacy_cursor(self, table_name: str, reference: TableReference) -> EventCursor:
-        bronze = read_delta(self.spark, reference)
-        if "_event_id" not in bronze.columns:
-            raise RuntimeError(
-                f"Bronze schema is outdated for {table_name}; rebuild Bronze before change-event ingestion"
-            )
-        row = bronze.agg(F.max("_event_id").alias("last_event_id")).first()
-        cursor = EventCursor(0 if row is None or row["last_event_id"] is None else int(row["last_event_id"]))
-        metadata: dict[str, object] = {
-            "pipeline": "postgres_to_bronze",
-            "source_table": table_name,
-            "batch_id": self.batch_id,
-            "last_event_id": cursor.last_event_id,
-            "bronze_schema_version": BRONZE_SCHEMA_VERSION,
-            "migration": "legacy_bronze_cursor",
-        }
-        with delta_commit_metadata(self.spark, metadata):
-            set_delta_table_property(
-                self.spark,
-                reference,
-                "pipeline.bronzeProgressMigration",
-                self.batch_id,
-            )
-        return cursor
 
 
 def extract_all_to_bronze(

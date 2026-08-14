@@ -9,8 +9,11 @@ CLOUD_ENV ?= .env.cloud
 	cdc-recover-offsets \
 	run-stream-local run-stream-local-once run-silver-stream-local run-silver-stream-local-once \
 	run-cdc-local-once reconcile-gold-local seed seed-reset-guard seed-stream \
-	run-batch-local run-batch-cloud run-deployed-batch-cloud validate-batch-cloud deploy-batch-cloud validate \
+	run-batch-local run-batch-cloud deploy-run-batch-cloud \
+	validate-batch-cloud deploy-batch-cloud validate \
 	airflow-build airflow-up airflow-down airflow-status airflow-check airflow-trigger airflow-trigger-cloud airflow-logs \
+	cdc-cloud-pg-bootstrap cdc-cloud-init cdc-cloud-plan cdc-cloud-apply cdc-cloud-destroy \
+	deploy-cdc-cloud run-cdc-cloud cdc-cloud-start cdc-cloud-stop cdc-cloud-status cdc-cloud-logs \
 	validate-batch-local lint format format-check type-check test test-integration test-e2e check \
 	smoke demo-batch-local build
 
@@ -29,9 +32,13 @@ CUSTOMERS ?= 10000
 ORDERS ?= 50000
 SEED_BATCH_SIZE ?= 10000
 ORDERS_PER_BATCH ?= 5
-INTERVAL_SECONDS ?= 3
+INTERVAL_SECONDS ?= 1
 MAX_BATCHES ?=
 DATABRICKS_FLAGS ?=
+CDC_TERRAFORM_DIR := infra/cloud/cdc
+AZURE_SUBSCRIPTION_ID ?= 85c4e9c5-c046-4dbe-90a1-dbdeb593fc61
+AZURE_CDC_RESOURCE_GROUP ?= rg-tk1-student-cdc-dev
+AZURE_CDC_NAME_PREFIX ?= tk1-ecommerce-cdc-dev
 
 CLOUD_REQUIRED_VARS := \
 	POSTGRES_HOST \
@@ -64,6 +71,16 @@ DATABRICKS_BUNDLE_VARS := \
 	--var="silver_schema=$(DATABRICKS_SILVER_SCHEMA)" \
 	--var="gold_schema=$(DATABRICKS_GOLD_SCHEMA)" \
 	--var="secret_scope=$(DATABRICKS_SECRET_SCOPE)"
+
+DATABRICKS_CDC_BUNDLE_VAR := $(if $(EVENT_HUBS_NAMESPACE),--var="event_hubs_namespace=$(EVENT_HUBS_NAMESPACE)",)
+
+CDC_TERRAFORM_VARS := \
+	-var="subscription_id=$(AZURE_SUBSCRIPTION_ID)" \
+	-var="resource_group_name=$(AZURE_CDC_RESOURCE_GROUP)" \
+	-var="name_prefix=$(AZURE_CDC_NAME_PREFIX)" \
+	-var="postgres_host=$(POSTGRES_HOST)" \
+	-var="postgres_port=$(POSTGRES_PORT)" \
+	-var="postgres_database=$(POSTGRES_DB)"
 
 help:
 	@$(VENV_PYTHON) -c "print('Targets: setup env pg-up pg-reset cdc-up cdc-status cdc-recover-offsets run-stream-local run-silver-stream-local run-cdc-local-once seed run-batch-local airflow-up airflow-trigger airflow-down validate check')" 2>/dev/null || \
@@ -102,6 +119,7 @@ lakehouse-reset:
 	find data/lakehouse -depth -mindepth 1 ! -name .gitkeep -delete
 
 cdc-state-reset: unified-state-reset
+	@test ! -d data/lakehouse/bronze/cdc_events || find data/lakehouse/bronze/cdc_events -depth -delete
 	@test ! -d data/lakehouse/bronze/streaming || find data/lakehouse/bronze/streaming -depth -delete
 	@test ! -d data/checkpoints/ecommerce-cdc-to-bronze || \
 		find data/checkpoints/ecommerce-cdc-to-bronze -depth -delete
@@ -158,7 +176,7 @@ run-cdc-local-once:
 	$(MAKE) run-silver-stream-local-once
 
 reconcile-gold-local: env
-	SPARK_LOCAL_IP=127.0.0.1 $(VENV_PYTHON) -m ecommerce_pipeline.jobs.reconcile_streaming_gold \
+	SPARK_LOCAL_IP=127.0.0.1 $(VENV_PYTHON) -m ecommerce_pipeline.jobs.reconcile_gold \
 		--env configs/local.yaml
 
 seed-reset-guard:
@@ -190,12 +208,73 @@ seed-stream: env
 run-batch-local: env
 	SPARK_LOCAL_IP=127.0.0.1 $(VENV_PYTHON) -m ecommerce_pipeline.jobs.run_batch --env configs/local.yaml --mode all
 
+cdc-cloud-pg-bootstrap: cloud-env
+	@POSTGRES_PASSWORD='$(POSTGRES_PASSWORD)' CDC_POSTGRES_PASSWORD='$(CDC_POSTGRES_PASSWORD)' \
+		$(VENV_PYTHON) -m ecommerce_pipeline.jobs.bootstrap_cloud_cdc --env-file $(CLOUD_ENV)
+
+cdc-cloud-init: cloud-env
+	terraform -chdir=$(CDC_TERRAFORM_DIR) init
+
+cdc-cloud-plan: cdc-cloud-init
+	@TF_VAR_postgres_cdc_password='$(CDC_POSTGRES_PASSWORD)' terraform -chdir=$(CDC_TERRAFORM_DIR) plan \
+		$(CDC_TERRAFORM_VARS)
+
+cdc-cloud-apply: cdc-cloud-pg-bootstrap cdc-cloud-init
+	@TF_VAR_postgres_cdc_password='$(CDC_POSTGRES_PASSWORD)' terraform -chdir=$(CDC_TERRAFORM_DIR) apply \
+		-auto-approve $(CDC_TERRAFORM_VARS)
+	bash $(CDC_TERRAFORM_DIR)/sync_databricks_secret.sh \
+		$(CDC_TERRAFORM_DIR) $(DATABRICKS_SECRET_SCOPE) $(DATABRICKS_PROFILE)
+	$(MAKE) deploy-cdc-cloud
+
+cdc-cloud-destroy: cloud-env
+	-@$(MAKE) cdc-cloud-stop
+	@TF_VAR_postgres_cdc_password='$(CDC_POSTGRES_PASSWORD)' terraform -chdir=$(CDC_TERRAFORM_DIR) destroy \
+		-auto-approve $(CDC_TERRAFORM_VARS)
+
+deploy-cdc-cloud: cloud-env
+	@namespace="$$(terraform -chdir=$(CDC_TERRAFORM_DIR) output -raw event_hubs_namespace)"; \
+		$(MAKE) deploy-batch-cloud EVENT_HUBS_NAMESPACE="$$namespace"
+
+run-cdc-cloud: cloud-env
+	@namespace="$$(terraform -chdir=$(CDC_TERRAFORM_DIR) output -raw event_hubs_namespace)"; \
+		$(DATABRICKS) $(DATABRICKS_FLAGS) bundle run --profile $(DATABRICKS_PROFILE) \
+		--target $(DATABRICKS_TARGET) $(DATABRICKS_BUNDLE_VARS) \
+		--var="event_hubs_namespace=$$namespace" ecommerce_cdc
+
+cdc-cloud-start: cloud-env
+	@namespace="$$(terraform -chdir=$(CDC_TERRAFORM_DIR) output -raw event_hubs_namespace)"; \
+		job_id="$$($(DATABRICKS) bundle summary --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) \
+		$(DATABRICKS_BUNDLE_VARS) --var="event_hubs_namespace=$$namespace" -o json | \
+		$(VENV_PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["resources"]["jobs"]["ecommerce_cdc"]["id"])')"; \
+		$(DATABRICKS) jobs update "$$job_id" --profile $(DATABRICKS_PROFILE) --json \
+		'{"new_settings":{"schedule":{"quartz_cron_expression":"0 0/2 * * * ?","timezone_id":"Asia/Ho_Chi_Minh","pause_status":"UNPAUSED"}}}'; \
+		printf '[cloud-cdc] schedule=UNPAUSED interval=2m job_id=%s\n' "$$job_id"
+
+cdc-cloud-stop: cloud-env
+	@namespace="$$(terraform -chdir=$(CDC_TERRAFORM_DIR) output -raw event_hubs_namespace)"; \
+		job_id="$$($(DATABRICKS) bundle summary --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) \
+		$(DATABRICKS_BUNDLE_VARS) --var="event_hubs_namespace=$$namespace" -o json | \
+		$(VENV_PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["resources"]["jobs"]["ecommerce_cdc"]["id"])')"; \
+		$(DATABRICKS) jobs update "$$job_id" --profile $(DATABRICKS_PROFILE) --json \
+		'{"new_settings":{"schedule":{"quartz_cron_expression":"0 0/2 * * * ?","timezone_id":"Asia/Ho_Chi_Minh","pause_status":"PAUSED"}}}'; \
+		printf '[cloud-cdc] schedule=PAUSED job_id=%s\n' "$$job_id"
+
+cdc-cloud-status: cloud-env
+	@terraform -chdir=$(CDC_TERRAFORM_DIR) output
+	@container="$$(terraform -chdir=$(CDC_TERRAFORM_DIR) output -raw debezium_container_group)"; \
+		az container show --resource-group $(AZURE_CDC_RESOURCE_GROUP) --name "$$container" \
+		--query '{name:name,state:instanceView.state,containers:containers[].{name:name,state:instanceView.currentState.state,restarts:instanceView.restartCount}}' --output json
+
+cdc-cloud-logs: cloud-env
+	@container="$$(terraform -chdir=$(CDC_TERRAFORM_DIR) output -raw debezium_container_group)"; \
+		az container logs --resource-group $(AZURE_CDC_RESOURCE_GROUP) --name "$$container" \
+			--container-name debezium-server
+
 airflow-build: env
 	$(AIRFLOW_COMPOSE) build airflow-init
 
 airflow-up: env
-	mkdir -p logs/airflow
-	$(AIRFLOW_COMPOSE) up -d --build --wait postgres airflow-api-server airflow-scheduler airflow-dag-processor
+	$(AIRFLOW_COMPOSE) up -d --wait postgres airflow-api-server airflow-scheduler airflow-dag-processor
 
 airflow-down:
 	$(AIRFLOW_COMPOSE) stop airflow-api-server airflow-scheduler airflow-dag-processor airflow-db
@@ -217,17 +296,19 @@ airflow-logs:
 	$(AIRFLOW_COMPOSE) logs --tail=200 airflow-scheduler airflow-dag-processor
 
 validate-batch-cloud: cloud-env
-	$(DATABRICKS) $(DATABRICKS_FLAGS) bundle validate --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) $(DATABRICKS_BUNDLE_VARS)
+	$(DATABRICKS) $(DATABRICKS_FLAGS) bundle validate --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) $(DATABRICKS_BUNDLE_VARS) $(DATABRICKS_CDC_BUNDLE_VAR)
 
 deploy-batch-cloud: validate-batch-cloud
-	$(DATABRICKS) $(DATABRICKS_FLAGS) bundle deploy --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) --auto-approve $(DATABRICKS_BUNDLE_VARS)
+	$(DATABRICKS) $(DATABRICKS_FLAGS) bundle deploy --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) --auto-approve $(DATABRICKS_BUNDLE_VARS) $(DATABRICKS_CDC_BUNDLE_VAR)
 
-run-batch-cloud: deploy-batch-cloud
-	$(DATABRICKS) $(DATABRICKS_FLAGS) bundle run --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) $(DATABRICKS_BUNDLE_VARS) ecommerce_pipeline
+# Data execution and code deployment are deliberately separate. Re-deploying on
+# every scheduled run creates a new dynamic wheel and makes shared compute spend
+# time reconciling historical task libraries.
+run-batch-cloud: cloud-env
+	$(DATABRICKS) $(DATABRICKS_FLAGS) bundle run --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) $(DATABRICKS_BUNDLE_VARS) $(DATABRICKS_CDC_BUNDLE_VAR) ecommerce_pipeline
 
-# Fast data-only rerun. Use only when the current wheel/config was already deployed.
-run-deployed-batch-cloud: cloud-env
-	$(DATABRICKS) $(DATABRICKS_FLAGS) bundle run --profile $(DATABRICKS_PROFILE) --target $(DATABRICKS_TARGET) $(DATABRICKS_BUNDLE_VARS) ecommerce_pipeline
+# Explicit CI/CD or developer command used only when code/config/job definition changed.
+deploy-run-batch-cloud: deploy-batch-cloud run-batch-cloud
 
 validate validate-batch-local: env
 	$(VENV_PYTHON) -m ecommerce_pipeline.jobs.validate_batch --env $(CONFIG)

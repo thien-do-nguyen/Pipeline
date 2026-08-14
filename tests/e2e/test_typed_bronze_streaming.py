@@ -101,7 +101,7 @@ def test_typed_bronze_is_physical_quarantined_and_idempotent(tmp_path: Path) -> 
 
 
 def _raw_event(offset: int, payload: dict[str, object], timestamp: datetime) -> Row:
-    topic = "ecommerce.customer_app.orders"
+    topic = "ecommerce.domain.sales"
     return Row(
         _transport_event_id=f"{topic}:0:{offset}",
         topic=topic,

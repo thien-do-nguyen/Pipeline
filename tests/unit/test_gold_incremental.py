@@ -6,6 +6,7 @@ from pyspark.sql import SparkSession
 
 from ecommerce_pipeline.contracts.gold_tables import GOLD_TABLES
 from ecommerce_pipeline.control.gold_releases import GoldRelease
+from ecommerce_pipeline.control.manifests import SilverBatchManifest, SilverTableResult
 from ecommerce_pipeline.pipelines import build_gold as gold_module
 from ecommerce_pipeline.pipelines.build_gold import GoldBuilder
 
@@ -51,6 +52,21 @@ def test_gold_skips_all_source_reads_when_silver_versions_are_current() -> None:
     builder._read_changes.assert_not_called()
     builder._run_incremental.assert_not_called()
     builder._publish.assert_not_called()
+
+
+def test_gold_uses_propagated_silver_versions_without_scanning_delta_metadata() -> None:
+    builder = _builder()
+    versions = {name: index for index, name in enumerate(gold_module.SILVER_TABLES)}
+    builder.silver_manifest = SilverBatchManifest(
+        tables={
+            name: SilverTableResult(name, committed_version=version, schema_version=2)
+            for name, version in versions.items()
+        }
+    )
+    builder._silver_versions = Mock()
+
+    assert builder._current_silver_versions() == versions
+    builder._silver_versions.assert_not_called()
 
 
 def test_gold_reads_only_changed_silver_version_ranges() -> None:
@@ -171,6 +187,41 @@ def test_gold_filter_can_map_different_id_column_names(spark: SparkSession) -> N
     )
 
     assert [row["category_id"] for row in children.collect()] == [2]
+
+
+def test_replayed_scd2_removes_obsolete_keys_for_affected_entities(spark: SparkSession) -> None:
+    builder = object.__new__(GoldBuilder)
+    builder.lakehouse = Mock()
+    builder.lakehouse.upsert_table.return_value = True
+    builder._filter_gold = Mock(
+        return_value=spark.createDataFrame(
+            [(100, 1), (101, 1)],
+            "shop_key long, source_shop_id int",
+        )
+    )
+    replayed = spark.createDataFrame(
+        [(101, 1)],
+        "shop_key long, source_shop_id int",
+    )
+    affected_ids = spark.createDataFrame([(1,)], "shop_id int")
+
+    assert builder._upsert_replayed_scd2(
+        "dim_shop",
+        replayed,
+        "shop_key",
+        "source_shop_id",
+        affected_ids,
+        "shop_id",
+    )
+
+    builder._filter_gold.assert_called_once_with(
+        "dim_shop",
+        "source_shop_id",
+        affected_ids,
+        "shop_id",
+    )
+    delete_keys = builder.lakehouse.upsert_table.call_args.kwargs["delete_keys"]
+    assert [row["shop_key"] for row in delete_keys.collect()] == [100]
 
 
 def test_incremental_checkpoints_reused_affected_order_ids() -> None:

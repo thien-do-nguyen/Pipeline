@@ -183,7 +183,7 @@ def test_silver_prefers_cdc_when_batch_and_cdc_have_the_same_event_time(spark: S
             datetime(2026, 1, 2),
             datetime(2026, 1, 1),
             "cdc-hash",
-            "ecommerce.customer_app.app_users:0:4",
+            "ecommerce.domain.customer:0:4",
             datetime(2026, 1, 2),
             "stream-4",
             "UPDATE",

@@ -181,6 +181,20 @@ def delta_table_properties(spark: SparkSession, reference: TableReference | str)
     return {str(key): str(value) for key, value in (row["properties"] or {}).items()}
 
 
+def try_delta_table_properties(
+    spark: SparkSession,
+    reference: TableReference | str,
+) -> dict[str, str] | None:
+    """Read table properties with one Delta request, returning None when absent."""
+
+    try:
+        return delta_table_properties(spark, reference)
+    except AnalysisException as exc:
+        if _is_missing_delta_table(exc):
+            return None
+        raise
+
+
 def set_delta_table_property(
     spark: SparkSession,
     reference: TableReference | str,
@@ -234,7 +248,15 @@ class LakehouseAdapter:
 
         return LakehouseAdapter(self.spark, self.config, gold_versions=versions)
 
-    def read_table(self, layer: str, table_name: str) -> DataFrame:
+    def read_table(
+        self,
+        layer: str,
+        table_name: str,
+        *,
+        include_deleted: bool = False,
+    ) -> DataFrame:
+        """Read a table, hiding Silver tombstones unless control-plane logic requests them."""
+
         reference = self.config.lakehouse.table_reference(layer, table_name)
         options: dict[str, bool | float | int | str | None] = {}
         if layer == "gold" and self.gold_versions is not None:
@@ -243,17 +265,28 @@ class LakehouseAdapter:
                 raise ValueError(f"Gold table is not part of the published snapshot: {table_name}")
             options["versionAsOf"] = version
         result = read_delta(self.spark, reference, options=options)
-        if layer == "silver" and isinstance(result.columns, list) and "_is_deleted" in result.columns:
+        if (
+            layer == "silver"
+            and not include_deleted
+            and isinstance(result.columns, list)
+            and "_is_deleted" in result.columns
+        ):
             result = result.where(~F.coalesce(F.col("_is_deleted"), F.lit(False)))
         return result
 
     def table_exists(self, layer: str, table_name: str) -> bool:
-        from delta.tables import DeltaTable
-
         reference = self.config.lakehouse.table_reference(layer, table_name)
-        if reference.is_catalog:
-            return self.spark.catalog.tableExists(reference.value)
-        return DeltaTable.isDeltaTable(self.spark, reference.value)
+        try:
+            if reference.is_catalog:
+                _delta_table(self.spark, reference)
+                return True
+            from delta.tables import DeltaTable
+
+            return DeltaTable.isDeltaTable(self.spark, reference.value)
+        except AnalysisException as exc:
+            if _is_missing_delta_table(exc):
+                return False
+            raise
 
     def write_table(
         self,
@@ -264,6 +297,8 @@ class LakehouseAdapter:
         enable_change_data_feed: bool = False,
     ) -> None:
         reference = self.config.lakehouse.table_reference(layer, table_name)
+        if reference.is_catalog:
+            _drop_dangling_catalog_registration(self.spark, reference)
         writer = df.write.format("delta").mode("overwrite").option("overwriteSchema", "true")
         if enable_change_data_feed:
             writer = writer.option("delta.enableChangeDataFeed", "true")
@@ -407,145 +442,6 @@ class LakehouseAdapter:
         )
         return True
 
-    def merge_scd2(
-        self,
-        df: DataFrame,
-        layer: str,
-        table_name: str,
-        source_key: str,
-        attribute_hash: str,
-        initial_effective_from: str,
-        type1_columns: Sequence[str] = (),
-        *,
-        replace: bool = False,
-    ) -> bool:
-        reference = self.config.lakehouse.table_reference(layer, table_name)
-        if initial_effective_from not in df.columns:
-            raise ValueError(
-                f"Missing initial effective date column for {layer}.{table_name}: {initial_effective_from}"
-            )
-        if replace or not self.table_exists(layer, table_name):
-            initial = df.withColumn(
-                "effective_from",
-                F.when(
-                    F.col(source_key).isNotNull(),
-                    F.coalesce(F.col(initial_effective_from), F.col("effective_from")),
-                ).otherwise(F.col("effective_from")),
-            )
-            self.write_table(initial, layer, table_name)
-            return True
-
-        target = self.read_table(layer, table_name)
-        source_columns = set(df.columns)
-        target_columns = set(target.columns)
-        _validate_schema_match(layer, table_name, source_columns, target_columns)
-
-        staged = _stage_scd2_changes(
-            df,
-            target.filter(F.col("is_current")),
-            source_key=source_key,
-            attribute_hash=attribute_hash,
-            initial_effective_from=initial_effective_from,
-            type1_columns=type1_columns,
-        ).localCheckpoint(eager=True)
-        delta = _delta_table(self.spark, reference)
-        try:
-            if staged.isEmpty():
-                return False
-            merge = (
-                delta.alias("target")
-                .merge(
-                    staged.alias("source"),
-                    f"target.`{source_key}` = source.`_merge_key` AND target.`is_current` = true",
-                )
-                .whenMatchedUpdate(
-                    condition="source.`_action` = 'CLOSE'",
-                    set={
-                        "effective_to": "source.`effective_from`",
-                        "is_current": "false",
-                        "updated_at": "current_timestamp()",
-                    },
-                )
-            )
-            if type1_columns:
-                type1_updates: dict[str, str | Column] = {column: f"source.`{column}`" for column in type1_columns}
-                type1_updates["updated_at"] = "current_timestamp()"
-                merge = merge.whenMatchedUpdate(
-                    condition="source.`_action` = 'TYPE1'",
-                    set=type1_updates,
-                )
-            insert_values: dict[str, str | Column] = {column: f"source.`{column}`" for column in df.columns}
-            merge.whenNotMatchedInsert(
-                condition="source.`_action` = 'INSERT'",
-                values=insert_values,
-            ).execute()
-            return True
-        finally:
-            staged.unpersist()
-
-
-def _stage_scd2_changes(
-    source: DataFrame,
-    current: DataFrame,
-    *,
-    source_key: str,
-    attribute_hash: str,
-    initial_effective_from: str,
-    type1_columns: Sequence[str],
-) -> DataFrame:
-    """Create mutually exclusive SCD2 actions consumed by one Delta MERGE."""
-
-    current_projection = current.select(
-        source_key,
-        F.lit(True).alias("_target_exists"),
-        F.col(attribute_hash).alias("_target_attribute_hash"),
-        *(F.col(column).alias(f"_target_type1_{column}") for column in type1_columns),
-    )
-    classified = source.filter(F.col(source_key).isNotNull()).join(
-        current_projection,
-        source_key,
-        "left",
-    )
-    is_new = F.col("_target_exists").isNull()
-    type2_changed = ~is_new & ~F.col(attribute_hash).eqNullSafe(F.col("_target_attribute_hash"))
-    type1_changed = F.lit(False)
-    for column in type1_columns:
-        type1_changed = type1_changed | ~F.col(column).eqNullSafe(F.col(f"_target_type1_{column}"))
-    type1_changed = ~is_new & ~type2_changed & type1_changed
-    classified = (
-        classified.withColumn("_is_new", is_new)
-        .withColumn("_is_type2", type2_changed)
-        .withColumn("_is_type1", type1_changed)
-        .withColumn(
-            "_actions",
-            F.when(F.col("_is_new"), F.array(F.lit("INSERT")))
-            .when(F.col("_is_type2"), F.array(F.lit("CLOSE"), F.lit("INSERT")))
-            .when(F.col("_is_type1"), F.array(F.lit("TYPE1")))
-            .otherwise(F.array().cast("array<string>")),
-        )
-        .withColumn("_action", F.explode("_actions"))
-    )
-
-    payload = list(source.columns)
-    merge_key_type = source.schema[source_key].dataType
-    return classified.withColumn(
-        "effective_from",
-        F.when(
-            F.col("_is_new") & (F.col("_action") == "INSERT"),
-            F.coalesce(F.col(initial_effective_from), F.col("effective_from")),
-        ).otherwise(F.col("effective_from")),
-    ).select(
-        *payload,
-        F.when(
-            F.col("_action") == "INSERT",
-            F.lit(None).cast(merge_key_type),
-        )
-        .otherwise(F.col(source_key))
-        .alias("_merge_key"),
-        "_action",
-    )
-
-
 def _validate_schema_match(
     layer: str,
     table_name: str,
@@ -573,6 +469,17 @@ def _delta_table(spark: SparkSession, reference: TableReference | str) -> DeltaT
     if resolved.is_catalog:
         return DeltaTable.forName(spark, resolved.value)
     return DeltaTable.forPath(spark, resolved.value)
+
+
+def _drop_dangling_catalog_registration(spark: SparkSession, reference: TableReference) -> None:
+    """Remove only a catalog entry whose external Delta storage no longer exists."""
+
+    try:
+        _delta_table(spark, reference)
+    except AnalysisException as exc:
+        if not _is_missing_delta_table(exc):
+            raise
+        spark.sql(f"DROP TABLE IF EXISTS {_sql_identifier(reference)}")
 
 
 def _sql_identifier(reference: TableReference | str) -> str:
@@ -631,6 +538,8 @@ def _is_missing_delta_table(exc: AnalysisException) -> bool:
     if condition is None and callable(get_error_class):
         condition = get_error_class()
     if condition in {
+        "DELTA_PATH_DOES_NOT_EXIST",
+        "DELTA_TABLE_NOT_FOUND",
         "TABLE_OR_VIEW_NOT_FOUND",
         "DELTA_MISSING_DELTA_TABLE",
         "PATH_NOT_FOUND",

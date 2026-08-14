@@ -56,8 +56,7 @@ streaming:
     gold_deferred_retry_interval_seconds: 2
 
 coordination:
-  # Keep the deployed batch job as owner until the cloud streaming job is enabled.
-  gold_owner: batch
-  cloud_lock_name: unified_silver_writer
+  # Batch and streaming may trigger Gold; this shared lock serializes Silver/Gold publication.
+  cloud_lock_name: unified_lakehouse_writer
   cloud_lock_ttl_seconds: 21600
   lock_wait_seconds: 600

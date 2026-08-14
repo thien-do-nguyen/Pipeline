@@ -20,11 +20,29 @@ docs/
 build/
 dist/
 *.egg-info/
+
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+*.tfplan
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+!.terraform.lock.hcl
 .databricks/
 
 data/lakehouse/**
 !data/lakehouse/.gitkeep
 data/checkpoints/
+data/runtime/
 logs/
 schema/dwhSchema.sql
 

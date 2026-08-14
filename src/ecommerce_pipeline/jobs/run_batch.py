@@ -19,12 +19,19 @@ from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
 from ecommerce_pipeline.control.batch_runs import local_pipeline_lock, log_batch_run_status, new_batch_id
 from ecommerce_pipeline.control.cloud_lock import cloud_pipeline_lock
 from ecommerce_pipeline.control.gold_releases import GoldReleaseStore
-from ecommerce_pipeline.control.manifests import BronzeBatchManifest, BronzeTableResult, SilverBatchManifest
+from ecommerce_pipeline.control.manifests import (
+    BronzeBatchManifest,
+    BronzeTableResult,
+    PipelineManifest,
+    SilverBatchManifest,
+    deserialize_manifest,
+    serialize_manifest,
+)
 from ecommerce_pipeline.ingestion.batch.extract_to_bronze import extract_all_to_bronze
 from ecommerce_pipeline.pipelines.build_gold import build_gold
 from ecommerce_pipeline.pipelines.build_silver import SILVER_DATA_PIPELINES, build_silver
 from ecommerce_pipeline.runtime.spark import build_spark
-from ecommerce_pipeline.validation.batch import validate_batch_lakehouse
+from ecommerce_pipeline.validation.batch import validate_batch_lakehouse, validate_gold_release
 from ecommerce_pipeline.validation.preflight import check_postgres_source
 
 
@@ -47,7 +54,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         default="bronze",
-        choices=["check_postgres", "bronze", "silver", "gold", "validate", "all"],
+        choices=[
+            "check_postgres",
+            "bronze",
+            "silver",
+            "gold",
+            "validate_release",
+            "validate",
+            "all",
+            "workflow",
+        ],
     )
     parser.add_argument("--batch-id")
     parser.add_argument("--tables", nargs="*", help="Optional source table names to extract.")
@@ -61,6 +77,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gold-schema")
     parser.add_argument("--external-storage-root")
     parser.add_argument("--secret-scope")
+    parser.add_argument(
+        "--emit-manifest",
+        action="store_true",
+        help="Print the output control manifest as the final stdout line for an orchestrator XCom.",
+    )
     parser.add_argument(
         "--full-rebuild-silver",
         action="store_true",
@@ -123,16 +144,20 @@ def run_mode(
     config: AppConfig,
     batch_id: str,
     timings_ms: dict[str, int],
-) -> list[BronzeTableResult]:
-    bronze_results: list[BronzeTableResult] = []
-    bronze_manifest: BronzeBatchManifest | None = None
-    if args.mode == "check_postgres":
+    upstream_manifest: PipelineManifest | None = None,
+) -> PipelineManifest | None:
+    workflow_mode = args.mode == "workflow"
+    bronze_manifest = upstream_manifest if isinstance(upstream_manifest, BronzeBatchManifest) else None
+    silver_manifest = upstream_manifest if isinstance(upstream_manifest, SilverBatchManifest) else None
+    bronze_results = [] if bronze_manifest is None else bronze_manifest.results
+    if args.mode == "check_postgres" or workflow_mode:
         started = perf_counter()
         preflight_report = check_postgres_source(config)
         timings_ms["preflight.postgres"] = round((perf_counter() - started) * 1000)
         print(f"[preflight] check=postgres status=passed report={json.dumps(preflight_report, separators=(',', ':'))}")
-        return bronze_results
-    if args.mode in {"bronze", "all"}:
+        if args.mode == "check_postgres":
+            return None
+    if args.mode in {"bronze", "all", "workflow"}:
         started = perf_counter()
         bronze_manifest = extract_all_to_bronze(
             spark,
@@ -153,21 +178,20 @@ def run_mode(
             batch_id,
             "RUNNING",
             config.application.timezone,
-            total_records=sum(result.record_count for result in bronze_results),
+            total_records=_record_count(bronze_results),
             timings_ms=timings_ms,
         )
         if (
-            args.mode == "all"
+            args.mode in {"all", "workflow"}
             and not args.full_rebuild_silver
             and not args.full_rebuild_gold
             and _is_no_change_batch(bronze_results)
             and _downstream_is_current(spark, config)
         ):
             print("[pipeline] no changes; skipped=silver,gold", flush=True)
-            return bronze_results
+            return bronze_manifest
 
-    silver_manifest: SilverBatchManifest | None = None
-    if args.mode in {"silver", "all"}:
+    if args.mode in {"silver", "all", "workflow"}:
         started = perf_counter()
         silver_tables = args.tables if args.mode == "silver" else None
         writer_lock = (
@@ -185,7 +209,7 @@ def run_mode(
                 silver_tables,
                 batch_id=batch_id,
                 full_rebuild=args.full_rebuild_silver,
-                bronze_manifest=bronze_manifest if args.mode == "all" else None,
+                bronze_manifest=bronze_manifest,
                 timings_ms=timings_ms,
             )
             timings_ms["silver.compute"] = round((perf_counter() - silver_compute_started) * 1000)
@@ -200,25 +224,28 @@ def run_mode(
             batch_id,
             "RUNNING",
             config.application.timezone,
-            total_records=sum(result.record_count for result in bronze_results),
+            total_records=_record_count(bronze_results),
             timings_ms=timings_ms,
         )
 
-    gold_owner = getattr(getattr(config, "coordination", None), "gold_owner", "batch")
-    if args.mode == "gold" and gold_owner != "batch":
-        raise RuntimeError(
-            "Gold ownership is assigned to streaming; batch --mode gold is disabled to prevent dual writers"
-        )
-    if args.mode in {"gold", "all"} and gold_owner == "batch":
+    if args.mode in {"gold", "all", "workflow"}:
         started = perf_counter()
-        gold_outputs = build_gold(
-            spark,
-            config,
-            batch_id=batch_id,
-            full_rebuild=args.full_rebuild_gold,
-            timings_ms=timings_ms,
-            silver_manifest=silver_manifest,
+        gold_writer_lock = (
+            cloud_pipeline_lock(spark, config, f"gold-batch-{batch_id}")
+            if getattr(getattr(config, "spark", None), "master", "local") is None
+            else nullcontext()
         )
+        lock_started = perf_counter()
+        with gold_writer_lock:
+            timings_ms["coordination.gold_lock_acquire"] = round((perf_counter() - lock_started) * 1000)
+            gold_outputs = build_gold(
+                spark,
+                config,
+                batch_id=batch_id,
+                full_rebuild=args.full_rebuild_gold,
+                timings_ms=timings_ms,
+                silver_manifest=silver_manifest,
+            )
         timings_ms["gold"] = round((perf_counter() - started) * 1000)
         print(
             f"[gold] tables={len(gold_outputs)} elapsed={_seconds(timings_ms['gold'])}",
@@ -228,12 +255,9 @@ def run_mode(
             batch_id,
             "RUNNING",
             config.application.timezone,
-            total_records=sum(result.record_count for result in bronze_results),
+            total_records=_record_count(bronze_results),
             timings_ms=timings_ms,
         )
-    elif args.mode == "all":
-        print("[gold] skipped owner=streaming; batch pipeline stops at Unified Silver", flush=True)
-
     if args.mode == "validate":
         started = perf_counter()
         validation_report = validate_batch_lakehouse(spark, config)
@@ -243,7 +267,22 @@ def run_mode(
             f"report={json.dumps(validation_report.as_dict(), separators=(',', ':'))}",
             flush=True,
         )
-    return bronze_results
+    if args.mode in {"validate_release", "workflow"}:
+        if silver_manifest is None:
+            raise ValueError("validate_release requires a propagated Silver manifest")
+        started = perf_counter()
+        release_report = validate_gold_release(spark, config, silver_manifest)
+        timings_ms["validation.release"] = round((perf_counter() - started) * 1000)
+        print(
+            f"[validation] type=release status=passed elapsed={_seconds(timings_ms['validation.release'])} "
+            f"report={json.dumps(release_report, separators=(',', ':'))}",
+            flush=True,
+        )
+    if args.mode in {"bronze", "all", "workflow"}:
+        return bronze_manifest
+    if args.mode == "silver":
+        return silver_manifest
+    return None
 
 
 def _is_no_change_batch(results: list[BronzeTableResult]) -> bool:
@@ -280,6 +319,33 @@ def _seconds(milliseconds: int) -> str:
     return f"{milliseconds / 1000:.2f}s"
 
 
+def _record_count(results: list[BronzeTableResult]) -> int | None:
+    """Return a source event count only when this process executed Bronze."""
+
+    return sum(result.record_count for result in results) if results else None
+
+
+def _manifest_record_count(manifest: PipelineManifest | None) -> int | None:
+    return _record_count(manifest.results) if isinstance(manifest, BronzeBatchManifest) else None
+
+
+def _upstream_manifest(mode: str) -> PipelineManifest | None:
+    raw = os.getenv("ECOMMERCE_UPSTREAM_MANIFEST", "").strip()
+    if not raw:
+        return None
+    manifest = deserialize_manifest(raw)
+    expected_type = (
+        BronzeBatchManifest
+        if mode == "silver"
+        else SilverBatchManifest
+        if mode in {"gold", "validate_release"}
+        else None
+    )
+    if expected_type is None or not isinstance(manifest, expected_type):
+        raise ValueError(f"Unexpected upstream manifest for mode={mode}: {type(manifest).__name__}")
+    return manifest
+
+
 def main() -> None:
     args = parse_args()
     _prepare_databricks_environment(args)
@@ -287,25 +353,28 @@ def main() -> None:
         raise SystemExit("--tables requires at least one table name")
     if args.tables and args.mode not in {"bronze", "silver"}:
         raise SystemExit("--tables is supported only for bronze or silver mode")
-    if args.full_rebuild_silver and args.mode not in {"silver", "all"}:
-        raise SystemExit("--full-rebuild-silver requires --mode silver or --mode all")
-    if args.full_rebuild_gold and args.mode not in {"gold", "all"}:
-        raise SystemExit("--full-rebuild-gold requires --mode gold or --mode all")
+    if args.full_rebuild_silver and args.mode not in {"silver", "all", "workflow"}:
+        raise SystemExit("--full-rebuild-silver requires --mode silver, all, or workflow")
+    if args.full_rebuild_gold and args.mode not in {"gold", "all", "workflow"}:
+        raise SystemExit("--full-rebuild-gold requires --mode gold, all, or workflow")
+    if args.emit_manifest and args.mode not in {"bronze", "silver"}:
+        raise SystemExit("--emit-manifest is supported only for bronze or silver mode")
     config = load_config(
         args.env,
         **({"base_path": args.base_config} if args.base_config else {}),
     )
     print(
-        f"[config] env={config.environment} lakehouse={config.lakehouse.catalog or config.lakehouse.base_path} "
-        f"logs={config.application.logs_path}",
+        f"[config] env={config.environment} lakehouse={config.lakehouse.catalog or config.lakehouse.base_path}",
         flush=True,
     )
     batch_id = args.batch_id or new_batch_id(config.application.timezone)
     spark: SparkSession | None = None
     run_started = perf_counter()
     timings_ms: dict[str, int] = {}
+    upstream_manifest = _upstream_manifest(args.mode)
+    output_manifest: PipelineManifest | None = None
     pipeline_lock = (
-        local_pipeline_lock(config.application.logs_path, batch_id) if config.spark.master else nullcontext()
+        local_pipeline_lock(config.coordination.local_lock_path, batch_id) if config.spark.master else nullcontext()
     )
     with pipeline_lock:
         try:
@@ -330,13 +399,20 @@ def main() -> None:
                 config.application.timezone,
                 timings_ms=timings_ms,
             )
-            results = run_mode(spark, args, config, batch_id, timings_ms)
+            output_manifest = run_mode(
+                spark,
+                args,
+                config,
+                batch_id,
+                timings_ms,
+                upstream_manifest=upstream_manifest,
+            )
             timings_ms["total"] = round((perf_counter() - run_started) * 1000)
             log_batch_run_status(
                 batch_id,
                 "SUCCEEDED",
                 config.application.timezone,
-                total_records=sum(result.record_count for result in results),
+                total_records=_manifest_record_count(output_manifest),
                 timings_ms=timings_ms,
             )
         except Exception as exc:
@@ -352,6 +428,10 @@ def main() -> None:
         finally:
             if spark is not None and config.spark.stop_session:
                 spark.stop()
+    if args.emit_manifest:
+        if output_manifest is None:
+            raise RuntimeError(f"No output manifest was produced for mode={args.mode}")
+        print(serialize_manifest(output_manifest), flush=True)
 
 
 if __name__ == "__main__":
