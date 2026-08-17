@@ -14,7 +14,8 @@ CLOUD_ENV ?= .env.cloud
 	airflow-build airflow-up airflow-down airflow-status airflow-check airflow-trigger airflow-trigger-cloud airflow-logs \
 	cdc-cloud-pg-bootstrap cdc-cloud-init cdc-cloud-plan cdc-cloud-apply cdc-cloud-destroy \
 	deploy-cdc-cloud run-cdc-cloud cdc-cloud-start cdc-cloud-stop cdc-cloud-status cdc-cloud-logs \
-	validate-batch-local lint format format-check type-check test test-integration test-e2e check \
+	validate-batch-local lint format format-check type-check test test-integration test-e2e \
+	test-e2e-batch test-e2e-streaming test-e2e-concurrency check \
 	smoke demo-batch-local build
 
 VENV_PYTHON := .venv/bin/python
@@ -334,6 +335,19 @@ test-integration: env
 
 test-e2e: env
 	RUN_E2E=1 $(VENV_BIN)/pytest tests/e2e -s
+
+test-e2e-batch: env
+	RUN_E2E=1 $(VENV_BIN)/pytest \
+		tests/e2e/test_batch_cdc_pipeline.py::test_postgres_to_gold_is_incremental_idempotent_and_reconciled -s
+
+test-e2e-streaming: env
+	RUN_E2E=1 $(VENV_BIN)/pytest \
+		tests/e2e/test_batch_cdc_pipeline.py::test_cdc_streaming_updates_unified_silver_and_gold_idempotently \
+		tests/e2e/test_typed_bronze_streaming.py -s
+
+test-e2e-concurrency: env
+	RUN_E2E=1 $(VENV_BIN)/pytest \
+		tests/e2e/test_batch_cdc_pipeline.py::test_shared_writer_lock_serializes_batch_and_cdc_and_converges -s
 
 check: format-check lint type-check test
 
