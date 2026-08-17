@@ -8,6 +8,18 @@ on:
 permissions:
   contents: read
 
+env:
+  POSTGRES_HOST: localhost
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ecommerce
+  POSTGRES_USER: admin
+  POSTGRES_PASSWORD: admin
+  PGPASSWORD: admin
+  PGHOST: localhost
+  PGPORT: "5432"
+  CDC_POSTGRES_PASSWORD: cdc-ci-only
+  SPARK_LOCAL_IP: 127.0.0.1
+
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -25,7 +37,7 @@ jobs:
       - run: make setup
       - run: make check
 
-  e2e:
+  e2e-batch:
     needs: quality
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -43,17 +55,6 @@ jobs:
           --health-interval 3s
           --health-timeout 5s
           --health-retries 20
-    env:
-      POSTGRES_HOST: localhost
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ecommerce
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: admin
-      PGPASSWORD: admin
-      PGHOST: localhost
-      PGPORT: "5432"
-      CDC_POSTGRES_PASSWORD: cdc-ci-only
-      SPARK_LOCAL_IP: 127.0.0.1
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -69,7 +70,89 @@ jobs:
           path: ~/.ivy2
           key: ivy-${{ runner.os }}-delta-3.2.0-postgresql-42.7.3
       - run: make setup
-      - run: psql -v ON_ERROR_STOP=1 -h localhost -U admin -d ecommerce -f schema/oltpSchema.sql
-      - run: bash infra/local/postgres/02_cdc.sh
-      - run: make test-integration
-      - run: make test-e2e
+      - name: Initialize shared PostgreSQL CDC contract
+        run: |
+          psql -v ON_ERROR_STOP=1 -f schema/oltpSchema.sql
+          bash infra/local/postgres/02_cdc.sh
+      - name: Run Batch E2E
+        run: make test-e2e-batch
+
+  e2e-streaming:
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_DB: ecommerce
+          POSTGRES_USER: admin
+          POSTGRES_PASSWORD: admin
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U admin -d ecommerce"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/cache@v5
+        with:
+          path: ~/.ivy2
+          key: ivy-${{ runner.os }}-delta-3.2.0-postgresql-42.7.3
+      - run: make setup
+      - name: Initialize shared PostgreSQL CDC contract
+        run: |
+          psql -v ON_ERROR_STOP=1 -f schema/oltpSchema.sql
+          bash infra/local/postgres/02_cdc.sh
+      - name: Run CDC Streaming E2E
+        run: make test-e2e-streaming
+
+  e2e-concurrency:
+    needs: [e2e-batch, e2e-streaming]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_DB: ecommerce
+          POSTGRES_USER: admin
+          POSTGRES_PASSWORD: admin
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U admin -d ecommerce"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/cache@v5
+        with:
+          path: ~/.ivy2
+          key: ivy-${{ runner.os }}-delta-3.2.0-postgresql-42.7.3
+      - run: make setup
+      - name: Initialize shared PostgreSQL CDC contract
+        run: |
+          psql -v ON_ERROR_STOP=1 -f schema/oltpSchema.sql
+          bash infra/local/postgres/02_cdc.sh
+      - name: Verify shared Delta writer lock and convergence
+        run: make test-e2e-concurrency
