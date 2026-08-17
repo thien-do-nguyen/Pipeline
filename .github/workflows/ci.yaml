@@ -17,6 +17,8 @@ env:
   PGPASSWORD: admin
   PGHOST: localhost
   PGPORT: "5432"
+  PGDATABASE: ecommerce
+  PGUSER: admin
   CDC_POSTGRES_PASSWORD: cdc-ci-only
   SPARK_LOCAL_IP: 127.0.0.1
 
@@ -72,7 +74,9 @@ jobs:
       - run: make setup
       - name: Initialize shared PostgreSQL CDC contract
         run: |
-          psql -v ON_ERROR_STOP=1 -f schema/oltpSchema.sql
+          psql --host "$POSTGRES_HOST" --port "$POSTGRES_PORT" \
+            --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+            --set ON_ERROR_STOP=1 --file schema/oltpSchema.sql
           bash infra/local/postgres/02_cdc.sh
       - name: Run Batch E2E
         run: make test-e2e-batch
@@ -112,7 +116,9 @@ jobs:
       - run: make setup
       - name: Initialize shared PostgreSQL CDC contract
         run: |
-          psql -v ON_ERROR_STOP=1 -f schema/oltpSchema.sql
+          psql --host "$POSTGRES_HOST" --port "$POSTGRES_PORT" \
+            --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+            --set ON_ERROR_STOP=1 --file schema/oltpSchema.sql
           bash infra/local/postgres/02_cdc.sh
       - name: Run CDC Streaming E2E
         run: make test-e2e-streaming
@@ -152,7 +158,9 @@ jobs:
       - run: make setup
       - name: Initialize shared PostgreSQL CDC contract
         run: |
-          psql -v ON_ERROR_STOP=1 -f schema/oltpSchema.sql
+          psql --host "$POSTGRES_HOST" --port "$POSTGRES_PORT" \
+            --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+            --set ON_ERROR_STOP=1 --file schema/oltpSchema.sql
           bash infra/local/postgres/02_cdc.sh
       - name: Verify shared Delta writer lock and convergence
         run: make test-e2e-concurrency
