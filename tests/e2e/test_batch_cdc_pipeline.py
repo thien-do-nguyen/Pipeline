@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+from argparse import Namespace
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Event
-from time import sleep
+from threading import Barrier, Event, Lock
+from time import monotonic, sleep
 from typing import cast
 from zoneinfo import ZoneInfo
 
@@ -29,12 +33,13 @@ from ecommerce_pipeline.config.models import AppConfig, LakehouseConfig, SparkCo
 from ecommerce_pipeline.control.batch_runs import new_batch_id
 from ecommerce_pipeline.control.cloud_lock import PipelineLockUnavailable, cloud_pipeline_lock
 from ecommerce_pipeline.control.gold_releases import GoldReleaseStore
-from ecommerce_pipeline.control.manifests import BronzeBatchManifest
 from ecommerce_pipeline.generator.database import connect
 from ecommerce_pipeline.generator.models import SeedPlan
 from ecommerce_pipeline.generator.scenarios import seed_continuous, seed_once
 from ecommerce_pipeline.ingestion.batch.extract_to_bronze import extract_all_to_bronze
+from ecommerce_pipeline.ingestion.streaming import unified_silver as unified_silver_module
 from ecommerce_pipeline.ingestion.streaming.unified_silver import UnifiedSilverMaterializer
+from ecommerce_pipeline.jobs import run_batch as run_batch_job
 from ecommerce_pipeline.pipelines.build_gold import build_gold
 from ecommerce_pipeline.pipelines.build_silver import build_silver
 from ecommerce_pipeline.runtime.spark import build_spark
@@ -253,8 +258,11 @@ def test_cdc_streaming_updates_unified_silver_and_gold_idempotently(tmp_path: Pa
 
 
 @pytest.mark.e2e
-def test_shared_writer_lock_serializes_batch_and_cdc_and_converges(tmp_path: Path) -> None:
-    """Exercise the real Delta lock, then race Batch and CDC shared-layer writers."""
+def test_shared_writer_lock_serializes_batch_and_cdc_and_converges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Race the production Batch and Streaming stage-level lock boundaries."""
 
     if os.getenv("RUN_E2E") != "1":
         pytest.skip("Set RUN_E2E=1 with PostgreSQL running")
@@ -291,8 +299,6 @@ def test_shared_writer_lock_serializes_batch_and_cdc_and_converges(tmp_path: Pat
                 "coordination": test_config.coordination.model_copy(update={"lock_wait_seconds": 60}),
             }
         )
-        _assert_shared_delta_lock_protocol(spark, shared_writer_config)
-
         bootstrap_id = new_batch_id(test_config.application.timezone)
         bootstrap_bronze = extract_all_to_bronze(spark, test_config, bootstrap_id)
         bootstrap_silver = build_silver(
@@ -316,51 +322,53 @@ def test_shared_writer_lock_serializes_batch_and_cdc_and_converges(tmp_path: Pat
             _RAW_CDC_SCHEMA,
         )
 
-        batch_bronze_committed = Event()
-        start_shared_writers = Event()
-        state: dict[str, BronzeBatchManifest] = {}
+        lock_observer = _ProductionLockObserver(cloud_pipeline_lock)
+        monkeypatch.setattr(run_batch_job, "cloud_pipeline_lock", lock_observer.lock)
+        monkeypatch.setattr(unified_silver_module, "cloud_pipeline_lock", lock_observer.lock)
+        start_writers = Barrier(2)
+        batch_args = Namespace(
+            mode="all",
+            tables=None,
+            full_rebuild_silver=False,
+            full_rebuild_gold=False,
+        )
 
-        def run_staged_batch() -> None:
-            batch_id = new_batch_id(test_config.application.timezone)
-            try:
-                manifest = extract_all_to_bronze(spark, test_config, batch_id)
-                state["batch_manifest"] = manifest
-            finally:
-                batch_bronze_committed.set()
-            if not start_shared_writers.wait(timeout=300):
-                raise TimeoutError("CDC writer did not reach the shared-layer boundary")
-            manifest = state["batch_manifest"]
-            with cloud_pipeline_lock(spark, shared_writer_config, f"batch-e2e-{batch_id}"):
-                silver_manifest = build_silver(
-                    spark,
-                    test_config,
-                    batch_id=batch_id,
-                    bronze_manifest=manifest,
-                )
-                build_gold(
-                    spark,
-                    test_config,
-                    batch_id=batch_id,
-                    silver_manifest=silver_manifest,
-                )
+        def run_batch() -> None:
+            start_writers.wait(timeout=60)
+            run_batch_job.run_mode(
+                spark,
+                batch_args,
+                shared_writer_config,
+                "batch-concurrency",
+                {},
+            )
 
         def run_cdc() -> None:
-            if not batch_bronze_committed.wait(timeout=300):
-                raise TimeoutError("Batch Bronze did not reach its orchestration boundary")
-            manifest = state.get("batch_manifest")
-            if manifest is None:
-                raise RuntimeError("Batch Bronze failed before publishing its manifest")
-            app_users = next(result for result in manifest.results if result.table_name == "app_users")
-            assert app_users.record_count == 1
-            start_shared_writers.set()
+            start_writers.wait(timeout=60)
             UnifiedSilverMaterializer(spark, shared_writer_config).process_batch(raw_cdc, batch_id=9001)
 
         with ThreadPoolExecutor(max_workers=2) as executor:
-            batch_future = executor.submit(run_staged_batch)
+            batch_future = executor.submit(run_batch)
             cdc_future = executor.submit(run_cdc)
+            assert lock_observer.batch_silver_acquired.wait(timeout=300)
+            assert lock_observer.streaming_silver_attempted.wait(timeout=300)
+            sleep(1)
+
+            timeout_config = shared_writer_config.model_copy(
+                update={"coordination": shared_writer_config.coordination.model_copy(update={"lock_wait_seconds": 0})}
+            )
+            with (
+                pytest.raises(PipelineLockUnavailable, match="Timed out waiting for cloud pipeline lock"),
+                cloud_pipeline_lock(spark, timeout_config, "timeout-writer"),
+            ):
+                pass
+
+            assert not lock_observer.has_acquired("stream-batch-9001")
+            lock_observer.allow_batch_silver_body.set()
             batch_future.result(timeout=900)
             cdc_future.result(timeout=900)
 
+        lock_observer.assert_expected_execution()
         lakehouse = LakehouseAdapter(spark, test_config)
         silver_customers = (
             lakehouse.read_table("silver", "app_users")
@@ -400,61 +408,136 @@ def test_shared_writer_lock_serializes_batch_and_cdc_and_converges(tmp_path: Pat
             .count()
             == 0
         )
+        assert (
+            GoldReleaseStore(spark, test_config)
+            .snapshot()
+            .read_table("gold", "dim_customer")
+            .filter(F.col("is_current"))
+            .groupBy("source_customer_id")
+            .count()
+            .filter(F.col("count") > 1)
+            .count()
+            == 0
+        )
+        assert GoldReleaseStore(spark, test_config).latest() is not None
         validate_batch_lakehouse(spark, test_config)
     finally:
         spark.stop()
 
 
-def _assert_shared_delta_lock_protocol(spark: SparkSession, config: AppConfig) -> None:
-    """Prove acquire/wait/release/acquire and timeout with the real Delta lock."""
+@dataclass(frozen=True)
+class _ObservedLockEvent:
+    owner: str
+    action: str
+    timestamp: float
 
-    holder_acquired = Event()
-    release_holder = Event()
-    waiter_attempted = Event()
-    order: list[str] = []
 
-    def holder() -> None:
-        with cloud_pipeline_lock(spark, config, "batch-writer"):
-            order.append("batch.acquire")
-            holder_acquired.set()
-            if not release_holder.wait(timeout=60):
-                raise TimeoutError("Test did not release the batch writer")
-            order.append("batch.release")
+_LockFactory = Callable[[SparkSession, AppConfig, str], AbstractContextManager[None]]
 
-    def waiter() -> None:
-        waiter_attempted.set()
-        with cloud_pipeline_lock(spark, config, "streaming-writer"):
-            order.append("streaming.acquire")
-        order.append("streaming.release")
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        holder_future = executor.submit(holder)
-        assert holder_acquired.wait(timeout=60)
+class _ProductionLockObserver:
+    """Coordinate stage contention while delegating every lock operation to Delta."""
 
-        timeout_config = config.model_copy(
-            update={"coordination": config.coordination.model_copy(update={"lock_wait_seconds": 0})}
-        )
-        with (
-            pytest.raises(PipelineLockUnavailable, match="Timed out waiting for cloud pipeline lock"),
-            cloud_pipeline_lock(spark, timeout_config, "timeout-writer"),
-        ):
-            pass
+    _BATCH_SILVER = "batch-batch-concurrency"
+    _BATCH_GOLD = "gold-batch-batch-concurrency"
+    _STREAMING_SILVER = "stream-batch-9001"
+    _STREAMING_GOLD = "gold-cdc-stream-9001"
 
-        waiter_future = executor.submit(waiter)
-        assert waiter_attempted.wait(timeout=10)
-        sleep(1)
-        assert not waiter_future.done(), "Streaming writer bypassed the active batch lock"
+    def __init__(self, real_lock: _LockFactory) -> None:
+        self._real_lock = real_lock
+        self._events: list[_ObservedLockEvent] = []
+        self._active_owner: str | None = None
+        self._mutex = Lock()
+        self.batch_silver_acquired = Event()
+        self.streaming_silver_attempted = Event()
+        self.allow_batch_silver_body = Event()
+        self.streaming_silver_acquired = Event()
+        self.streaming_gold_acquired = Event()
+        self.batch_gold_attempted = Event()
 
-        release_holder.set()
-        holder_future.result(timeout=60)
-        waiter_future.result(timeout=60)
+    @contextmanager
+    def lock(self, spark: SparkSession, config: AppConfig, owner: str) -> Iterator[None]:
+        if owner == self._STREAMING_SILVER:
+            if not self.batch_silver_acquired.wait(timeout=300):
+                raise TimeoutError("Batch did not acquire its Silver lock")
+            self.streaming_silver_attempted.set()
+        elif owner == self._BATCH_GOLD:
+            self._record(owner, "stage_ready")
+            if not self.streaming_gold_acquired.wait(timeout=300):
+                raise TimeoutError("Streaming did not acquire its Gold lock")
 
-    assert order == [
-        "batch.acquire",
-        "batch.release",
-        "streaming.acquire",
-        "streaming.release",
-    ]
+        self._record(owner, "attempt")
+        if owner == self._BATCH_GOLD:
+            self.batch_gold_attempted.set()
+
+        acquired = False
+        try:
+            with self._real_lock(spark, config, owner):
+                self._mark_acquired(owner)
+                acquired = True
+                if owner == self._BATCH_SILVER:
+                    self.batch_silver_acquired.set()
+                    if not self.allow_batch_silver_body.wait(timeout=300):
+                        raise TimeoutError("Test did not release the Batch Silver stage")
+                elif owner == self._STREAMING_SILVER:
+                    self.streaming_silver_acquired.set()
+                elif owner == self._STREAMING_GOLD:
+                    self.streaming_gold_acquired.set()
+                    if not self.batch_gold_attempted.wait(timeout=300):
+                        raise TimeoutError("Batch did not contend for the Gold lock")
+                    sleep(1)
+                yield
+        finally:
+            if acquired:
+                self._mark_released(owner)
+
+    def has_acquired(self, owner: str) -> bool:
+        with self._mutex:
+            return any(event.owner == owner and event.action == "acquire" for event in self._events)
+
+    def assert_expected_execution(self) -> None:
+        batch_silver_attempt = self._timestamp(self._BATCH_SILVER, "attempt")
+        batch_silver_acquire = self._timestamp(self._BATCH_SILVER, "acquire")
+        batch_silver_release = self._timestamp(self._BATCH_SILVER, "release")
+        streaming_silver_attempt = self._timestamp(self._STREAMING_SILVER, "attempt")
+        streaming_silver_acquire = self._timestamp(self._STREAMING_SILVER, "acquire")
+        streaming_silver_release = self._timestamp(self._STREAMING_SILVER, "release")
+        batch_gold_ready = self._timestamp(self._BATCH_GOLD, "stage_ready")
+        batch_gold_attempt = self._timestamp(self._BATCH_GOLD, "attempt")
+        batch_gold_acquire = self._timestamp(self._BATCH_GOLD, "acquire")
+        batch_gold_release = self._timestamp(self._BATCH_GOLD, "release")
+        streaming_gold_acquire = self._timestamp(self._STREAMING_GOLD, "acquire")
+        streaming_gold_release = self._timestamp(self._STREAMING_GOLD, "release")
+
+        assert batch_silver_attempt <= batch_silver_acquire
+        assert streaming_silver_attempt < batch_silver_release < streaming_silver_acquire
+        assert streaming_silver_acquire - streaming_silver_attempt >= 1
+        assert batch_silver_release < batch_gold_ready < streaming_silver_release
+        assert streaming_silver_acquire < streaming_gold_acquire < batch_gold_attempt
+        assert batch_gold_attempt < streaming_gold_release < batch_gold_acquire
+        assert batch_gold_acquire - batch_gold_attempt >= 1
+        assert batch_gold_acquire < batch_gold_release
+
+    def _mark_acquired(self, owner: str) -> None:
+        with self._mutex:
+            assert self._active_owner is None, f"Lock overlap detected: active={self._active_owner}, acquiring={owner}"
+            self._active_owner = owner
+            self._events.append(_ObservedLockEvent(owner, "acquire", monotonic()))
+
+    def _mark_released(self, owner: str) -> None:
+        with self._mutex:
+            assert self._active_owner == owner
+            self._events.append(_ObservedLockEvent(owner, "release", monotonic()))
+            self._active_owner = None
+
+    def _record(self, owner: str, action: str) -> None:
+        with self._mutex:
+            self._events.append(_ObservedLockEvent(owner, action, monotonic()))
+
+    def _timestamp(self, owner: str, action: str) -> float:
+        matching = [event.timestamp for event in self._events if event.owner == owner and event.action == action]
+        assert len(matching) == 1, f"Expected one {owner}.{action}, got {matching}"
+        return matching[0]
 
 
 def _update_source_customer_for_batch(config: AppConfig) -> tuple[int, datetime, dict[str, object]]:
