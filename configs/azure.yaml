@@ -7,8 +7,11 @@ spark:
   configure_delta_package: false
   stop_session: false
   config:
-    spark.sql.shuffle.partitions: "auto"
+    spark.sql.shuffle.partitions: "4"
+    spark.default.parallelism: "4"
     spark.databricks.delta.snapshotPartitions: "2"
+    spark.databricks.delta.optimizeWrite.enabled: "true"
+    spark.databricks.delta.autoCompact.enabled: "true"
 
 streaming:
   enabled: true
