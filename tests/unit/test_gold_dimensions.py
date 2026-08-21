@@ -1,128 +1,131 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from decimal import Decimal
 
 from pyspark.sql import SparkSession
 
 from ecommerce_pipeline.transformations.gold.dimensions import (
-    build_dim_category,
-    build_dim_product,
-    build_dim_shop,
+    build_dim_date,
+    build_dim_location,
+    build_dim_payment,
+    build_dim_promotion,
+    build_dim_shipping,
+    build_dim_time,
 )
 
 
-def test_shop_and_category_dimensions_expose_scd2_contract(spark: SparkSession) -> None:
-    shops = spark.createDataFrame(
-        [(1, "shop-public", "Shop A", "shop-a", "active", datetime(2025, 1, 1), datetime(2026, 1, 1))],
-        """shop_id int, public_shop_id string, shop_name string, shop_slug string, status string,
-           created_at timestamp, updated_at timestamp""",
-    )
-    categories = spark.createDataFrame(
-        [
-            (1, None, "Parent", "parent", True, datetime(2025, 1, 1), datetime(2026, 2, 1)),
-            (2, 1, "Child", "child", True, datetime(2025, 2, 1), datetime(2026, 1, 1)),
-        ],
-        """category_id int, parent_category_id int, category_name string, slug string, is_active boolean,
-           created_at timestamp, updated_at timestamp""",
+def test_build_dim_date_and_time_creates_deterministic_keys(spark: SparkSession) -> None:
+    orders = spark.createDataFrame(
+        [(1, datetime(2026, 3, 15, 14, 30, 45))],
+        "order_id int, created_at timestamp",
     )
 
-    shop = build_dim_shop(shops, spark).filter("source_shop_id = 1").first()
-    category = build_dim_category(categories, spark).filter("source_category_id = 2").first()
+    dim_date = build_dim_date(orders, spark)
+    date_row = dim_date.filter("date_key <> 0").first()
+    assert date_row is not None
+    assert date_row["date_key"] > 0
+    assert date_row["year_number"] == 2026
+    assert date_row["month_number"] == 3
+    assert date_row["day_name"] is not None
 
-    assert shop["shop_key"] > 0
-    assert shop["attribute_hash"]
-    assert shop["effective_from"] == datetime(2026, 1, 1)
-    assert shop["is_current"]
-    assert category["category_key"] > 0
-    assert category["parent_category_name"] == "Parent"
-    assert category["effective_from"] == datetime(2026, 2, 1)
-    assert category["is_current"]
+    dim_time = build_dim_time(orders, spark)
+    time_row = dim_time.filter("time_key <> 0").first()
+    assert time_row is not None
+    assert time_row["time_key"] > 0
+    assert time_row["full_time"] is not None
+    assert time_row["hour_24"] is not None
+    assert time_row["minute_number"] is not None
+    assert time_row["second_number"] is not None
 
 
-def test_product_high_frequency_type1_values_do_not_change_attribute_hash(spark: SparkSession) -> None:
-    products = spark.createDataFrame(
+def test_build_dim_location_extracts_and_hashes_addresses(spark: SparkSession) -> None:
+    addresses = spark.createDataFrame(
         [
             (
-                10,
                 1,
-                2,
-                "product-public",
-                "SKU-10",
-                "product-10",
-                "Product",
-                "Brand",
-                "{}",
-                "[]",
-                "active",
+                10,
+                "shipping",
+                "Alice",
+                "0900000001",
+                "123 Nguyen Hue",
+                "Ben Nghe",
+                "District 1",
+                "Ho Chi Minh City",
+                "HCM",
+                "70000",
+                "VN",
                 True,
-                datetime(2025, 1, 1),
+                datetime(2026, 1, 1),
                 datetime(2026, 1, 1),
             )
         ],
-        """product_id int, shop_id int, category_id int, public_product_id string, product_sku string,
-           product_slug string, product_name string, brand string, attributes_json string, images_json string,
-           status string, is_featured boolean, created_at timestamp, updated_at timestamp""",
+        """address_id int, user_id int, address_type string, recipient_name string,
+           phone_number string, street string, ward string, district string, city string,
+           state string, postal_code string, country string, is_default boolean,
+           created_at timestamp, updated_at timestamp""",
     )
-    variant_schema = """
-        product_variant_id int, public_variant_id string, product_id int, variant_sku string,
-        variant_name string, options_json string, unit_price decimal(12,2), compare_at_price decimal(12,2),
-        currency string, stock_quantity int, reserved_quantity int, weight_kg decimal(8,3),
-        images_json string, status string, is_default boolean, created_at timestamp, updated_at timestamp
-    """
-    original = spark.createDataFrame(
+    orders = spark.createDataFrame(
+        [],
+        """order_id int, customer_id int, shipping_address_id int, billing_address_id int,
+           shipping_address_snapshot string, billing_address_snapshot string""",
+    )
+
+    dim_location = build_dim_location(addresses, orders, spark)
+    row = dim_location.filter("source_address_id = 1").first()
+    assert row is not None
+    assert row["location_key"] > 0
+    assert row["city"] == "Ho Chi Minh City"
+    assert row["district"] == "District 1"
+
+
+def test_build_dim_promotion_and_payment_and_shipping(spark: SparkSession) -> None:
+    order_vouchers = spark.createDataFrame(
+        [(1, 100)],
+        "order_id int, voucher_id int",
+    )
+    vouchers = spark.createDataFrame(
         [
             (
                 100,
-                "variant-public",
-                10,
-                "VAR-100",
-                "Default",
-                "{}",
+                "SUMMER20",
+                "Summer Promo",
+                "percentage",
+                json.dumps(["cart"]),
+                datetime(2026, 1, 1),
+                datetime(2026, 12, 31),
                 Decimal("100.00"),
-                Decimal("120.00"),
-                "VND",
-                10,
-                1,
-                Decimal("1.000"),
-                "[]",
-                "active",
                 True,
-                datetime(2025, 1, 1),
-                datetime(2026, 1, 1),
             )
         ],
-        variant_schema,
+        """voucher_id int, voucher_code string, voucher_name string, discount_type string,
+           scope_json string, starts_at timestamp, ends_at timestamp, minimum_order_amount decimal(12,2),
+           is_active boolean""",
     )
-    price_and_stock_change = spark.createDataFrame(
-        [
-            (
-                100,
-                "variant-public",
-                10,
-                "VAR-100",
-                "Default",
-                "{}",
-                Decimal("150.00"),
-                Decimal("170.00"),
-                "VND",
-                4,
-                2,
-                Decimal("1.000"),
-                "[]",
-                "active",
-                True,
-                datetime(2025, 1, 1),
-                datetime(2026, 2, 1),
-            )
-        ],
-        variant_schema,
+    payments = spark.createDataFrame(
+        [("credit_card", "paid")],
+        "payment_method string, payment_status string",
+    )
+    shipments = spark.createDataFrame(
+        [("FastExpress", "delivered")],
+        "carrier string, shipment_status string",
     )
 
-    before = build_dim_product(products, original, spark).filter("source_product_variant_id = 100").first()
-    after = build_dim_product(products, price_and_stock_change, spark).filter("source_product_variant_id = 100").first()
+    promotions = build_dim_promotion(order_vouchers, vouchers, spark)
+    promo_row = promotions.filter("promotion_key <> 0").first()
+    assert promo_row is not None
+    assert promo_row["promotion_key"] > 0
+    assert promo_row["promotion_type"] == "voucher"
 
-    assert before["attribute_hash"] == after["attribute_hash"]
-    assert before["current_unit_price"] == Decimal("100.00")
-    assert after["current_unit_price"] == Decimal("150.00")
-    assert before["product_key"] != after["product_key"]
+    dim_payment = build_dim_payment(payments, spark)
+    pay_row = dim_payment.filter("payment_key <> 0").first()
+    assert pay_row is not None
+    assert pay_row["payment_key"] > 0
+    assert pay_row["payment_method"] == "credit_card"
+
+    dim_shipping = build_dim_shipping(shipments, spark)
+    ship_row = dim_shipping.filter("shipping_key <> 0").first()
+    assert ship_row is not None
+    assert ship_row["shipping_key"] > 0
+    assert ship_row["carrier"] == "FastExpress"

@@ -3,6 +3,7 @@ environment: local
 spark:
   # Bound local concurrency so decoded Debezium JSON cannot exhaust driver heap.
   master: "local[4]"
+  max_parallel_tables: 2
   configure_delta_package: "${SPARK_CONFIGURE_DELTA_PACKAGE:-true}"
   stop_session: true
   config:
@@ -44,8 +45,7 @@ streaming:
     # v3 replays Raw Bronze after fixing foreachBatch writer-session transactions.
     checkpoint_version: v3
     max_files_per_trigger: 4
-    reconcile_gold_each_batch: true
-    gold_deferred_retry_seconds: 30
+    gold_reconcile_interval_seconds: 2
 
 coordination:
   # Batch and streaming both trigger the shared, idempotent GoldBuilder under this local writer lock.

@@ -134,10 +134,9 @@ def test_local_streaming_config_is_cloud_protocol_compatible(monkeypatch: pytest
     assert config.streaming.silver_checkpoint_location == "data/checkpoints/ecommerce-cdc-to-silver/v3"
     assert config.streaming.silver.max_files_per_trigger == 4
     assert config.streaming.silver.max_bytes_per_trigger == "32m"
-    assert config.streaming.silver.reconcile_gold_each_batch is True
     assert config.streaming.silver.max_gold_readiness_order_ids == 5000
-    assert config.streaming.silver.gold_deferred_retry_seconds == 30
-    assert config.streaming.silver.gold_deferred_retry_interval_seconds == 2
+    assert config.streaming.silver.gold_reconcile_interval_seconds == 2
+    assert config.spark.max_parallel_tables == 2
     assert config.spark.config["spark.sql.debug.maxToStringFields"] == "2000"
     assert config.spark.config["spark.driver.extraJavaOptions"].endswith("infra/local/spark/log4j2.properties")
     assert config.lakehouse.raw_cdc_bronze_reference("cdc_events").value.endswith("/bronze/cdc_events")
@@ -204,7 +203,7 @@ def test_azure_config_uses_unity_catalog_identifiers(monkeypatch: pytest.MonkeyP
     )
     assert config.streaming.silver_checkpoint_location == (
         "abfss://lakehouse@storage.dfs.core.windows.net/ecommerce/dev/"
-        "_checkpoints/cdc-downstream/ecommerce-cdc-to-silver/v1"
+        "_checkpoints/cdc-downstream/ecommerce-cdc-to-silver/v2"
     )
     assert not any(key.startswith("spark.hadoop.fs.azure.account") for key in config.spark.config)
 

@@ -123,12 +123,15 @@ def test_kafka_source_uses_only_protocol_options() -> None:
 def test_connector_captures_exactly_the_declared_bronze_sources() -> None:
     path = Path(__file__).resolve().parents[2] / "infra/local/connect/postgres-cdc.json"
     config = json.loads(path.read_text(encoding="utf-8"))
-    actual = {table.removeprefix("customer_app.") for table in config["table.include.list"].split(",")}
+    captured = set(config["table.include.list"].split(","))
+    actual = {table.removeprefix("customer_app.") for table in captured if table.startswith("customer_app.")}
 
     assert actual == set(BRONZE_TABLES)
+    assert captured - {f"customer_app.{table}" for table in BRONZE_TABLES} == {"cdc_control.debezium_heartbeat"}
     assert config["column.exclude.list"] == "customer_app.app_users.password_hash"
     transforms = config["transforms"].split(",")
-    assert set(transforms) == {f"route{domain}" for domain in CDC_DOMAIN_TABLES}
+    assert set(transforms) == {f"route{domain}" for domain in CDC_DOMAIN_TABLES} | {"routeheartbeat"}
+    assert config["transforms.routeheartbeat.topic.replacement"] == "ecommerce.heartbeat.v1"
     for domain, tables in CDC_DOMAIN_TABLES.items():
         transform = f"route{domain}"
         topic_regex = re.compile(config[f"transforms.{transform}.topic.regex"])

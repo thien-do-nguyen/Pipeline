@@ -13,13 +13,20 @@ locals {
     for domain in keys(local.domain_tables) : domain => "ecommerce.domain.${domain}"
   }
   event_hubs = merge(local.data_event_hubs, {
-    heartbeat   = "ecommerce.heartbeat.v1"
-    transaction = "ecommerce.transaction.v1"
+    heartbeat = "ecommerce.heartbeat.v1"
+    # Debezium prefixes the transaction metadata topic with topic.prefix.
+    # Keep the Event Hub name aligned with that physical producer destination.
+    transaction = "${azurerm_eventhub_namespace.cdc.name}.transaction.v1"
   })
-  source_tables = sort(flatten(values(local.domain_tables)))
-  table_include_list = join(",", [
-    for table in local.source_tables : "customer_app.${table}"
-  ])
+  # The namespace is the source epoch. A freshly-created Event Hubs namespace
+  # must receive a new baseline snapshot, while an ACI/code restart in the same
+  # namespace must resume the existing JDBC offset.
+  source_topic_prefix = azurerm_eventhub_namespace.cdc.name
+  source_tables       = sort(flatten(values(local.domain_tables)))
+  table_include_list = join(",", concat(
+    [for table in local.source_tables : "customer_app.${table}"],
+    ["cdc_control.debezium_heartbeat"],
+  ))
   kafka_jaas = format(
     "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"$ConnectionString\" password=\"%s\";",
     azurerm_eventhub_namespace_authorization_rule.debezium_send.primary_connection_string,
@@ -92,73 +99,78 @@ resource "azurerm_container_group" "debezium" {
     memory = "1.5"
 
     environment_variables = {
-      JAVA_OPTS_APPEND                                          = "-Xms256m -Xmx768m"
-      DEBEZIUM_SINK_TYPE                                        = "kafka"
-      DEBEZIUM_SINK_KAFKA_PRODUCER_BOOTSTRAP_SERVERS            = "${azurerm_eventhub_namespace.cdc.name}.servicebus.windows.net:9093"
-      DEBEZIUM_SINK_KAFKA_PRODUCER_SECURITY_PROTOCOL            = "SASL_SSL"
-      DEBEZIUM_SINK_KAFKA_PRODUCER_SASL_MECHANISM               = "PLAIN"
-      DEBEZIUM_SINK_KAFKA_PRODUCER_KEY_SERIALIZER               = "org.apache.kafka.common.serialization.StringSerializer"
-      DEBEZIUM_SINK_KAFKA_PRODUCER_VALUE_SERIALIZER             = "org.apache.kafka.common.serialization.StringSerializer"
-      DEBEZIUM_SINK_KAFKA_PRODUCER_ACKS                         = "all"
-      DEBEZIUM_SINK_KAFKA_PRODUCER_ENABLE_IDEMPOTENCE           = "false"
-      DEBEZIUM_SINK_KAFKA_WAIT_MESSAGE_DELIVERY_TIMEOUT_MS      = "60000"
-      DEBEZIUM_FORMAT_KEY_SCHEMAS_ENABLE                        = "false"
-      DEBEZIUM_FORMAT_VALUE_SCHEMAS_ENABLE                      = "false"
-      DEBEZIUM_SOURCE_CONNECTOR_CLASS                           = "io.debezium.connector.postgresql.PostgresConnector"
-      DEBEZIUM_SOURCE_DATABASE_HOSTNAME                         = var.postgres_host
-      DEBEZIUM_SOURCE_DATABASE_PORT                             = tostring(var.postgres_port)
-      DEBEZIUM_SOURCE_DATABASE_USER                             = var.postgres_cdc_user
-      DEBEZIUM_SOURCE_DATABASE_DBNAME                           = var.postgres_database
-      DEBEZIUM_SOURCE_DATABASE_SSLMODE                          = "require"
-      DEBEZIUM_SOURCE_TOPIC_PREFIX                              = "ecommerce"
-      DEBEZIUM_SOURCE_PLUGIN_NAME                               = "pgoutput"
-      DEBEZIUM_SOURCE_SLOT_NAME                                 = "ecommerce_cdc_cloud"
-      DEBEZIUM_SOURCE_SLOT_DROP_ON_STOP                         = "false"
-      DEBEZIUM_SOURCE_PUBLICATION_NAME                          = "ecommerce_cdc_publication"
-      DEBEZIUM_SOURCE_PUBLICATION_AUTOCREATE_MODE               = "disabled"
-      DEBEZIUM_SOURCE_SCHEMA_INCLUDE_LIST                       = "customer_app"
-      DEBEZIUM_SOURCE_TABLE_INCLUDE_LIST                        = local.table_include_list
-      DEBEZIUM_SOURCE_COLUMN_EXCLUDE_LIST                       = "customer_app.app_users.password_hash"
-      DEBEZIUM_SOURCE_SNAPSHOT_MODE                             = "when_needed"
-      DEBEZIUM_SOURCE_PROVIDE_TRANSACTION_METADATA              = "true"
-      DEBEZIUM_SOURCE_HEARTBEAT_INTERVAL_MS                     = "10000"
-      DEBEZIUM_SOURCE_TOPIC_HEARTBEAT_NAME                      = "ecommerce.heartbeat.v1"
-      DEBEZIUM_SOURCE_TOPIC_TRANSACTION                         = "transaction.v1"
-      DEBEZIUM_SOURCE_TOMBSTONES_ON_DELETE                      = "false"
-      DEBEZIUM_SOURCE_DECIMAL_HANDLING_MODE                     = "string"
-      DEBEZIUM_SOURCE_BINARY_HANDLING_MODE                      = "base64"
-      DEBEZIUM_SOURCE_OFFSET_STORAGE                            = "io.debezium.storage.jdbc.offset.JdbcOffsetBackingStore"
-      DEBEZIUM_SOURCE_OFFSET_STORAGE_JDBC_URL                   = "jdbc:postgresql://${var.postgres_host}:${var.postgres_port}/${var.postgres_database}?sslmode=require&currentSchema=cdc_control"
-      DEBEZIUM_SOURCE_OFFSET_STORAGE_JDBC_USER                  = var.postgres_cdc_user
-      DEBEZIUM_SOURCE_OFFSET_STORAGE_JDBC_OFFSET_TABLE_NAME     = "debezium_offset_storage"
-      DEBEZIUM_SOURCE_OFFSET_FLUSH_INTERVAL_MS                  = "1000"
+      JAVA_OPTS_APPEND                                      = "-Xms256m -Xmx768m"
+      DEBEZIUM_SINK_TYPE                                    = "kafka"
+      DEBEZIUM_SINK_KAFKA_PRODUCER_BOOTSTRAP_SERVERS        = "${azurerm_eventhub_namespace.cdc.name}.servicebus.windows.net:9093"
+      DEBEZIUM_SINK_KAFKA_PRODUCER_SECURITY_PROTOCOL        = "SASL_SSL"
+      DEBEZIUM_SINK_KAFKA_PRODUCER_SASL_MECHANISM           = "PLAIN"
+      DEBEZIUM_SINK_KAFKA_PRODUCER_KEY_SERIALIZER           = "org.apache.kafka.common.serialization.StringSerializer"
+      DEBEZIUM_SINK_KAFKA_PRODUCER_VALUE_SERIALIZER         = "org.apache.kafka.common.serialization.StringSerializer"
+      DEBEZIUM_SINK_KAFKA_PRODUCER_ACKS                     = "all"
+      DEBEZIUM_SINK_KAFKA_PRODUCER_ENABLE_IDEMPOTENCE       = "false"
+      DEBEZIUM_SINK_KAFKA_WAIT_MESSAGE_DELIVERY_TIMEOUT_MS  = "60000"
+      DEBEZIUM_FORMAT_KEY_SCHEMAS_ENABLE                    = "false"
+      DEBEZIUM_FORMAT_VALUE_SCHEMAS_ENABLE                  = "false"
+      DEBEZIUM_SOURCE_CONNECTOR_CLASS                       = "io.debezium.connector.postgresql.PostgresConnector"
+      DEBEZIUM_SOURCE_DATABASE_HOSTNAME                     = var.postgres_host
+      DEBEZIUM_SOURCE_DATABASE_PORT                         = tostring(var.postgres_port)
+      DEBEZIUM_SOURCE_DATABASE_USER                         = var.postgres_cdc_user
+      DEBEZIUM_SOURCE_DATABASE_DBNAME                       = var.postgres_database
+      DEBEZIUM_SOURCE_DATABASE_SSLMODE                      = "require"
+      DEBEZIUM_SOURCE_TOPIC_PREFIX                          = local.source_topic_prefix
+      DEBEZIUM_SOURCE_PLUGIN_NAME                           = "pgoutput"
+      DEBEZIUM_SOURCE_SLOT_NAME                             = "ecommerce_cdc_cloud"
+      DEBEZIUM_SOURCE_SLOT_DROP_ON_STOP                     = "false"
+      DEBEZIUM_SOURCE_PUBLICATION_NAME                      = "ecommerce_cdc_publication"
+      DEBEZIUM_SOURCE_PUBLICATION_AUTOCREATE_MODE           = "disabled"
+      DEBEZIUM_SOURCE_SCHEMA_INCLUDE_LIST                   = "customer_app,cdc_control"
+      DEBEZIUM_SOURCE_TABLE_INCLUDE_LIST                    = local.table_include_list
+      DEBEZIUM_SOURCE_COLUMN_EXCLUDE_LIST                   = "customer_app.app_users.password_hash"
+      DEBEZIUM_SOURCE_SNAPSHOT_MODE                         = "when_needed"
+      DEBEZIUM_SOURCE_PROVIDE_TRANSACTION_METADATA          = "true"
+      DEBEZIUM_SOURCE_HEARTBEAT_INTERVAL_MS                 = "10000"
+      DEBEZIUM_SOURCE_HEARTBEAT_ACTION_QUERY                = "INSERT INTO cdc_control.debezium_heartbeat (id, last_seen_at) VALUES (1, clock_timestamp()) ON CONFLICT (id) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at"
+      DEBEZIUM_SOURCE_TOPIC_HEARTBEAT_NAME                  = "ecommerce.heartbeat.v1"
+      DEBEZIUM_SOURCE_TOPIC_TRANSACTION                     = "transaction.v1"
+      DEBEZIUM_SOURCE_TOMBSTONES_ON_DELETE                  = "false"
+      DEBEZIUM_SOURCE_DECIMAL_HANDLING_MODE                 = "string"
+      DEBEZIUM_SOURCE_BINARY_HANDLING_MODE                  = "base64"
+      DEBEZIUM_SOURCE_OFFSET_STORAGE                        = "io.debezium.storage.jdbc.offset.JdbcOffsetBackingStore"
+      DEBEZIUM_SOURCE_OFFSET_STORAGE_JDBC_URL               = "jdbc:postgresql://${var.postgres_host}:${var.postgres_port}/${var.postgres_database}?sslmode=require&currentSchema=cdc_control"
+      DEBEZIUM_SOURCE_OFFSET_STORAGE_JDBC_USER              = var.postgres_cdc_user
+      DEBEZIUM_SOURCE_OFFSET_STORAGE_JDBC_OFFSET_TABLE_NAME = "debezium_offset_storage"
+      DEBEZIUM_SOURCE_OFFSET_FLUSH_INTERVAL_MS              = "1000"
       # MicroProfile normalizes environment variable names to lower case. The
       # symbolic names must match or Debezium cannot resolve their `.type`.
-      DEBEZIUM_TRANSFORMS                                       = "routecustomer,routecatalog,routepromotion,routesales,routepayment,routeshipping"
+      DEBEZIUM_TRANSFORMS                                       = "routecustomer,routecatalog,routepromotion,routesales,routepayment,routeshipping,routeheartbeat"
       DEBEZIUM_TRANSFORMS_ROUTECUSTOMER_TYPE                    = "io.debezium.transforms.ByLogicalTableRouter"
-      DEBEZIUM_TRANSFORMS_ROUTECUSTOMER_TOPIC_REGEX             = "ecommerce\\.customer_app\\.(app_users|user_addresses)"
+      DEBEZIUM_TRANSFORMS_ROUTECUSTOMER_TOPIC_REGEX             = "${local.source_topic_prefix}\\.customer_app\\.(app_users|user_addresses)"
       DEBEZIUM_TRANSFORMS_ROUTECUSTOMER_TOPIC_REPLACEMENT       = local.data_event_hubs.customer
       DEBEZIUM_TRANSFORMS_ROUTECUSTOMER_KEY_ENFORCE_UNIQUENESS  = "true"
       DEBEZIUM_TRANSFORMS_ROUTECATALOG_TYPE                     = "io.debezium.transforms.ByLogicalTableRouter"
-      DEBEZIUM_TRANSFORMS_ROUTECATALOG_TOPIC_REGEX              = "ecommerce\\.customer_app\\.(shops|categories|products|product_variants)"
+      DEBEZIUM_TRANSFORMS_ROUTECATALOG_TOPIC_REGEX              = "${local.source_topic_prefix}\\.customer_app\\.(shops|categories|products|product_variants)"
       DEBEZIUM_TRANSFORMS_ROUTECATALOG_TOPIC_REPLACEMENT        = local.data_event_hubs.catalog
       DEBEZIUM_TRANSFORMS_ROUTECATALOG_KEY_ENFORCE_UNIQUENESS   = "true"
       DEBEZIUM_TRANSFORMS_ROUTEPROMOTION_TYPE                   = "io.debezium.transforms.ByLogicalTableRouter"
-      DEBEZIUM_TRANSFORMS_ROUTEPROMOTION_TOPIC_REGEX            = "ecommerce\\.customer_app\\.vouchers"
+      DEBEZIUM_TRANSFORMS_ROUTEPROMOTION_TOPIC_REGEX            = "${local.source_topic_prefix}\\.customer_app\\.vouchers"
       DEBEZIUM_TRANSFORMS_ROUTEPROMOTION_TOPIC_REPLACEMENT      = local.data_event_hubs.promotion
       DEBEZIUM_TRANSFORMS_ROUTEPROMOTION_KEY_ENFORCE_UNIQUENESS = "true"
       DEBEZIUM_TRANSFORMS_ROUTESALES_TYPE                       = "io.debezium.transforms.ByLogicalTableRouter"
-      DEBEZIUM_TRANSFORMS_ROUTESALES_TOPIC_REGEX                = "ecommerce\\.customer_app\\.(orders|order_items|order_vouchers)"
+      DEBEZIUM_TRANSFORMS_ROUTESALES_TOPIC_REGEX                = "${local.source_topic_prefix}\\.customer_app\\.(orders|order_items|order_vouchers)"
       DEBEZIUM_TRANSFORMS_ROUTESALES_TOPIC_REPLACEMENT          = local.data_event_hubs.sales
       DEBEZIUM_TRANSFORMS_ROUTESALES_KEY_ENFORCE_UNIQUENESS     = "true"
       DEBEZIUM_TRANSFORMS_ROUTEPAYMENT_TYPE                     = "io.debezium.transforms.ByLogicalTableRouter"
-      DEBEZIUM_TRANSFORMS_ROUTEPAYMENT_TOPIC_REGEX              = "ecommerce\\.customer_app\\.payments"
+      DEBEZIUM_TRANSFORMS_ROUTEPAYMENT_TOPIC_REGEX              = "${local.source_topic_prefix}\\.customer_app\\.payments"
       DEBEZIUM_TRANSFORMS_ROUTEPAYMENT_TOPIC_REPLACEMENT        = local.data_event_hubs.payment
       DEBEZIUM_TRANSFORMS_ROUTEPAYMENT_KEY_ENFORCE_UNIQUENESS   = "true"
       DEBEZIUM_TRANSFORMS_ROUTESHIPPING_TYPE                    = "io.debezium.transforms.ByLogicalTableRouter"
-      DEBEZIUM_TRANSFORMS_ROUTESHIPPING_TOPIC_REGEX             = "ecommerce\\.customer_app\\.shipments"
+      DEBEZIUM_TRANSFORMS_ROUTESHIPPING_TOPIC_REGEX             = "${local.source_topic_prefix}\\.customer_app\\.shipments"
       DEBEZIUM_TRANSFORMS_ROUTESHIPPING_TOPIC_REPLACEMENT       = local.data_event_hubs.shipping
       DEBEZIUM_TRANSFORMS_ROUTESHIPPING_KEY_ENFORCE_UNIQUENESS  = "true"
+      DEBEZIUM_TRANSFORMS_ROUTEHEARTBEAT_TYPE                   = "io.debezium.transforms.ByLogicalTableRouter"
+      DEBEZIUM_TRANSFORMS_ROUTEHEARTBEAT_TOPIC_REGEX            = "${local.source_topic_prefix}\\.cdc_control\\.debezium_heartbeat"
+      DEBEZIUM_TRANSFORMS_ROUTEHEARTBEAT_TOPIC_REPLACEMENT      = local.event_hubs.heartbeat
+      DEBEZIUM_TRANSFORMS_ROUTEHEARTBEAT_KEY_ENFORCE_UNIQUENESS = "true"
       QUARKUS_LOG_CONSOLE_JSON_ENABLED                          = "true"
     }
 

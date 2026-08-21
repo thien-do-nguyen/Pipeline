@@ -30,9 +30,7 @@ chế độ batch thường xuyên.
 
 Spark/JDBC compute có thể chạy local hoặc trên Databricks. Local dùng filesystem; cloud dùng external Delta tables
 trên StorageV2/ADLS Gen2 do project sở hữu. Unity Catalog quản lý metadata, permissions, lineage và governance.
-Power BI có thể đọc Gold qua Databricks SQL. Local CDC dùng đúng Kafka protocol để khi triển khai cloud chỉ cần
-đổi broker/security/checkpoint/storage configuration sang Event Hubs, ADLS và Unity Catalog. ADF và cloud streaming
-deployment chưa nằm trong phạm vi hiện tại.
+Power BI có thể đọc Gold qua Databricks SQL. Local CDC sử dụng Kafka KRaft và Debezium Connect, trong khi Cloud CDC sử dụng Azure Event Hubs (Kafka API) kết hợp ACI Debezium và Databricks Structured Streaming được quản lý tự động qua Terraform trong `infra/cloud/cdc`.
 
 ## 1. Những tính chất pipeline bảo đảm
 
@@ -145,17 +143,30 @@ docker compose version
 cp .env.example .env
 ```
 
-Nội dung mặc định cho local:
-
 ```dotenv
+# 1. REQUIRED LOCAL RUNTIME CONFIGURATION
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
 POSTGRES_DB=ecommerce
 POSTGRES_USER=admin
 POSTGRES_PASSWORD=admin
+CDC_POSTGRES_PASSWORD=cdc-local-only
+
+# 2. OPTIONAL: CUSTOM PORTS & SCHEDULING (Có sẵn default trong docker-compose)
+KAFKA_PORT=29092
+KAFKA_CONNECT_PORT=8083
+AIRFLOW_PORT=8080
+AIRFLOW_PARALLELISM=4
+AIRFLOW_BATCH_SCHEDULE=
 ```
 
-Không commit `.env`. Trên Azure, các giá trị này sẽ được inject từ Key Vault/secret scope thay vì sửa code.
+Không commit `.env`. Trên Azure, các giá trị nhạy cảm được quản lý trong Key Vault / Databricks Secret Scope thay vì lưu trong file plain-text.
+Docker Compose tự nạp `.env`; config loader của các job local cũng đọc file này. Các target Terraform/Databricks
+đọc `.env.cloud` riêng, vì vậy không cần nhân bản biến local trong Makefile.
+
+Airflow local mặc định có bốn executor slots (`AIRFLOW_PARALLELISM=4`) để DAG local và cloud không chặn nhau khi
+cloud operator đang poll Databricks. Mỗi Batch DAG vẫn có `max_active_runs=1` và `max_active_tasks=1`, nên năm stage
+trong một DAG luôn chạy đúng thứ tự.
 
 Cloud target dùng external Delta tables trong catalog `dbw_tk1_student_dev_sea`, với base schema names
 `ecommerce_bronze`, `ecommerce_silver`, `ecommerce_gold`. Bundle tạo schema và task lấy tên trực tiếp từ schema
@@ -293,41 +304,25 @@ data/lakehouse/
 
 ### Quản lý batch local bằng Airflow
 
-Airflow là lớp orchestration; transformation vẫn nằm trong package `ecommerce_pipeline`. DAG tách các
-stage để mỗi layer có status, retry, timeout và task log riêng:
+Airflow là lớp orchestration; PostgreSQL extraction và mọi Spark/Delta transformation vẫn nằm trong package
+`ecommerce_pipeline` hoặc Databricks. Local và cloud dùng chung một logical flow:
 
 ```text
-check_postgres_source
-            │
-            ▼
-start_spark_and_ingest_bronze
-            │
-            ▼
-   build_unified_silver
-            │
-            ▼
-   build_gold_curated
-      │
-      ▼
-validate_gold_release
+check_source → run_bronze → run_silver → run_gold → validate_release
 ```
 
-Mỗi stage dùng một `batch_id` có cùng run prefix và layer suffix, nên có thể truy vết từ Airflow run
-sang structured task log và Delta commit. Tách process làm local khởi tạo Spark nhiều lần hơn; trên cloud các
-task nên dùng chung Databricks job cluster/existing cluster để giữ observability mà giảm startup cost.
+Mọi stage trong một DAG run dùng cùng `batch_id`. Local dùng `BashOperator` gọi entrypoint hiện có; cloud dùng
+`DatabricksRunNowOperator` chính thức để trigger cùng Databricks Job với `pipeline_mode` tương ứng. Delta commit
+metadata, pipeline progress và Gold release marker là source of truth giữa các process. XCom cloud chỉ chứa
+Databricks run ID/URL nhỏ do provider quản lý, không truyền manifest, DataFrame hoặc business data.
 
-Bronze đẩy manifest nhỏ gồm Delta version/schema/count qua Airflow XCom cho Silver; Silver tiếp tục đẩy committed
-version/schema cho Gold. XCom chỉ mang control metadata, không mang DataFrame hay business data. Vì vậy các task
-vẫn độc lập và retry được nhưng không phải dò lại Delta history của 12 bảng upstream. Nếu chạy một stage thủ công
-không có manifest, pipeline vẫn fallback sang Delta commit metadata làm source of truth.
-
-Gold đã chạy quality gate trước khi publish. Vì vậy `validate_gold_release` trong critical path chỉ đối chiếu atomic
-release marker với Silver manifest, không full-scan lại toàn bộ Lakehouse. Deep validation vẫn dùng `make validate`
+Gold đã chạy quality gate trước khi publish. Vì vậy `validate_gold_release` trong critical path kiểm tra atomic
+release marker và table contract, không full-scan lại toàn bộ Lakehouse. Deep validation vẫn dùng `make validate`
 để chạy thủ công, sau migration hoặc theo một lịch kiểm tra riêng.
 
-`check_postgres_source` kết nối read-only bằng psycopg, xác nhận database/user, quyền
+`check_source` kết nối read-only bằng psycopg, xác nhận database/user, quyền
 `USAGE`/`SELECT` và contract cột của `customer_app.change_events`. Task
-`start_spark_and_ingest_bronze` khởi tạo SparkSession rồi dùng ngay session đó để ingest Bronze; không tạo
+`run_bronze` khởi tạo SparkSession rồi dùng ngay session đó để ingest Bronze; không tạo
 một Spark check process rồi tắt trước khi xử lý dữ liệu. Log task in `STARTING`, `RUNNING`, Spark version,
 application ID và `spark_startup`.
 
@@ -369,23 +364,21 @@ Trigger cloud job từ Airflow local:
 make airflow-trigger-cloud
 ```
 
-DAG `ecommerce_databricks_batch_cloud` dùng một task orchestration:
+DAG `ecommerce_databricks_batch_cloud` dùng cùng năm task như local:
 
 ```text
-run_cloud_pipeline
-  └─ Databricks workflow: PostgreSQL preflight → Bronze → Silver → Gold → release validation
+check_source → run_bronze → run_silver → run_gold → validate_release
 ```
 
-Airflow chỉ gọi Databricks Jobs API 2.2 `run-now` một lần với `pipeline_mode=workflow`, sau đó poll đến khi
-workflow thành công hoặc fail. Cả pipeline dùng chung một Python process và Spark session nên manifest Bronze/Silver
-được truyền trong RAM, fast-path no-change hoạt động, wheel chỉ được cài một lần và không lặp startup/metadata scan
-cho từng tầng. Airflow đồng bộ phần stdout mới của Databricks theo chu kỳ 15 giây (không in lặp), bao gồm stage logs
-và `timings_ms`, nên có thể theo dõi progress ngay trong task log. Idempotency token bao gồm Airflow run và attempt,
-nên retry trong cùng attempt không tạo run trùng còn retry mới không tái sử dụng terminal failed run.
+Mỗi task trigger một Databricks run theo stage trên cùng existing cluster. Provider Airflow lưu run ID bền vững và
+reconnect khi worker retry, thay cho custom HTTP polling. Stage retry-safe nhờ Bronze cursor, Delta idempotent
+transactions, Silver progress và atomic Gold release. Việc tách process tăng task startup overhead, nhưng giữ
+lỗi và thời gian từng layer hiển thị trực tiếp trên Airflow graph.
 
-Không tách Bronze/Silver/Gold thành nhiều `run-now`: cách đó tạo năm Databricks runs độc lập, lặp library setup,
-Spark/Python startup và metadata reads, nên chậm gần gấp đôi dù Airflow graph trông chi tiết hơn. Chi tiết stage và
-failure vẫn có trong Databricks run output và structured timing log của `run_cloud_pipeline`.
+`DATABRICKS_HTTP_TIMEOUT_SECONDS` giới hạn thời gian một REST status request; timeout chỉ retry việc đọc
+status của durable run ID, không submit run thứ hai. Không chạy `make deploy-batch-cloud` trước mỗi batch:
+deploy tạo wheel artifact mới và Databricks phải cài/reconcile library ở run đầu tiên. Chỉ deploy khi code,
+config hoặc job definition thay đổi; run hàng ngày dùng `make airflow-trigger-cloud`.
 
 Sau khi thay đổi job parameters phải chạy `make deploy-batch-cloud` trước khi trigger DAG cloud.
 
@@ -395,14 +388,12 @@ Muốn đặt lịch, thêm cron vào `.env`, ví dụ chạy mỗi giờ:
 AIRFLOW_BATCH_SCHEDULE=0 * * * *
 ```
 
-Sau khi đổi schedule, chạy lại `make airflow-up`. Lệnh này tái sử dụng image hiện có; chỉ chạy `make airflow-build`
-khi Dockerfile hoặc Python dependency thay đổi. DAG đặt `max_active_runs=1`, LocalExecutor chỉ cấp một worker,
-retry một lần và timeout hai giờ để không có hai batch Airflow cùng ghi Lakehouse. File lock hiện có vẫn bảo vệ khi ai đó đồng thời chạy
-`make run-batch-local` ngoài Airflow.
+Sau khi đổi schedule, chạy lại `make airflow-up`. DAG đặt `max_active_runs=1`; file/Delta lock vẫn bảo vệ khi có
+CLI hoặc CDC chạy đồng thời. Batch DAG không phụ thuộc CDC Job, nên Debezium/CDC tiếp tục nhận và xử lý event độc lập.
 
-Batch Airflow luôn trigger Gold sau Unified Silver. Nếu streaming vừa publish cùng Silver version, batch lấy shared
-lock sau đó đọc Gold release mới nhất và no-op; nếu batch publish trước thì streaming thực hiện đối xứng. Vì vậy cả hai
-trigger đều linh hoạt nhưng không có hai publication chạy đồng thời.
+Batch và Streaming đều dùng `unified_lakehouse_writer`: Silver và Gold acquire/release riêng theo production
+semantics. Nếu manifest của Batch bị Streaming supersede giữa hai lock, Gold refresh live Silver progress dưới Gold
+lock rồi hoàn tất idempotently; không dùng outer lock bao trọn Silver → Gold.
 
 Tắt Airflow nhưng giữ metadata history:
 
@@ -410,11 +401,11 @@ Tắt Airflow nhưng giữ metadata history:
 make airflow-down
 ```
 
-Local chỉ tạo file lock tạm để ngăn hai writer chạy đồng thời:
+Local dùng POSIX advisory lock trên một file inode ổn định để ngăn hai writer chạy đồng thời:
 
 ```text
 data/runtime/
-└── _pipeline.lock               # chỉ tồn tại trong lúc local job đang chạy
+└── _pipeline.lock               # file control tồn tại; kernel lock chỉ được giữ khi writer đang chạy
 ```
 
 Pipeline không tạo `logs/batch_runs/*.json` ở local hoặc Azure. Trạng thái cuối được in thành một dòng JSON có
@@ -474,9 +465,9 @@ make run-silver-stream-local
 make seed-stream ORDERS_PER_BATCH=2 INTERVAL_SECONDS=3
 ```
 
-Continuous downstream merge micro-batch vào Unified Silver rồi reconcile Gold ngay khi
-`streaming.silver.reconcile_gold_each_batch: true`. Job `reconcile-gold-local` vẫn dùng được để backfill hoặc repair
-thủ công từ Unified Silver đã hợp nhất:
+Continuous downstream merge micro-batch vào Unified Silver, commit durable request vào
+`silver/gold_reconcile_queue`, nhả shared writer lock rồi mới reconcile Gold ở control loop độc lập. Job
+`reconcile-gold-local` vẫn dùng được để backfill hoặc repair thủ công từ Unified Silver đã hợp nhất:
 
 ```bash
 make reconcile-gold-local
@@ -511,13 +502,14 @@ Query log `[cdc-quality-alert]` rồi tiếp tục valid rows; việc replay cù
 
 Mỗi table được transform bằng cùng Silver rule của batch rồi merge vào `data/lakehouse/silver/<table>`. Merge dùng
 event time, ingestion priority và source sequence; CDC thắng batch khi cùng event time. Delete được lưu thành
-tombstone để sự kiện batch cũ không resurrect dữ liệu. Transaction identity gồm query name, checkpoint version,
+tombstone nhưng giữ business context của target; delete thiếu before-image bắt buộc được quarantine. PostgreSQL dùng
+`REPLICA IDENTITY FULL` cho cả 12 bảng để child delete vẫn có foreign key phục vụ Gold readiness. Transaction identity gồm query name, checkpoint version,
 table name và Spark batch ID; retry bỏ qua transaction đã commit và tiếp tục table còn lại. Với local continuous query,
-Gold đọc Delta CDF và publish sau từng micro-batch Silver thành công. Nếu Silver chưa có đủ fact source từ 12 Kafka
-topics, stream log `[gold-reconcile] status=deferred reason=source_fact_incomplete`, retry trong cửa sổ
-`streaming.silver.gold_deferred_retry_seconds`, rồi tiếp tục idle-reconcile định kỳ khi query không nhận thêm raw file;
-khi source đã đủ thì pending scope được publish. Nếu quality vẫn fail, stream log `[gold-quality-alert]`, bỏ publish lần
-đó và tiếp tục xử lý.
+Gold đọc durable queue mỗi `streaming.silver.gold_reconcile_interval_seconds` và publish sau khi Silver thành công.
+Nếu Silver chưa có đủ fact source từ các Kafka domain topics, request vẫn ở trạng thái `pending`; control loop log
+`[gold-reconcile] status=deferred reason=source_fact_incomplete` rồi thử lại ở chu kỳ kế tiếp mà không giữ Spark
+`foreachBatch`. Khi source đã đủ, Gold publish và queue được đánh dấu `published`. Nếu quality vẫn fail, stream log
+`[gold-quality-alert]`, giữ request pending và tiếp tục xử lý.
 
 Batch và CDC-to-Silver chỉ giữ lock trong lúc ghi Shared Silver/Gold. Local dùng `_pipeline.lock`; cloud dùng bảng
 Delta `_pipeline_writer_locks` với optimistic concurrency và TTL, nên khóa có hiệu lực giữa hai Databricks jobs khác
@@ -609,6 +601,8 @@ Sau khi nâng schema Gold để thêm SCD2 cho product/shop/category, cần ch�
 
 ## 8. Test và quality gates
 
+Kiểm tra định dạng mã nguồn, static analysis, type checking và 176 unit tests:
+
 ```bash
 make format-check
 make lint
@@ -616,7 +610,7 @@ make type-check
 make test
 ```
 
-Integration test yêu cầu PostgreSQL đang chạy:
+Kiểm tra hợp đồng CDC PostgreSQL (Replication Role, Publication 12 bảng + Heartbeat, REPLICA IDENTITY FULL):
 
 ```bash
 make pg-up
@@ -624,13 +618,15 @@ make pg-wait
 make test-integration
 ```
 
-E2E test reset dữ liệu source trong database local, chạy PostgreSQL → Bronze → Silver → Gold ba lần và kiểm tra incremental/idempotency:
+Kiểm tra các kịch bản End-to-End (E2E) như trong GitHub Actions CI:
 
 ```bash
-make test-e2e
+make test-e2e-batch           # Luồng Batch toàn trình PostgreSQL → Bronze → Silver → Gold
+make test-e2e-streaming       # Luồng CDC Debezium → Typed Bronze → Unified Silver → Gold queue
+make test-e2e-concurrency     # Race condition: Shared Writer Lock giữa Batch và CDC
 ```
 
-Lệnh kiểm tra nhanh toàn repo:
+Lệnh kiểm tra nhanh toàn bộ chất lượng mã nguồn (Quality Gate):
 
 ```bash
 make check
@@ -822,11 +818,13 @@ NAT Gateway hoặc public inbound IP cho ACI; vì vậy nếu PostgreSQL không 
 firewall rule phù hợp trước khi apply. Không đưa PostgreSQL firewall vào Terraform này vì PostgreSQL nằm ngoài phạm vi
 tài nguyên được phép quản lý/xóa.
 
-Bootstrap idempotent sẽ tạo/cập nhật role `ecommerce_cdc`, publication 12 bảng và schema offset riêng. Password PostgreSQL
+Bootstrap idempotent sẽ tạo/cập nhật role `ecommerce_cdc`, publication 12 bảng, xác nhận cả 12 bảng dùng
+`REPLICA IDENTITY FULL`, và tạo schema control riêng cho offset/heartbeat. Debezium cập nhật heartbeat row mỗi 10 giây;
+health gate đọc tuổi heartbeat và WAL retained bytes trực tiếp từ PostgreSQL thay vì suy đoán từ Spark. Password PostgreSQL
 và Event Hubs connection string đi qua Terraform sensitive variables/ACI secure environment variables; local Terraform
 state vẫn chứa secret nên `.terraform`, `*.tfstate` và `terraform.tfvars` đã bị git-ignore.
 
-### Apply, chạy và destroy
+### Rollout production an toàn, chạy và destroy
 
 Xem plan trước khi phát sinh chi phí:
 
@@ -834,34 +832,56 @@ Xem plan trước khi phát sinh chi phí:
 make cdc-cloud-plan
 ```
 
-Tạo hạ tầng, đồng bộ Event Hubs Listen connection string vào Databricks secret scope, rồi deploy CDC job:
+Chạy toàn bộ gate đến concurrency canary. Target này deploy job ở trạng thái `PAUSED` trước, bootstrap PostgreSQL,
+apply Event Hubs/ACI, health check, chạy `availableNow` canary và cuối cùng chạy Batch+CDC đồng thời. Nếu bất kỳ gate
+nào lỗi, Make dừng ngay và Continuous Job vẫn `PAUSED`; Delta checkpoint và Debezium offset không bị reset:
 
 ```bash
-make cdc-cloud-apply
-make cdc-cloud-status
-make cdc-cloud-logs
+make cdc-cloud-rollout
 ```
 
-Chạy một incremental cycle `availableNow` theo thứ tự Event Hubs → Raw Bronze → typed Bronze → Unified Silver → Gold:
+Có thể chạy/điều tra từng gate độc lập:
 
 ```bash
-make run-cdc-cloud
+make deploy-cdc-cloud-paused       # code/job definition, chưa tạo tài nguyên CDC
+make cdc-cloud-pg-bootstrap        # role/publication/identity/heartbeat
+make cdc-cloud-apply               # IaC + secret + deploy namespace thật; vẫn PAUSED
+make cdc-cloud-health              # ACI, slot, heartbeat age, WAL retained bytes
+make cdc-cloud-canary              # availableNow + deep Raw/Typed/Silver/Gold validation
+make cdc-cloud-concurrency-canary  # Batch và CDC thật chạy đồng thời, rồi validate converge
 ```
 
-CDC job dùng cùng existing cluster `0804-071458-pswonf6z` với batch. Không tạo compute thứ hai. Schedule mặc định paused;
-nếu cần near-real-time trong thời gian demo, bật chu kỳ 2 phút rồi tắt ngay khi xong:
+`make run-cdc-cloud` là một `availableNow` cycle hữu hạn; `make cdc-cloud-canary` bật thêm deep validation. Canary kiểm
+tra table contract/existence, duplicate Raw/Typed/Silver, Gold release, freshness,
+quarantine và durable pending-Gold queue.
+
+CDC job dùng cùng existing cluster `0804-071458-pswonf6z` với batch. Không tạo compute thứ hai. Production path là một
+Databricks Continuous Job mặc định paused; trong một task dài hạn, Raw và Unified Silver queries chạy đồng thời với
+processing-time trigger 5 giây. Cách này loại bỏ cold start và library installation khỏi từng micro-batch:
 
 ```bash
 make cdc-cloud-start
 make cdc-cloud-stop
 ```
 
-Chu kỳ 2 phút giữ cluster ấm nên có thể phát sinh DBU/VM liên tục. Với tài khoản EDU, ưu tiên `make run-cdc-cloud` thủ
-công hoặc chỉ unpause trong cửa sổ test. Batch và CDC dùng chung Delta writer lock để không publish Silver/Gold đồng
+Chỉ bật sau khi rollout báo `CANARIES_PASSED`. Theo dõi ít nhất ba micro-batches thực sự có `input_rows > 0`; nếu query
+lỗi hoặc freshness/lag tăng, chạy `make cdc-cloud-stop`, rollback wheel/job definition và chạy lại canary. Không xóa
+`_checkpoints`, replication slot hoặc JDBC offset table trong rollback.
+
+Các structured metric/alert có thể tìm trực tiếp trong Databricks task logs:
+
+- `[cdc-runtime-metrics]`: input rows, Event Hubs offsets behind latest, micro-batch duration và stage duration.
+- `[cdc-health]`: Debezium heartbeat age, PostgreSQL WAL retained bytes và slot state.
+- `[cdc-canary]`: Raw/Typed/Silver/Gold freshness, pending Gold age/count và quarantine count.
+- `[pipeline-lock]`: lock wait, timeout và held duration của `unified_lakehouse_writer`.
+- `[cdc-alert]`: lag/duration threshold, pending/quarantine, cycle failure hoặc Gold publish failure.
+
+Continuous Job giữ cluster sống nên phát sinh DBU/VM liên tục. Với tài khoản EDU, ưu tiên `make run-cdc-cloud` thủ công
+nếu chỉ cần minute-level latency, hoặc chỉ unpause Continuous Job trong cửa sổ test. Batch và CDC dùng chung Delta writer lock để không publish Silver/Gold đồng
 thời; Spark FAIR scheduler giảm starvation nếu hai job tình cờ overlap, nhưng single-node 4-core vẫn chậm hơn khi chạy
 đồng thời.
 
-Khi hoàn tất, lệnh destroy pause schedule trước rồi chỉ xóa Event Hubs và ACI:
+Khi hoàn tất, lệnh destroy pause Continuous Job trước rồi chỉ xóa Event Hubs và ACI:
 
 ```bash
 make cdc-cloud-destroy
@@ -890,7 +910,23 @@ continuity và sẽ chạy snapshot/recovery ở lần apply kế tiếp.
   orchestrator phải đặt concurrency bằng 1 hoặc dùng distributed lease.
 - `schema/dwhSchema.sql` là physical reference; runtime local lưu Gold bằng Delta, không tạo PostgreSQL DWH riêng.
 
-## 12. Troubleshooting
+## 13. Phân tích hiệu năng thực tế trên Databricks Single-Node Cluster
+
+Khi triển khai trên gói tiết kiệm chi phí (Azure Student / EDU) với cấu hình **Single-Node Cluster (`Standard_D4s_v4`: 4 vCPUs, 16GB RAM, 0 Workers)**:
+
+### Chỉ số đo lường thực tế (Logs đo từ Databricks Job Run)
+* **Tổng thời gian Batch Run:** ~ 4 phút (~ 249 giây).
+* **Bóc tách thời gian từng tầng:**
+  - **Bronze Extraction (12 bảng JDBC):** `18.27 giây` (~ 1.5s / bảng).
+  - **Silver Merge (12 bảng Delta):** `73.19 giây` (~ 6s / bảng).
+  - **Gold Dimensional Model (11 bảng DWH + SCD2 Replay):** `157.20 giây` (~ 2.6 phút). Trong đó: `dim_customer` (45.7s), `dim_category` (41.3s), `dim_product` (39.9s), `dim_shop` (27.1s), `fact_sales` (56.9s).
+
+### Phân tích điểm nghẽn (Bottleneck Analysis)
+1. **Azure Blob Storage (ADLS Gen2) REST API Overhead:** Khi ghi tuần tự 23 bảng Delta (`abfss://`), mỗi transaction yêu cầu hàng chục lệnh gọi REST API qua mạng để đọc metadata, ghi Parquet và commit `_delta_log`. Overhead cố định của Storage I/O chiếm tới 60-70% tổng thời gian chạy.
+2. **SCD2 Full History Recompute trên 4 vCPUs:** Các bảng SCD2 Type 2 tính toán lại toàn bộ lịch sử với các hàm Window Function và SHA-256 trên một máy ảo duy nhất không có worker song song.
+3. **Delta Transactions trên bảng không có thay đổi:** Các bảng không có bản ghi mới vẫn thực hiện Delta MERGE transaction xuống storage.
+
+## 14. Troubleshooting
 
 **Thiếu biến môi trường**: loader fail với `Missing required environment variable`. Tạo `.env` từ `.env.example`.
 
@@ -925,4 +961,5 @@ make lakehouse-reset
 make run-batch-local
 ```
 
-**Pipeline báo đang có writer khác**: đảm bảo không còn job Spark chạy. Nếu job trước bị kill cứng, xóa file generated `logs/_pipeline.lock` rồi chạy lại.
+**Pipeline báo đang có writer khác**: kiểm tra job Spark/Batch/Airflow khác thực sự còn chạy. Không cần xóa
+`data/runtime/_pipeline.lock`; POSIX lock được kernel tự nhả kể cả khi process bị kill cứng.

@@ -10,7 +10,6 @@ from pyspark.sql import types as T
 from ecommerce_pipeline.transformations.gold.scd2 import (
     build_dim_category_from_history,
     build_dim_customer_from_history,
-    build_dim_customer_incremental,
     build_dim_product_from_history,
     build_dim_shop_from_history,
 )
@@ -93,10 +92,6 @@ def _business_rows(df: DataFrame) -> list[dict[str, object]]:
             .collect()
         )
     ]
-
-
-def _apply_upserts(existing: DataFrame, upserts: DataFrame) -> DataFrame:
-    return existing.join(upserts.select("customer_key"), "customer_key", "left_anti").unionByName(upserts)
 
 
 _HISTORY_META_SCHEMA = """
@@ -587,62 +582,36 @@ def test_type1_last_login_update_does_not_create_new_customer_version(spark: Spa
     assert rows[0]["is_current"] is True
 
 
-def test_retry_same_incremental_batch_is_idempotent_by_customer_key(spark: SparkSession) -> None:
-    initial = build_dim_customer_from_history(_history(spark, [{}]), spark, include_unknown=False)
-    batch = _history(
+def test_customer_reactivation_after_delete_creates_new_active_version(spark: SparkSession) -> None:
+    history = _history(
         spark,
         [
+            {},  # Insert at 2026-01-01
             {
-                "email": "alice.retry@example.com",
-                "updated_at": _ts("2026-03-01T10:05:00"),
-                "_operation": "UPDATE",
-                "_event_occurred_at": _ts("2026-03-01T10:05:00"),
-                "_history_event_id": "e2",
-                "_source_event_sequence": 2,
-            }
-        ],
-    )
-    upserts = build_dim_customer_incremental(initial, batch)
-
-    once = _apply_upserts(initial, upserts)
-    twice = _apply_upserts(once, upserts)
-
-    assert once.select("customer_key").distinct().count() == once.count()
-    assert twice.select("customer_key").distinct().count() == twice.count()
-    assert _business_rows(once) == _business_rows(twice)
-
-
-def test_full_rebuild_matches_incremental_customer_processing(spark: SparkSession) -> None:
-    all_history = _history(
-        spark,
-        [
-            {},
-            {
-                "phone_number": "0900000002",
-                "updated_at": _ts("2026-03-01T10:05:00"),
-                "_operation": "UPDATE",
-                "_event_occurred_at": _ts("2026-03-01T10:05:00"),
+                "_operation": "DELETE",
+                "_event_occurred_at": _ts("2026-04-01T00:00:00"),
                 "_history_event_id": "e2",
                 "_source_event_sequence": 2,
             },
             {
-                "updated_at": _ts("2026-03-02T00:00:00"),
-                "last_login": _ts("2026-03-02T00:00:00"),
-                "_operation": "UPDATE",
-                "_event_occurred_at": _ts("2026-03-02T00:00:00"),
+                "email": "alice.reactivated@example.com",
+                "phone_number": "0999888777",
+                "updated_at": _ts("2026-06-01T00:00:00"),
+                "_operation": "INSERT",
+                "_event_occurred_at": _ts("2026-06-01T00:00:00"),
                 "_history_event_id": "e3",
                 "_source_event_sequence": 3,
             },
         ],
     )
-    initial = build_dim_customer_from_history(
-        all_history.where(F.col("_source_event_sequence") == 1), spark, include_unknown=False
-    )
-    upserts = build_dim_customer_incremental(
-        initial,
-        all_history.where(F.col("_source_event_sequence") > 1),
-    )
-    incremental = _apply_upserts(initial, upserts)
-    full = build_dim_customer_from_history(all_history, spark, include_unknown=False)
 
-    assert _business_rows(incremental) == _business_rows(full)
+    rows = _business_rows(build_dim_customer_from_history(history, spark, include_unknown=False))
+    assert len(rows) == 2
+    # First version was active until deleted at 2026-04-01
+    assert rows[0]["effective_to"] == _ts("2026-04-01T00:00:00")
+    assert rows[0]["is_current"] is False
+    # Second version is active from 2026-06-01 to 9999-12-31
+    assert rows[1]["email"] == "alice.reactivated@example.com"
+    assert rows[1]["effective_from"] == _ts("2026-06-01T00:00:00")
+    assert rows[1]["is_current"] is True
+    assert rows[1]["is_deleted"] is False

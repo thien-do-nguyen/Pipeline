@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
-from time import perf_counter, sleep
+from threading import Lock
+from time import perf_counter
 
 from pyspark.sql import DataFrame, Row, SparkSession
 from pyspark.sql import functions as F
@@ -20,11 +21,13 @@ from ecommerce_pipeline.contracts.cdc_tables import TYPED_CDC_TABLES
 from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES, get_silver_contract
 from ecommerce_pipeline.control.batch_runs import local_pipeline_lock
 from ecommerce_pipeline.control.cloud_lock import cloud_pipeline_lock
+from ecommerce_pipeline.control.gold_reconcile_queue import GoldReconcileQueue
 from ecommerce_pipeline.ingestion.streaming.cdc_decoder import prepare_raw_cdc_events
 from ecommerce_pipeline.ingestion.streaming.typed_bronze import TypedBronzeMaterializer
 from ecommerce_pipeline.pipelines.build_gold import GoldBuilder
 from ecommerce_pipeline.pipelines.build_silver import SILVER_CHANGE_HISTORY_PIPELINE_NAME, SilverBuilder
 from ecommerce_pipeline.pipelines.quality import GoldQualityError
+from ecommerce_pipeline.runtime.shutdown import unpersist_safely
 from ecommerce_pipeline.transformations.silver.common import SILVER_SCHEMA_VERSION, SILVER_SEQUENCE_COLUMNS
 
 CDC_SILVER_PIPELINE_NAME = "cdc_to_silver"
@@ -67,19 +70,26 @@ class UnifiedSilverMaterializer:
         self.lakehouse = LakehouseAdapter(spark, config)
         self.silver = SilverBuilder(spark, config)
         self.typed_bronze = TypedBronzeMaterializer(spark, config)
+        self.gold_queue = GoldReconcileQueue(spark, config)
+        # foreachBatch runs on Spark's streaming callback thread while Gold is
+        # driven by the control thread. Do not let two memory-heavy Spark jobs
+        # from the same query overlap before either reaches the writer lock.
+        self._cycle_lock = Lock()
         self._targets_validated = False
-        self._pending_gold_order_ids: set[int] = set()
-        self._pending_gold_requires_full_readiness = False
 
     def process_batch(self, raw_batch: DataFrame, batch_id: int) -> None:
+        with self._cycle_lock:
+            self._process_batch(raw_batch, batch_id)
+
+    def _process_batch(self, raw_batch: DataFrame, batch_id: int) -> None:
         batch_started = perf_counter()
-        prepared = prepare_raw_cdc_events(raw_batch).persist(StorageLevel.DISK_ONLY)
+        prepared = prepare_raw_cdc_events(raw_batch).persist(StorageLevel.MEMORY_AND_DISK)
         try:
             bronze_started = perf_counter()
             materialized = self.typed_bronze.materialize(prepared, batch_id)
             bronze_seconds = perf_counter() - bronze_started
         finally:
-            prepared.unpersist()
+            unpersist_safely(prepared, label="unified-silver")
         statistics = materialized.statistics
         changed_tables = [name for name in self.table_names if name in statistics]
         if not changed_tables:
@@ -102,25 +112,25 @@ class UnifiedSilverMaterializer:
         with self._writer_lock(f"stream-batch-{batch_id}"):
             target_exists = self._preflight_targets(transformed)
             silver_started = perf_counter()
-            for table_name, history in histories.items():
-                contract = get_silver_contract(table_name)
-                history_app_id = (
-                    f"{SILVER_CHANGE_HISTORY_PIPELINE_NAME}:"
-                    f"{self.settings.query_name}:{self.settings.checkpoint_version}:{table_name}"
-                )
-                self.silver.append_change_history(
-                    contract,
-                    history,
-                    batch_id=f"cdc-stream-{batch_id}",
-                    bronze_version=batch_id,
-                    bronze_starting_version=None,
-                    transaction_version=batch_id,
-                    pipeline_name=SILVER_CHANGE_HISTORY_PIPELINE_NAME,
-                    transaction_app_id=history_app_id,
-                )
 
             def merge_table(table_name: str) -> tuple[str, float]:
                 table_started = perf_counter()
+                if table_name in histories:
+                    contract = get_silver_contract(table_name)
+                    history_app_id = (
+                        f"{SILVER_CHANGE_HISTORY_PIPELINE_NAME}:"
+                        f"{self.settings.query_name}:{self.settings.checkpoint_version}:{table_name}"
+                    )
+                    self.silver.append_change_history(
+                        contract,
+                        histories[table_name],
+                        batch_id=f"cdc-stream-{batch_id}",
+                        bronze_version=batch_id,
+                        bronze_starting_version=None,
+                        transaction_version=batch_id,
+                        pipeline_name=SILVER_CHANGE_HISTORY_PIPELINE_NAME,
+                        transaction_app_id=history_app_id,
+                    )
                 self._merge_table(
                     transformed[table_name],
                     table_name,
@@ -130,113 +140,70 @@ class UnifiedSilverMaterializer:
                 )
                 return table_name, perf_counter() - table_started
 
-            workers = max(1, min(len(changed_tables), self.config.spark.max_parallel_tables))
+            # A new table is written through ``dataframe.write`` and therefore
+            # uses the DataFrame's owning SparkSession. Bootstrap sequentially
+            # so transaction/user metadata cannot race on that shared session.
+            # Existing targets use independent sessions and remain parallel.
+            bootstrap_required = any(not target_exists[name] for name in changed_tables)
+            workers = (
+                1 if bootstrap_required else max(1, min(len(changed_tables), self.config.spark.max_parallel_tables))
+            )
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 table_seconds = dict(executor.map(merge_table, changed_tables))
             silver_seconds = perf_counter() - silver_started
+            affected_order_ids, requires_fact_readiness = self._gold_scope(transformed)
+            queue_started = perf_counter()
+            self.gold_queue.enqueue(
+                request_id=f"{self.settings.query_name}:{self.settings.checkpoint_version}:{batch_id}",
+                affected_order_ids=affected_order_ids,
+                requires_fact_readiness=requires_fact_readiness,
+            )
+            queue_seconds = perf_counter() - queue_started
 
             self._targets_validated = True
-        gold_status = "disabled"
-        gold_seconds = 0.0
-        if getattr(self.settings, "reconcile_gold_each_batch", False):
-            self._track_pending_gold_scope(transformed)
-            gold_started = perf_counter()
-            affected_order_ids = (
-                None if self._pending_gold_requires_full_readiness else set(self._pending_gold_order_ids)
-            )
-            defer_if_source_incomplete = bool(
-                self._pending_gold_requires_full_readiness or self._pending_gold_order_ids
-            )
-            gold_status = self._reconcile_gold_with_deferred_retry(
-                batch_id=f"cdc-stream-{batch_id}",
-                raise_on_quality_error=False,
-                rebuild_on_quality_error=False,
-                defer_if_source_incomplete=defer_if_source_incomplete,
-                affected_order_ids=affected_order_ids,
-            )
-            if gold_status == "published":
-                self._pending_gold_order_ids.clear()
-                self._pending_gold_requires_full_readiness = False
-            gold_seconds = perf_counter() - gold_started
         slowest_table = max(table_seconds, key=table_seconds.__getitem__)
         records = sum(int(statistics[name]["record_count"]) for name in changed_tables)
         print(
             f"[unified-silver-batch] batch={batch_id} records={records} tables={len(changed_tables)} "
             f"quarantined={materialized.quarantined_count} typed_bronze={bronze_seconds:.2f}s "
-            f"silver={silver_seconds:.2f}s "
+            f"silver={silver_seconds:.2f}s gold_queue={queue_seconds:.2f}s "
             f"slowest={slowest_table}:{table_seconds[slowest_table]:.2f}s "
-            f"gold_status={gold_status} gold={gold_seconds:.2f}s "
+            "gold_status=queued "
             f"total={perf_counter() - batch_started:.2f}s",
             flush=True,
         )
 
-    def _reconcile_gold_with_deferred_retry(
-        self,
-        *,
-        batch_id: str,
-        raise_on_quality_error: bool,
-        rebuild_on_quality_error: bool,
-        defer_if_source_incomplete: bool,
-        affected_order_ids: set[int] | None,
-    ) -> str:
-        status = self.reconcile_gold(
-            batch_id=batch_id,
-            raise_on_quality_error=raise_on_quality_error,
-            rebuild_on_quality_error=rebuild_on_quality_error,
-            defer_if_source_incomplete=defer_if_source_incomplete,
-            affected_order_ids=affected_order_ids,
-        )
-        if status != "deferred_source_incomplete":
-            return status
-
-        retry_seconds = getattr(self.settings, "gold_deferred_retry_seconds", 0)
-        if retry_seconds <= 0:
-            return status
-
-        retry_interval = getattr(self.settings, "gold_deferred_retry_interval_seconds", 2.0)
-        deadline = perf_counter() + retry_seconds
-        attempt = 0
-        while perf_counter() < deadline:
-            pause_seconds = min(retry_interval, max(0.0, deadline - perf_counter()))
-            if pause_seconds <= 0:
-                break
-            sleep(pause_seconds)
-            attempt += 1
-            status = self.reconcile_gold(
-                batch_id=f"{batch_id}-retry-{attempt}",
-                raise_on_quality_error=raise_on_quality_error,
-                rebuild_on_quality_error=rebuild_on_quality_error,
-                defer_if_source_incomplete=defer_if_source_incomplete,
-                affected_order_ids=affected_order_ids,
-            )
-            if status != "deferred_source_incomplete":
-                print(
-                    f"[gold-reconcile] status={status} after_deferred_retry attempt={attempt}",
-                    flush=True,
-                )
-                return status
-        return "deferred_source_incomplete"
-
     def reconcile_pending_gold_if_ready(self, *, batch_id: str) -> str:
-        """Retry a deferred Gold publish when the stream is idle between CDC micro-batches."""
+        """Publish one durable pending Silver scope without blocking Silver micro-batches."""
 
-        if not getattr(self.settings, "reconcile_gold_each_batch", False):
-            return "disabled"
-        if not self._pending_gold_requires_full_readiness and not self._pending_gold_order_ids:
+        with self._cycle_lock:
+            return self._reconcile_pending_gold_if_ready(batch_id=batch_id)
+
+    def _reconcile_pending_gold_if_ready(self, *, batch_id: str) -> str:
+        # Avoid acquiring the shared writer lock on every idle poll. Re-read after
+        # acquiring it so another writer cannot invalidate the selected scope.
+        if self.gold_queue.pending(max_order_ids=self.settings.max_gold_readiness_order_ids) is None:
             return "not_pending"
-
-        affected_order_ids = None if self._pending_gold_requires_full_readiness else set(self._pending_gold_order_ids)
-        status = self.reconcile_gold(
-            batch_id=batch_id,
-            raise_on_quality_error=False,
-            rebuild_on_quality_error=False,
-            defer_if_source_incomplete=True,
-            affected_order_ids=affected_order_ids,
-        )
-        if status == "published":
-            self._pending_gold_order_ids.clear()
-            self._pending_gold_requires_full_readiness = False
-        return status
+        started = perf_counter()
+        with self._writer_lock(f"gold-{batch_id}"):
+            pending = self.gold_queue.pending(max_order_ids=self.settings.max_gold_readiness_order_ids)
+            if pending is None:
+                return "not_pending"
+            if pending.requires_fact_readiness and not self._source_fact_ready_for_gold(pending.affected_order_ids):
+                return "deferred_source_incomplete"
+            status = self._run_gold_locked(
+                batch_id=batch_id,
+                raise_on_quality_error=False,
+                rebuild_on_quality_error=False,
+            )
+            if status == "published":
+                self.gold_queue.complete(pending.keys)
+            print(
+                f"[gold-reconcile-cycle] status={status} queue_rows={len(pending.keys)} "
+                f"elapsed={perf_counter() - started:.2f}s",
+                flush=True,
+            )
+            return status
 
     def reconcile_gold(
         self,
@@ -252,50 +219,74 @@ class UnifiedSilverMaterializer:
         if defer_if_source_incomplete and not self._source_fact_ready_for_gold(affected_order_ids):
             return "deferred_source_incomplete"
         with self._writer_lock(f"gold-{batch_id}"):
-            try:
-                GoldBuilder(self.spark, self.config).run(batch_id=batch_id)
-            except GoldQualityError as exc:
-                if not rebuild_on_quality_error:
-                    print(
-                        f"[gold-quality-alert] action=skip_publish_keep_streaming error={exc}",
-                        flush=True,
-                    )
-                    if raise_on_quality_error:
-                        raise
-                    return "quality_skipped"
+            return self._run_gold_locked(
+                batch_id=batch_id,
+                raise_on_quality_error=raise_on_quality_error,
+                rebuild_on_quality_error=rebuild_on_quality_error,
+            )
+
+    def _run_gold_locked(
+        self,
+        *,
+        batch_id: str,
+        raise_on_quality_error: bool,
+        rebuild_on_quality_error: bool,
+    ) -> str:
+        try:
+            GoldBuilder(self.spark, self.config).run(batch_id=batch_id)
+        except GoldQualityError as exc:
+            if not rebuild_on_quality_error:
                 print(
-                    f"[gold-quality-alert] action=full_rebuild_after_failed_candidate error={exc}",
+                    f"[gold-quality-alert] action=skip_publish_keep_streaming error={exc}",
                     flush=True,
                 )
-                try:
-                    GoldBuilder(self.spark, self.config).run(
-                        batch_id=f"{batch_id}-rebuild",
-                        full_rebuild=True,
-                    )
-                except GoldQualityError as rebuild_exc:
-                    print(
-                        f"[gold-quality-alert] action=skip_publish_keep_streaming error={rebuild_exc}",
-                        flush=True,
-                    )
-                    if raise_on_quality_error:
-                        raise
-                    return "quality_skipped"
+                if raise_on_quality_error:
+                    raise
+                return "quality_skipped"
+            print(
+                f"[gold-quality-alert] action=full_rebuild_after_failed_candidate error={exc}",
+                flush=True,
+            )
+            try:
+                GoldBuilder(self.spark, self.config).run(
+                    batch_id=f"{batch_id}-rebuild",
+                    full_rebuild=True,
+                )
+            except GoldQualityError as rebuild_exc:
+                print(
+                    f"[gold-quality-alert] action=skip_publish_keep_streaming error={rebuild_exc}",
+                    flush=True,
+                )
+                if raise_on_quality_error:
+                    raise
+                return "quality_skipped"
+            except Exception as rebuild_error:
+                print(
+                    f"[cdc-alert] metric=gold_publish_failure value=1 "
+                    f"error_type={type(rebuild_error).__name__} error={rebuild_error}",
+                    flush=True,
+                )
+                raise
+        except Exception as publish_error:
+            print(
+                f"[cdc-alert] metric=gold_publish_failure value=1 "
+                f"error_type={type(publish_error).__name__} error={publish_error}",
+                flush=True,
+            )
+            raise
         print("[gold-reconcile] status=published source=unified_silver", flush=True)
         return "published"
 
-    def _track_pending_gold_scope(self, transformed: Mapping[str, DataFrame]) -> None:
+    def _gold_scope(self, transformed: Mapping[str, DataFrame]) -> tuple[set[int] | None, bool]:
         order_scoped = {
             table_name: dataframe
             for table_name, dataframe in transformed.items()
             if table_name in _ORDER_SCOPED_GOLD_TABLES
         }
         if not order_scoped:
-            return
+            return set(), False
         affected = self._collect_affected_order_ids(order_scoped)
-        if affected is None:
-            self._pending_gold_requires_full_readiness = True
-            return
-        self._pending_gold_order_ids.update(affected)
+        return affected, True
 
     def _collect_affected_order_ids(self, transformed: Mapping[str, DataFrame]) -> set[int] | None:
         max_order_ids = self.settings.max_gold_readiness_order_ids
@@ -446,7 +437,11 @@ class UnifiedSilverMaterializer:
         *,
         target_exists: bool,
     ) -> None:
-        worker_spark = self.spark.newSession()
+        # ``DataFrame.write`` uses dataframe.sparkSession. For the initial
+        # table creation the commit metadata and idempotent transaction must be
+        # configured on that same session. MERGE targets can safely use an
+        # isolated session and retain table-level parallelism.
+        worker_spark = self.spark if not target_exists else self.spark.newSession()
         lakehouse = LakehouseAdapter(worker_spark, self.config)
         contract = get_silver_contract(table_name)
         metadata: dict[str, object] = {
@@ -484,6 +479,7 @@ class UnifiedSilverMaterializer:
                 sequence_columns=SILVER_SEQUENCE_COLUMNS,
                 target_exists=True,
                 source_is_nonempty=True,
+                preserve_target_on_soft_delete=True,
             )
 
 

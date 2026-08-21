@@ -27,7 +27,7 @@ def test_continuous_query_logs_waiting_when_no_progress(capsys) -> None:
     _await_continuous_query(query, materializer)
 
     assert "[unified-silver-progress] status=waiting_for_raw_bronze input_rows=0" in capsys.readouterr().out
-    materializer.reconcile_pending_gold_if_ready.assert_called_once_with(batch_id="cdc-idle-reconcile")
+    materializer.reconcile_pending_gold_if_ready.assert_not_called()
 
 
 def test_zero_input_progress_is_throttled() -> None:
@@ -37,6 +37,16 @@ def test_zero_input_progress_is_throttled() -> None:
     assert _should_log_progress({"batchId": 9, "numInputRows": 0}) is False
     assert _should_log_progress({"batchId": 10, "numInputRows": 0}) is True
     assert _should_log_progress({"batchId": 11, "numInputRows": 1}) is True
+
+
+def test_continuous_query_reconciles_once_per_completed_progress() -> None:
+    progress = {"runId": "run-1", "batchId": 3, "numInputRows": 1}
+    query = _FakeQuery([progress, progress, progress], terminate_on_call=3)
+    materializer = Mock()
+
+    _await_continuous_query(query, materializer)
+
+    materializer.reconcile_pending_gold_if_ready.assert_called_once_with(batch_id="cdc-idle-reconcile")
 
 
 class _FakeQuery:

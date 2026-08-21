@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import fcntl
 import json
-import os
 import re
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from time import monotonic, sleep
@@ -88,19 +88,24 @@ def local_pipeline_lock(
     lock_path = Path(lock_directory) / "_pipeline.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = monotonic() + wait_timeout_seconds
-    while True:
+    # Keep one stable inode and let the kernel own lock lifecycle. Unlike an
+    # O_EXCL sentinel, flock is released automatically after SIGKILL/SIGHUP or
+    # a crashed JVM, so a stale file cannot block the next pipeline run.
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if monotonic() >= deadline:
+                    owner = lock_path.read_text(encoding="utf-8").strip() or "unknown"
+                    raise RuntimeError(f"Another local pipeline run is active: {owner}") from exc
+                sleep(1)
         try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError as exc:
-            if monotonic() >= deadline:
-                owner = lock_path.read_text(encoding="utf-8").strip() if lock_path.exists() else "unknown"
-                raise RuntimeError(f"Another local pipeline run is active: {owner}") from exc
-            sleep(1)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as lock_file:
+            lock_file.seek(0)
+            lock_file.truncate()
             lock_file.write(batch_id)
-        yield
-    finally:
-        with suppress(FileNotFoundError):
-            lock_path.unlink()
+            lock_file.flush()
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

@@ -165,6 +165,30 @@ def test_delete_event_uses_before_image(spark: SparkSession) -> None:
     assert row["_operation"] == "DELETE"
 
 
+def test_child_delete_without_order_context_is_quarantined(spark: SparkSession) -> None:
+    raw = spark.createDataFrame(
+        [_raw_row({"order_item_id": 9}, table_name="order_items", operation="d")],
+        RAW_SCHEMA,
+    )
+
+    error = cdc_decoder.prepare_raw_cdc_events(raw).select("_decode_error").first()
+
+    assert error is not None
+    assert error["_decode_error"] == "incomplete_delete_before_image"
+
+
+def test_child_delete_with_zero_order_context_is_quarantined(spark: SparkSession) -> None:
+    raw = spark.createDataFrame(
+        [_raw_row({"order_item_id": 9, "order_id": 0}, table_name="order_items", operation="d")],
+        RAW_SCHEMA,
+    )
+
+    error = cdc_decoder.prepare_raw_cdc_events(raw).select("_decode_error").first()
+
+    assert error is not None
+    assert error["_decode_error"] == "incomplete_delete_before_image"
+
+
 def test_schema_drift_is_marked_before_any_target_write(spark: SparkSession) -> None:
     raw = spark.createDataFrame(
         [_raw_row({"order_id": 42, "new_unmapped_column": "value"})],

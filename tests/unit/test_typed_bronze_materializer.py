@@ -41,3 +41,18 @@ def test_append_sets_transaction_on_dataframe_writer_session(
         json.dumps(metadata, separators=(",", ":"), sort_keys=True),
     )
     write_delta.assert_called_once_with(writer, reference)
+
+
+def test_catalog_exists_repairs_dangling_registration_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    materializer = object.__new__(TypedBronzeMaterializer)
+    materializer.spark = Mock()
+    materializer.spark.catalog.tableExists.return_value = False
+    reference = Mock(is_catalog=True, value="catalog.bronze.cdc_typed_orders")
+    repair = Mock()
+    monkeypatch.setattr(
+        "ecommerce_pipeline.ingestion.streaming.typed_bronze.drop_dangling_catalog_registration",
+        repair,
+    )
+
+    assert materializer._exists(reference) is False
+    repair.assert_called_once_with(materializer.spark, reference)

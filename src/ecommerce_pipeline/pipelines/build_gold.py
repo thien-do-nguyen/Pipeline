@@ -17,7 +17,7 @@ from ecommerce_pipeline.adapters.lakehouse import (
 )
 from ecommerce_pipeline.config.models import AppConfig
 from ecommerce_pipeline.contracts.gold_tables import GOLD_TABLES, SCD2_DIMENSIONS
-from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES
+from ecommerce_pipeline.contracts.silver_tables import SILVER_TABLES, get_silver_contract
 from ecommerce_pipeline.control.gold_releases import GoldRelease, GoldReleaseStore
 from ecommerce_pipeline.control.manifests import GoldCandidateManifest, SilverBatchManifest
 from ecommerce_pipeline.pipelines.quality import GoldQualityChecker
@@ -79,6 +79,7 @@ class GoldBuilder:
                 self._publish(current_versions, batch_id, changed_gold_tables, previous_release)
             return self._paths()
 
+        current_versions = self._refresh_stale_propagated_versions(previous_versions, current_versions)
         self._validate_progress(previous_versions, current_versions)
         changed_tables = {name for name, version in current_versions.items() if version > previous_versions[name]}
         if not changed_tables:
@@ -90,6 +91,12 @@ class GoldBuilder:
             name: self._read_changes(name, previous_versions[name] + 1, current_versions[name])
             for name in changed_tables
         }
+        changes = self._substantive_changes(changes)
+        if not changes:
+            with self._timed("gold.publish"):
+                self._publish(current_versions, batch_id, frozenset(), previous_release)
+            print("[gold] incremental=skipped reason=metadata_only_silver_changes", flush=True)
+            return self._paths()
         owned_cache = [dataframe for dataframe in changes.values() if not dataframe.is_cached]
         for dataframe in owned_cache:
             dataframe.cache()
@@ -102,6 +109,49 @@ class GoldBuilder:
             for dataframe in owned_cache:
                 dataframe.unpersist()
         return self._paths()
+
+    def _substantive_changes(self, changes: dict[str, DataFrame]) -> dict[str, DataFrame]:
+        """Discard Silver CDF ranges that only advance ingestion metadata.
+
+        Batch and CDC can observe the same source event. Silver must still keep
+        the newest sequencing metadata so a delayed event cannot win later, but
+        Gold does not need to rebuild when the business projection is identical.
+        All table markers are evaluated in one Spark action.
+        """
+
+        markers: list[DataFrame] = []
+        for table_name, dataframe in changes.items():
+            contract = get_silver_contract(table_name)
+            business_columns = [*contract.columns, "_is_deleted"]
+            missing = sorted({*contract.primary_keys, *business_columns, "_change_type"} - set(dataframe.columns))
+            if missing:
+                raise ValueError(f"Silver CDF is missing columns for {table_name}: {missing}")
+            business_hash = F.sha2(
+                F.to_json(
+                    F.struct(*(F.col(name) for name in business_columns)),
+                    {"ignoreNullFields": "false"},
+                ),
+                256,
+            )
+            hashed = dataframe.withColumn("_gold_business_hash", business_hash)
+            direct_change = hashed.where(F.col("_change_type").isin("insert", "delete")).select(
+                F.lit(table_name).alias("table_name")
+            )
+            changed_update = (
+                hashed.groupBy(*contract.primary_keys)
+                .agg(F.countDistinct("_gold_business_hash").alias("business_versions"))
+                .where(F.col("business_versions") > 1)
+                .select(F.lit(table_name).alias("table_name"))
+            )
+            markers.append(direct_change.limit(1).unionByName(changed_update.limit(1)))
+
+        if not markers:
+            return {}
+        combined = markers[0]
+        for marker in markers[1:]:
+            combined = combined.unionByName(marker)
+        substantive = {row["table_name"] for row in combined.distinct().collect()}
+        return {name: dataframe for name, dataframe in changes.items() if name in substantive}
 
     def _run_full(self, *, replace: bool = False) -> frozenset[str]:
         tables = self._read_sources()
@@ -507,6 +557,29 @@ class GoldBuilder:
         workers = max(1, min(len(table_names), self.config.spark.max_parallel_tables))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             return dict(executor.map(read_version, table_names))
+
+    def _refresh_stale_propagated_versions(
+        self,
+        previous: dict[str, int],
+        propagated: dict[str, int],
+    ) -> dict[str, int]:
+        """Rebase a Gold stage superseded between the Silver and Gold locks.
+
+        A propagated manifest is normally the fast path. If the active Gold
+        release is already ahead of it, another writer committed Silver and
+        Gold after this run released its Silver lock. Re-read live Silver
+        progress while holding the Gold lock so mixed-table changes are not
+        lost and the stale run can complete idempotently.
+        """
+
+        if self.silver_manifest is None or set(previous) != set(propagated):
+            return propagated
+        if not any(previous[name] > propagated[name] for name in propagated):
+            return propagated
+        with self._timed("gold.metadata.silver_versions_refresh"):
+            refreshed = self._silver_versions()
+        print("[gold] progress=refreshed reason=stale_propagated_silver_manifest", flush=True)
+        return refreshed
 
     @staticmethod
     def _validate_progress(previous: dict[str, int], current: dict[str, int]) -> None:

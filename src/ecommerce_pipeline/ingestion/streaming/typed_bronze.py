@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from delta.tables import DeltaTable
@@ -9,12 +10,14 @@ from pyspark.sql import functions as F
 from pyspark.storagelevel import StorageLevel
 
 from ecommerce_pipeline.adapters.lakehouse import (
+    drop_dangling_catalog_registration,
     read_delta,
     write_delta,
 )
 from ecommerce_pipeline.config.models import AppConfig, TableReference
 from ecommerce_pipeline.contracts.cdc_tables import TYPED_CDC_TABLES, get_typed_cdc_contract
 from ecommerce_pipeline.ingestion.streaming.cdc_decoder import decode_table_events, table_statistics
+from ecommerce_pipeline.runtime.shutdown import unpersist_safely
 
 TYPED_BRONZE_PIPELINE_NAME = "cdc_to_typed_bronze"
 QUARANTINE_TABLE_NAME = "quarantine"
@@ -41,7 +44,9 @@ class TypedBronzeMaterializer:
         quarantined_count = self._write_quarantine(prepared, batch_id)
         statistics = table_statistics(prepared)
 
-        for table_name in statistics:
+        changed_tables = tuple(table_name for table_name in TYPED_CDC_TABLES if table_name in statistics)
+
+        def append_table(table_name: str) -> None:
             valid = prepared.where((F.col("source_table") == table_name) & F.col("_decode_error").isNull())
             typed = decode_table_events(
                 valid,
@@ -54,13 +59,17 @@ class TypedBronzeMaterializer:
             )
             self._append_typed(typed, table_name, batch_id, statistics[table_name])
 
+        workers = max(1, min(len(changed_tables), self.config.spark.max_parallel_tables))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(append_table, changed_tables))
+
         batch_key = f"{self.settings.query_name}:{self.settings.checkpoint_version}:{batch_id}"
         tables = {
             table_name: read_delta(
                 self.spark,
                 self.config.lakehouse.streaming_typed_bronze_reference(table_name),
             ).where(F.col("_batch_id") == batch_key)
-            for table_name in statistics
+            for table_name in changed_tables
         }
         return MaterializedTypedBatch(tables, statistics, quarantined_count)
 
@@ -120,7 +129,7 @@ class TypedBronzeMaterializer:
             )
             return count
         finally:
-            rows.unpersist()
+            unpersist_safely(rows, label="typed-bronze-quarantine")
 
     def _quarantine_rows(self, prepared: DataFrame, batch_id: int) -> DataFrame:
         raw_columns = [
@@ -183,6 +192,7 @@ class TypedBronzeMaterializer:
 
     def _exists(self, reference: TableReference) -> bool:
         if reference.is_catalog:
+            drop_dangling_catalog_registration(self.spark, reference)
             return self.spark.catalog.tableExists(reference.value)
         return DeltaTable.isDeltaTable(self.spark, reference.value)
 

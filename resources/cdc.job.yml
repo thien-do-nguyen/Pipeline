@@ -6,16 +6,19 @@ resources:
       run_as:
         user_name: ${var.run_principal}
 
-      # Kept paused by default so destroying Event Hubs cannot accidentally
-      # start the shared cluster. Trigger manually or enable the schedule only
-      # while the ephemeral CDC infrastructure exists.
-      schedule:
-        quartz_cron_expression: "0 0/2 * * * ?"
-        timezone_id: Asia/Ho_Chi_Minh
+      parameters:
+        - name: validation_mode
+          default: runtime
+        - name: execution_mode
+          default: continuous
+
+      # An always-on Structured Streaming workload avoids repeated job/library
+      # startup. Keep it paused until ephemeral Event Hubs and ACI are healthy.
+      continuous:
         pause_status: PAUSED
 
       tasks:
-        - task_key: process_cdc_available_now
+        - task_key: process_cdc
           existing_cluster_id: 0804-071458-pswonf6z
           python_wheel_task:
             package_name: ecommerce_pipeline
@@ -47,5 +50,9 @@ resources:
               - ${resources.schemas.gold.name}
               - --external-storage-root
               - ${resources.external_locations.pipeline.url}
+              - --validation-mode
+              - "{{job.parameters.validation_mode}}"
+              - --execution-mode
+              - "{{job.parameters.execution_mode}}"
           libraries:
             - whl: ../dist/*.whl

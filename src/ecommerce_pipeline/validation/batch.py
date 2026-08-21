@@ -38,25 +38,33 @@ class BatchValidationReport:
 def validate_gold_release(
     spark: SparkSession,
     config: AppConfig,
-    silver_manifest: SilverBatchManifest,
+    silver_manifest: SilverBatchManifest | None = None,
 ) -> dict[str, object]:
     """Verify the atomic Gold marker without repeating the full data-quality scan."""
 
-    expected_versions = silver_manifest.committed_versions
-    if set(expected_versions) != set(SILVER_TABLES):
-        raise ValueError("Silver manifest does not contain every contracted table")
     release = GoldReleaseStore(spark, config).latest()
     if release is None:
         raise RuntimeError("Gold has no published release")
-    if release.silver_versions != expected_versions:
-        raise ValueError(
-            "Gold progress is not aligned with the orchestrated Silver output: "
-            f"published={release.silver_versions}, expected={expected_versions}"
-        )
+    if set(release.silver_versions) != set(SILVER_TABLES):
+        raise ValueError("Gold release does not contain every contracted Silver table")
+    expected_versions = release.silver_versions
+    if silver_manifest is not None:
+        expected_versions = silver_manifest.committed_versions
+    if set(expected_versions) != set(SILVER_TABLES):
+        raise ValueError("Silver manifest does not contain every contracted table")
+    lagging = {
+        name: {"published": release.silver_versions[name], "expected": expected_versions[name]}
+        for name in expected_versions
+        if release.silver_versions[name] < expected_versions[name]
+    }
+    if lagging:
+        raise ValueError(f"Gold progress is behind the orchestrated Silver output: lagging={lagging}")
     return {
         "batch_id": release.batch_id,
         "silver_table_count": len(release.silver_versions),
         "gold_table_count": len(release.gold_versions),
+        "superseded": release.silver_versions != expected_versions,
+        "validation_source": "gold_release" if silver_manifest is None else "silver_manifest",
     }
 
 

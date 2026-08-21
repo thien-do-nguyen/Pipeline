@@ -298,7 +298,7 @@ class LakehouseAdapter:
     ) -> None:
         reference = self.config.lakehouse.table_reference(layer, table_name)
         if reference.is_catalog:
-            _drop_dangling_catalog_registration(self.spark, reference)
+            drop_dangling_catalog_registration(self.spark, reference)
         writer = df.write.format("delta").mode("overwrite").option("overwriteSchema", "true")
         if enable_change_data_feed:
             writer = writer.option("delta.enableChangeDataFeed", "true")
@@ -317,6 +317,7 @@ class LakehouseAdapter:
         sequence_columns: Sequence[str] = (),
         target_exists: bool | None = None,
         source_is_nonempty: bool = False,
+        preserve_target_on_soft_delete: bool = False,
     ) -> bool:
         if not merge_keys:
             raise ValueError("merge_keys must not be empty")
@@ -334,6 +335,9 @@ class LakehouseAdapter:
 
         source_columns = set(df.columns)
         uses_operation_delete = delete_mode == "hard" and "_operation" in source_columns
+        preserves_soft_delete = (
+            preserve_target_on_soft_delete and delete_mode == "soft" and "_is_deleted" in source_columns
+        )
 
         exists = self.table_exists(layer, table_name) if target_exists is None else target_exists
         if not exists:
@@ -377,7 +381,18 @@ class LakehouseAdapter:
             if delete_condition is not None:
                 matched_delete = delete_condition if newer is None else f"({newer}) AND ({delete_condition})"
                 merge = merge.whenMatchedDelete(condition=matched_delete)
+            if preserves_soft_delete:
+                soft_delete = "source.`_is_deleted` = true"
+                if newer is not None:
+                    soft_delete = f"({newer}) AND ({soft_delete})"
+                metadata_updates: dict[str, str | Column] = {
+                    name: f"source.`{name}`" for name in update_columns if name.startswith("_")
+                }
+                merge = merge.whenMatchedUpdate(condition=soft_delete, set=metadata_updates)
             not_delete = None if delete_condition is None else f"NOT ({delete_condition})"
+            if preserves_soft_delete:
+                active_source = "NOT coalesce(source.`_is_deleted`, false)"
+                not_delete = active_source if not_delete is None else f"({not_delete}) AND ({active_source})"
             if compared:
                 equality = " AND ".join(f"target.`{name}` <=> source.`{name}`" for name in compared)
                 update_condition = f"NOT ({equality})"
@@ -472,7 +487,7 @@ def _delta_table(spark: SparkSession, reference: TableReference | str) -> DeltaT
     return DeltaTable.forPath(spark, resolved.value)
 
 
-def _drop_dangling_catalog_registration(spark: SparkSession, reference: TableReference) -> None:
+def drop_dangling_catalog_registration(spark: SparkSession, reference: TableReference) -> None:
     """Remove only a catalog entry whose external Delta storage no longer exists."""
 
     try:

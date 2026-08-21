@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter
 
@@ -8,7 +9,7 @@ from pyspark.sql import DataFrame, SparkSession
 from ecommerce_pipeline.adapters.lakehouse import (
     LakehouseAdapter,
     delta_commit_metadata,
-    delta_idempotent_transaction,
+    drop_dangling_catalog_registration,
     latest_delta_pipeline_commit,
     read_delta,
     try_delta_table_state,
@@ -105,6 +106,19 @@ class SilverBuilder:
                 contract,
                 version,
             )
+
+        # CDC may bootstrap Unified Silver before the first Batch execution.
+        # Establish Batch progress with a sequence-guarded MERGE; replacing the
+        # table here could discard a newer CDC event that arrived after the
+        # Batch snapshot was extracted.
+        if silver_state.progress is None:
+            self._merge_snapshot_into_unified(contract, current_bronze_version, batch_id)
+            committed = latest_delta_pipeline_commit(
+                self.spark,
+                silver_reference,
+                pipelines=SILVER_DATA_PIPELINES,
+            )
+            return self._result(contract, committed.version)
 
         previous_bronze_version = self._processed_version(table_name, silver_state.progress)
         if previous_bronze_version is None:
@@ -278,6 +292,56 @@ class SilverBuilder:
             if owns_source_cache:
                 shared_source.unpersist()
 
+    def _merge_snapshot_into_unified(
+        self,
+        contract: SilverTableContract,
+        bronze_version: int,
+        batch_id: str,
+    ) -> None:
+        """Initialize Batch progress without replacing CDC-owned Silver state."""
+
+        source = self.read_snapshot(contract.table_name)
+        owns_source_cache = contract.materialize_change_history and not source.is_cached
+        shared_source = source.cache() if owns_source_cache else source
+        try:
+            if contract.materialize_change_history:
+                history_started = perf_counter()
+                self.append_change_history(
+                    contract,
+                    self.transform_history(contract, shared_source),
+                    batch_id=batch_id,
+                    bronze_version=bronze_version,
+                    bronze_starting_version=None,
+                    transaction_version=bronze_version,
+                )
+                self._record_timing(f"silver.history.{contract.table_name}", history_started)
+
+            merge_started = perf_counter()
+            snapshot = self.transform(contract, shared_source)
+            with delta_commit_metadata(
+                self.spark,
+                self._progress_metadata(
+                    contract.table_name,
+                    bronze_version,
+                    batch_id,
+                    bronze_starting_version=None,
+                ),
+            ):
+                self.lakehouse.upsert_table(
+                    snapshot,
+                    "silver",
+                    contract.table_name,
+                    contract.primary_keys,
+                    delete_mode="soft",
+                    sequence_columns=SILVER_SEQUENCE_COLUMNS,
+                    target_exists=True,
+                    source_is_nonempty=True,
+                )
+            self._record_timing(f"silver.merge.{contract.table_name}", merge_started)
+        finally:
+            if owns_source_cache:
+                shared_source.unpersist()
+
     def append_change_history(
         self,
         contract: SilverTableContract,
@@ -294,6 +358,8 @@ class SilverBuilder:
 
         table_name = silver_change_history_table_name(contract.table_name)
         reference = self.config.lakehouse.table_reference("silver", table_name)
+        if reference.is_catalog:
+            drop_dangling_catalog_registration(self.spark, reference)
         metadata = self._history_progress_metadata(
             contract.table_name,
             bronze_version,
@@ -301,21 +367,17 @@ class SilverBuilder:
             bronze_starting_version=bronze_starting_version,
             pipeline_name=pipeline_name,
         )
-        with (
-            delta_commit_metadata(self.spark, metadata),
-            delta_idempotent_transaction(
-                self.spark,
-                application_id=transaction_app_id or f"{pipeline_name}:{contract.table_name}:v{SILVER_SCHEMA_VERSION}",
-                transaction_version=transaction_version,
-            ),
-        ):
-            writer = (
-                history.write.format("delta")
-                .mode("append")
-                .option("mergeSchema", "true")
-                .option("delta.enableChangeDataFeed", "true")
-            )
-            write_delta(writer, reference)
+        application_id = transaction_app_id or (f"{pipeline_name}:{contract.table_name}:v{SILVER_SCHEMA_VERSION}")
+        writer = (
+            history.write.format("delta")
+            .mode("append")
+            .option("mergeSchema", "true")
+            .option("delta.enableChangeDataFeed", "true")
+            .option("txnAppId", application_id)
+            .option("txnVersion", transaction_version)
+            .option("userMetadata", json.dumps(metadata, separators=(",", ":"), sort_keys=True))
+        )
+        write_delta(writer, reference)
         return True
 
     @staticmethod

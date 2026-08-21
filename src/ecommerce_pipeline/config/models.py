@@ -157,10 +157,8 @@ class UnifiedSilverStreamingConfig(FrozenConfigModel):
     trigger_interval: str = Field(default="1 minute", min_length=1)
     max_files_per_trigger: int = Field(default=8, ge=1, le=10_000)
     max_bytes_per_trigger: str = Field(default="32m", pattern=r"^[1-9][0-9]*[kKmMgG]$")
-    reconcile_gold_each_batch: bool = False
     max_gold_readiness_order_ids: int = Field(default=5_000, ge=1, le=1_000_000)
-    gold_deferred_retry_seconds: int = Field(default=0, ge=0, le=600)
-    gold_deferred_retry_interval_seconds: float = Field(default=2.0, gt=0, le=60)
+    gold_reconcile_interval_seconds: float = Field(default=10.0, gt=0, le=300)
 
 
 class PipelineCoordinationConfig(FrozenConfigModel):
