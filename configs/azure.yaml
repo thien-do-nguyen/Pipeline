@@ -12,7 +12,7 @@ spark:
 
 streaming:
   enabled: true
-  trigger_interval: 30 seconds
+  trigger_interval: 5 seconds
   checkpoint_version: v1
   checkpoint_root: "${DATABRICKS_EXTERNAL_STORAGE_ROOT}/_checkpoints/cdc/not-configured"
   kafka:
@@ -34,12 +34,12 @@ streaming:
     # Stable across Event Hubs destroy/apply because the Delta Raw Bronze source
     # is persistent and must not be replayed from version zero each epoch.
     checkpoint_root: "${DATABRICKS_EXTERNAL_STORAGE_ROOT}/_checkpoints/cdc-downstream"
-    trigger_interval: 30 seconds
-    checkpoint_version: v1
+    trigger_interval: 5 seconds
+    # v2 replays durable Raw Bronze once after fixing bootstrap commit metadata.
+    checkpoint_version: v2
     max_files_per_trigger: 8
     max_bytes_per_trigger: 64m
-    reconcile_gold_each_batch: true
-    gold_deferred_retry_seconds: 30
+    gold_reconcile_interval_seconds: 5
 
 lakehouse:
   catalog: "${DATABRICKS_CATALOG}"

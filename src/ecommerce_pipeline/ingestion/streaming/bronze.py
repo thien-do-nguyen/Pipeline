@@ -3,6 +3,7 @@ from pyspark.sql.streaming.query import StreamingQuery
 
 from ecommerce_pipeline.adapters.lakehouse import (
     delta_table_properties,
+    drop_dangling_catalog_registration,
     set_delta_table_property,
     write_delta,
 )
@@ -41,6 +42,8 @@ def ensure_bronze_target(df: DataFrame, reference: TableReference) -> None:
     """Create the Delta target once and keep CDF enabled for downstream consumers."""
 
     spark = df.sparkSession
+    if reference.is_catalog:
+        drop_dangling_catalog_registration(spark, reference)
     exists = spark.catalog.tableExists(reference.value) if reference.is_catalog else _is_delta_path(df, reference)
     if not exists:
         empty = spark.createDataFrame([], df.schema)

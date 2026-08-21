@@ -232,6 +232,7 @@ def test_cdc_streaming_updates_unified_silver_and_gold_idempotently(tmp_path: Pa
 
         materializer.process_batch(raw_cdc, batch_id=7001)
         materializer.process_batch(raw_cdc, batch_id=7001)
+        assert materializer.reconcile_pending_gold_if_ready(batch_id="cdc-stream-7001") == "published"
 
         lakehouse = LakehouseAdapter(spark, test_config)
         silver_rows = (
@@ -327,7 +328,7 @@ def test_shared_writer_lock_serializes_batch_and_cdc_and_converges(
         monkeypatch.setattr(unified_silver_module, "cloud_pipeline_lock", lock_observer.lock)
         start_writers = Barrier(2)
         batch_args = Namespace(
-            mode="all",
+            mode="workflow",
             tables=None,
             full_rebuild_silver=False,
             full_rebuild_gold=False,
@@ -345,7 +346,9 @@ def test_shared_writer_lock_serializes_batch_and_cdc_and_converges(
 
         def run_cdc() -> None:
             start_writers.wait(timeout=60)
-            UnifiedSilverMaterializer(spark, shared_writer_config).process_batch(raw_cdc, batch_id=9001)
+            materializer = UnifiedSilverMaterializer(spark, shared_writer_config)
+            materializer.process_batch(raw_cdc, batch_id=9001)
+            assert materializer.reconcile_pending_gold_if_ready(batch_id="cdc-stream-9001") == "published"
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             batch_future = executor.submit(run_batch)
@@ -556,9 +559,25 @@ def _update_source_customer_for_batch(config: AppConfig) -> tuple[int, datetime,
         row = cursor.fetchone()
         if row is None:
             raise RuntimeError("E2E source does not contain a customer")
+        cursor.execute(
+            """
+            SELECT occurred_at
+            FROM customer_app.change_events
+            WHERE source_table = 'app_users'
+              AND (row_data ->> 'user_id')::int = %s
+            ORDER BY event_id DESC
+            LIMIT 1
+            """,
+            (row["user_id"],),
+        )
+        event_row = cursor.fetchone()
+        if event_row is None:
+            raise RuntimeError("E2E source update did not create a change event")
         connection.commit()
     typed_row = cast(dict[str, object], row)
-    return cast(int, typed_row["user_id"]), changed_at, typed_row
+    event_at = cast(datetime, event_row["occurred_at"])
+    event_at = event_at.astimezone(ZoneInfo(config.application.timezone)).replace(tzinfo=None)
+    return cast(int, typed_row["user_id"]), event_at, typed_row
 
 
 def _customer_cdc_event(payload: dict[str, object], occurred_at: datetime) -> Row:

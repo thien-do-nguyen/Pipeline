@@ -29,6 +29,12 @@ _REQUIRED_RAW_COLUMNS = {
     "parse_error",
     "ingested_at",
 }
+_DELETE_CONTEXT_COLUMNS: dict[str, tuple[str, ...]] = {
+    "order_items": ("order_id",),
+    "order_vouchers": ("order_id",),
+    "payments": ("order_id",),
+    "shipments": ("order_id",),
+}
 
 
 def read_raw_bronze_stream(
@@ -156,6 +162,12 @@ def _decode_error() -> Column:
             (
                 F.when(scope & missing_key, F.lit("missing_or_invalid_primary_key")),
                 F.when(
+                    scope
+                    & (F.col("operation") == DebeziumOperation.DELETE.value)
+                    & _missing_payload_field(_DELETE_CONTEXT_COLUMNS.get(table_name, ())),
+                    F.lit("incomplete_delete_before_image"),
+                ),
+                F.when(
                     scope & (F.size(unexpected) > 0),
                     F.concat(F.lit("unexpected_payload_fields:"), F.array_join(unexpected, ",")),
                 ),
@@ -166,6 +178,16 @@ def _decode_error() -> Column:
             cast_failed = raw.isNotNull() & _typed_payload_value(field.name, field.dataType, "UTC").isNull()
             errors.append(F.when(scope & cast_failed, F.lit(f"invalid_field_type:{field.name}")))
     return F.coalesce(*errors)
+
+
+def _missing_payload_field(columns: tuple[str, ...]) -> Column:
+    missing = F.lit(False)
+    for column in columns:
+        # Child order relationships are positive bigint identifiers. Missing,
+        # null, non-numeric and sentinel zero values cannot drive Gold readiness.
+        value = F.element_at(F.col("_payload_map"), F.lit(column)).cast("long")
+        missing = missing | value.isNull() | (value <= 0)
+    return missing
 
 
 def _typed_payload_value(column: str, data_type: DataType, timezone: str) -> Column:

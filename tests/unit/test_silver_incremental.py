@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -129,6 +130,34 @@ def test_silver_reuses_scd2_source_for_history_and_current_merge(monkeypatch: py
     changes.unpersist.assert_called_once_with()
 
 
+def test_change_history_sets_idempotency_on_each_writer_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _service("app_users")
+    history = Mock()
+    writer = history.write.format.return_value
+    writer.mode.return_value = writer
+    writer.option.return_value = writer
+    write_delta = Mock()
+    monkeypatch.setattr(silver_module, "write_delta", write_delta)
+
+    service.append_change_history(
+        silver_module.get_silver_contract("app_users"),
+        history,
+        batch_id="cdc-stream-7",
+        bronze_version=7,
+        bronze_starting_version=None,
+        transaction_version=7,
+        transaction_app_id="cdc-history-app-users",
+    )
+
+    options = dict(call.args for call in writer.option.call_args_list)
+    assert options["txnAppId"] == "cdc-history-app-users"
+    assert options["txnVersion"] == 7
+    metadata = json.loads(options["userMetadata"])
+    assert metadata["pipeline"] == silver_module.SILVER_CHANGE_HISTORY_PIPELINE_NAME
+    assert metadata["last_processed_bronze_version"] == 7
+    write_delta.assert_called_once()
+
+
 def test_silver_skips_transform_when_delta_version_is_current(monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service()
     service.transform = Mock()
@@ -143,12 +172,25 @@ def test_silver_skips_transform_when_delta_version_is_current(monkeypatch: pytes
     service.lakehouse.upsert_table.assert_not_called()
 
 
-def test_silver_rejects_existing_table_without_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_silver_bootstraps_batch_progress_without_replacing_cdc_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service = _service()
     service._replace_from_snapshot = Mock()
+    service._merge_snapshot_into_unified = Mock()
     _mock_progress(monkeypatch, silver_version=None)
+    monkeypatch.setattr(
+        silver_module,
+        "latest_delta_pipeline_commit",
+        Mock(return_value=SimpleNamespace(version=26)),
+    )
 
-    with pytest.raises(RuntimeError, match="Silver progress metadata is missing"):
-        service.run_table("orders", batch_id="batch-2")
+    result = service.run_table("orders", batch_id="batch-2")
 
     service._replace_from_snapshot.assert_not_called()
+    service._merge_snapshot_into_unified.assert_called_once_with(
+        silver_module.get_silver_contract("orders"),
+        25,
+        "batch-2",
+    )
+    assert result.committed_version == 26

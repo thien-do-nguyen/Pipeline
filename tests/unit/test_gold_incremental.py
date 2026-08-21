@@ -18,6 +18,7 @@ def _builder() -> GoldBuilder:
     builder._paths = Mock(return_value=["gold/fact_sales"])
     builder._run_full = Mock(return_value=frozenset(GOLD_TABLES))
     builder._run_incremental = Mock(return_value=frozenset({"fact_sales"}))
+    builder._substantive_changes = Mock(side_effect=lambda changes: changes)
     builder._publish = Mock()
     builder._validate_progress = Mock()
     builder._validate_scd2_schemas = Mock()
@@ -69,6 +70,56 @@ def test_gold_uses_propagated_silver_versions_without_scanning_delta_metadata() 
     builder._silver_versions.assert_not_called()
 
 
+def test_gold_refreshes_a_propagated_manifest_superseded_by_another_writer() -> None:
+    builder = _builder()
+    propagated = {name: 1 for name in gold_module.SILVER_TABLES}
+    published = dict(propagated)
+    published["app_users"] = 2
+    builder.silver_manifest = SilverBatchManifest(
+        tables={
+            name: SilverTableResult(name, committed_version=version, schema_version=2)
+            for name, version in propagated.items()
+        }
+    )
+    builder._silver_versions = Mock(return_value=published)
+    builder.releases.latest.return_value = _release(published)
+
+    assert builder.run(batch_id="stale-batch") == ["gold/fact_sales"]
+
+    builder._silver_versions.assert_called_once_with()
+    builder._run_incremental.assert_not_called()
+    builder._publish.assert_not_called()
+
+
+def test_gold_rebases_mixed_progress_onto_live_silver_versions() -> None:
+    builder = _builder()
+    propagated = {name: 2 for name in gold_module.SILVER_TABLES}
+    previous = dict(propagated)
+    previous["app_users"] = 3
+    previous["orders"] = 1
+    live = dict(propagated)
+    live["app_users"] = 3
+    live["orders"] = 3
+    builder.silver_manifest = SilverBatchManifest(
+        tables={
+            name: SilverTableResult(name, committed_version=version, schema_version=2)
+            for name, version in propagated.items()
+        }
+    )
+    builder._silver_versions = Mock(return_value=live)
+    builder.releases.latest.return_value = _release(previous)
+
+    builder.run(batch_id="mixed-progress")
+
+    builder._read_changes.assert_called_once_with("orders", 2, 3)
+    builder._publish.assert_called_once_with(
+        live,
+        "mixed-progress",
+        frozenset({"fact_sales"}),
+        builder.releases.latest.return_value,
+    )
+
+
 def test_gold_reads_only_changed_silver_version_ranges() -> None:
     builder = _builder()
     current = {"orders": 8, "payments": 4}
@@ -87,6 +138,66 @@ def test_gold_reads_only_changed_silver_version_ranges() -> None:
         frozenset({"fact_sales"}),
         builder.releases.latest.return_value,
     )
+
+
+def test_gold_publishes_progress_without_compute_for_metadata_only_changes() -> None:
+    builder = _builder()
+    current = {"orders": 8, "payments": 4}
+    previous = _release({"orders": 8, "payments": 3})
+    builder._silver_versions = Mock(return_value=current)
+    builder.releases.latest.return_value = previous
+    builder._substantive_changes.side_effect = None
+    builder._substantive_changes.return_value = {}
+
+    assert builder.run(batch_id="metadata-only") == ["gold/fact_sales"]
+
+    builder._run_incremental.assert_not_called()
+    builder._publish.assert_called_once_with(current, "metadata-only", frozenset(), previous)
+
+
+def test_substantive_changes_ignores_sequence_metadata_only_update(spark: SparkSession) -> None:
+    builder = object.__new__(GoldBuilder)
+    before = (
+        42,
+        "pending",
+        False,
+        "update_preimage",
+        "batch",
+    )
+    after = (
+        42,
+        "pending",
+        False,
+        "update_postimage",
+        "cdc",
+    )
+    changes = spark.createDataFrame(
+        [before, after],
+        "order_id int, order_status string, _is_deleted boolean, _change_type string, _ingestion_mode string",
+    )
+    contract = gold_module.get_silver_contract("orders")
+    for column in contract.columns:
+        if column not in changes.columns:
+            changes = changes.withColumn(column, gold_module.F.lit(None))
+
+    assert builder._substantive_changes({"orders": changes}) == {}
+
+
+def test_substantive_changes_keeps_business_update(spark: SparkSession) -> None:
+    builder = object.__new__(GoldBuilder)
+    changes = spark.createDataFrame(
+        [
+            (42, "pending", False, "update_preimage"),
+            (42, "paid", False, "update_postimage"),
+        ],
+        "order_id int, order_status string, _is_deleted boolean, _change_type string",
+    )
+    contract = gold_module.get_silver_contract("orders")
+    for column in contract.columns:
+        if column not in changes.columns:
+            changes = changes.withColumn(column, gold_module.F.lit(None))
+
+    assert set(builder._substantive_changes({"orders": changes})) == {"orders"}
 
 
 def test_gold_full_builds_once_when_delta_progress_is_missing() -> None:

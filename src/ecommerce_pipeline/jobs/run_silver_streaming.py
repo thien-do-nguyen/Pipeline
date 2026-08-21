@@ -17,9 +17,10 @@ from ecommerce_pipeline.ingestion.streaming.unified_silver import (
     UnifiedSilverMaterializer,
     start_unified_silver_stream,
 )
+from ecommerce_pipeline.runtime.shutdown import log_runtime_failure, stop_spark_safely, stop_streaming_query_safely
 from ecommerce_pipeline.runtime.spark import build_spark
+from ecommerce_pipeline.runtime.streaming_progress import summarize_streaming_progress
 
-PROGRESS_LOG_INTERVAL_SECONDS = 10
 NO_INPUT_PROGRESS_LOG_EVERY_BATCHES = 10
 
 
@@ -35,7 +36,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def run(spark: SparkSession, config: AppConfig, *, available_now: bool) -> None:
+def start_query(
+    spark: SparkSession,
+    config: AppConfig,
+    *,
+    available_now: bool,
+) -> tuple[StreamingQuery, UnifiedSilverMaterializer]:
     settings = config.streaming.silver
     if not settings.enabled:
         raise RuntimeError(f"Streaming Silver is not enabled for environment: {config.environment}")
@@ -62,30 +68,62 @@ def run(spark: SparkSession, config: AppConfig, *, available_now: bool) -> None:
     )
     print(
         f"[unified-silver] query={settings.query_name} source={raw_reference.value} "
-        f"targets=bronze/streaming/<typed-table>,silver gold_each_batch={settings.reconcile_gold_each_batch} "
+        "targets=bronze/streaming/<typed-table>,silver gold_mode=durable_queue "
         f"checkpoint={config.streaming.silver_checkpoint_location}",
         flush=True,
     )
-    if available_now:
-        query.awaitTermination()
-        materializer.reconcile_gold()
-        return
-    _await_continuous_query(query, materializer)
+    return query, materializer
 
 
-def _await_continuous_query(query: StreamingQuery, materializer: UnifiedSilverMaterializer) -> None:
+def run(spark: SparkSession, config: AppConfig, *, available_now: bool) -> dict[str, int | float] | None:
+    query, materializer = start_query(spark, config, available_now=available_now)
+    try:
+        if available_now:
+            query.awaitTermination()
+            materializer.reconcile_pending_gold_if_ready(batch_id="cdc-available-now-reconcile")
+            return summarize_streaming_progress(query)
+        _await_continuous_query(
+            query,
+            materializer,
+            reconcile_interval_seconds=config.streaming.silver.gold_reconcile_interval_seconds,
+        )
+        return None
+    except KeyboardInterrupt:
+        print("[unified-silver] status=stopping reason=keyboard_interrupt", flush=True)
+    except Exception as exc:
+        log_runtime_failure("unified-silver", exc)
+        raise
+    finally:
+        stop_streaming_query_safely(query, label="unified-silver")
+    return None
+
+
+def _await_continuous_query(
+    query: StreamingQuery,
+    materializer: UnifiedSilverMaterializer,
+    *,
+    reconcile_interval_seconds: float = 10,
+) -> None:
     last_progress_key: tuple[object, object] | None = None
+    last_reconciled_progress_key: tuple[object, object] | None = None
+    waiting_logged = False
     while query.isActive:
-        terminated = query.awaitTermination(PROGRESS_LOG_INTERVAL_SECONDS)
+        terminated = query.awaitTermination(max(1, round(reconcile_interval_seconds)))
         progress = query.lastProgress
+        reconcile = False
         if progress is not None:
             progress_key = (progress.get("runId"), progress.get("batchId"))
             if progress_key != last_progress_key and _should_log_progress(progress):
                 last_progress_key = progress_key
                 print(_format_progress(progress), flush=True)
+            if progress_key != last_reconciled_progress_key:
+                last_reconciled_progress_key = progress_key
+                reconcile = True
         elif not terminated:
-            print("[unified-silver-progress] status=waiting_for_raw_bronze input_rows=0", flush=True)
-        if not terminated:
+            if not waiting_logged:
+                print("[unified-silver-progress] status=waiting_for_raw_bronze input_rows=0", flush=True)
+                waiting_logged = True
+        if not terminated and reconcile:
             materializer.reconcile_pending_gold_if_ready(batch_id="cdc-idle-reconcile")
         if terminated:
             return
@@ -123,7 +161,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         run(spark, config, available_now=args.available_now)
     finally:
         if spark is not None and config.spark.stop_session:
-            spark.stop()
+            stop_spark_safely(spark, label="unified-silver")
 
 
 if __name__ == "__main__":

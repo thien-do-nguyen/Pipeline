@@ -35,4 +35,5 @@ COPY --chown=airflow:root src ./src
 # Keep Airflow pinned while installing the local Spark/Delta runtime.
 RUN pip install --no-cache-dir \
     "apache-airflow==${AIRFLOW_VERSION}" \
+    "apache-airflow-providers-databricks==7.18.0" \
     ".[local]"

@@ -6,9 +6,6 @@ from pyspark.sql import Column, DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
 from ecommerce_pipeline.transformations.gold.dimensions import (
-    build_dim_category,
-    build_dim_product,
-    build_dim_shop,
     natural_hash,
     positive_hash_key,
 )
@@ -59,7 +56,9 @@ def build_dim_shop_from_history(
             "shop_created_at",
         ),
     )
-    return build_dim_shop(history.limit(0), spark).unionByName(rows) if include_unknown else rows
+    if not include_unknown:
+        return rows
+    return _unknown_shop(spark).unionByName(rows)
 
 
 def build_dim_category_from_history(
@@ -153,7 +152,9 @@ def build_dim_category_from_history(
             "category_created_at",
         ),
     )
-    return build_dim_category(history.limit(0), spark).unionByName(rows) if include_unknown else rows
+    if not include_unknown:
+        return rows
+    return _unknown_category(spark).unionByName(rows)
 
 
 def build_dim_product_from_history(
@@ -332,11 +333,9 @@ def build_dim_product_from_history(
             "attribute_hash",
         ),
     )
-    return (
-        build_dim_product(product_history.limit(0), variant_history.limit(0), spark).unionByName(rows)
-        if include_unknown
-        else rows
-    )
+    if not include_unknown:
+        return rows
+    return _unknown_product(spark).unionByName(rows)
 
 
 def build_dim_customer_from_history(
@@ -378,67 +377,6 @@ def build_dim_customer_from_history(
     if not include_unknown:
         return rows
     return _unknown_customer(spark).unionByName(rows)
-
-
-def build_dim_customer_incremental(
-    current_dimension: DataFrame,
-    new_history: DataFrame,
-) -> DataFrame:
-    """Build idempotent customer SCD2 upserts from current Gold + new history only."""
-
-    new_events = _customer_history_events(_normalize_history_event_time(new_history, new_history.sparkSession))
-    affected_ids = new_events.select("source_customer_id").where("source_customer_id IS NOT NULL").distinct()
-    seed = (
-        current_dimension.filter(F.col("is_current") & F.col("source_customer_id").isNotNull())
-        .join(F.broadcast(affected_ids), "source_customer_id", "left_semi")
-        .select(
-            "source_customer_id",
-            "public_customer_id",
-            "username",
-            "email",
-            "first_name",
-            "last_name",
-            "full_name",
-            "phone_number",
-            "customer_status",
-            "attribute_hash",
-            "registered_at",
-            "last_login_at",
-            F.col("effective_from").alias("_event_time"),
-            F.lit("SEED").alias("_operation"),
-            F.concat_ws(":", F.lit("seed"), F.col("source_customer_id"), F.col("effective_from")).alias(
-                "_history_event_id"
-            ),
-            F.lit(0).alias("_ingestion_priority"),
-            F.lit(-1).cast("long").alias("_source_event_sequence"),
-            F.lit(-1).cast("long").alias("_source_event_subsequence"),
-            F.lit(None).cast("long").alias("_source_lsn"),
-            F.lit(None).cast("int").alias("_kafka_partition"),
-            F.lit(None).cast("long").alias("_kafka_offset"),
-        )
-    )
-    scoped_events = seed.unionByName(new_events)
-    return _replay_single_entity_scd2(
-        scoped_events,
-        source_key="source_customer_id",
-        surrogate_key="customer_key",
-        initial_effective_from="registered_at",
-        type1_columns=("last_login_at",),
-        dimension_columns=(
-            "source_customer_id",
-            "public_customer_id",
-            "username",
-            "email",
-            "first_name",
-            "last_name",
-            "full_name",
-            "phone_number",
-            "customer_status",
-            "attribute_hash",
-            "registered_at",
-            "last_login_at",
-        ),
-    )
 
 
 def _customer_history_events(history: DataFrame) -> DataFrame:
@@ -628,6 +566,53 @@ def _event_order_columns() -> tuple[Column, ...]:
         F.col("_kafka_partition").asc_nulls_last(),
         F.col("_kafka_offset").asc_nulls_last(),
         F.col("_history_event_id").asc_nulls_last(),
+    )
+
+
+def _unknown_shop(spark: SparkSession) -> DataFrame:
+    return spark.sql(
+        """
+        SELECT CAST(0 AS BIGINT) shop_key, CAST(NULL AS INT) source_shop_id, CAST(NULL AS STRING) public_shop_id,
+               'Unknown Shop' shop_name, CAST(NULL AS STRING) shop_slug, 'unknown' shop_status,
+               CAST(NULL AS STRING) attribute_hash, CAST(NULL AS TIMESTAMP) shop_created_at,
+               TIMESTAMP '1970-01-01' effective_from, TIMESTAMP '9999-12-31' effective_to, TRUE is_current,
+               FALSE is_deleted, current_timestamp() created_at, current_timestamp() updated_at
+        """
+    )
+
+
+def _unknown_category(spark: SparkSession) -> DataFrame:
+    return spark.sql(
+        """
+        SELECT CAST(0 AS BIGINT) category_key, CAST(NULL AS INT) source_category_id,
+               CAST(NULL AS INT) source_parent_category_id, 'Unknown Category' category_name,
+               'unknown' category_slug, CAST(NULL AS STRING) parent_category_name, FALSE is_active,
+               CAST(NULL AS STRING) attribute_hash, CAST(NULL AS TIMESTAMP) category_created_at,
+               TIMESTAMP '1970-01-01' effective_from, TIMESTAMP '9999-12-31' effective_to, TRUE is_current,
+               FALSE is_deleted, current_timestamp() created_at, current_timestamp() updated_at
+        """
+    )
+
+
+def _unknown_product(spark: SparkSession) -> DataFrame:
+    return spark.sql(
+        """
+        SELECT CAST(0 AS BIGINT) product_key, CAST(NULL AS INT) source_product_id,
+               CAST(NULL AS INT) source_product_variant_id, CAST(NULL AS INT) source_shop_id,
+               CAST(NULL AS INT) source_category_id, CAST(NULL AS STRING) public_product_id,
+               CAST(NULL AS STRING) public_variant_id, 'unknown' product_sku, CAST(NULL AS STRING) product_slug,
+               'Unknown Product' product_name, CAST(NULL AS STRING) brand, 'unknown' product_status, FALSE is_featured,
+               'unknown' variant_sku, 'Unknown Variant' variant_name, 'unknown' variant_status,
+               CAST(NULL AS STRING) variant_options_json, FALSE is_default_variant,
+               CAST(NULL AS DECIMAL(12,2)) current_unit_price, CAST(NULL AS DECIMAL(12,2)) compare_at_price,
+               CAST(NULL AS STRING) currency, CAST(NULL AS INT) stock_quantity, CAST(NULL AS INT) reserved_quantity,
+               CAST(NULL AS DECIMAL(8,3)) weight_kg, CAST(NULL AS STRING) product_attributes_json,
+               CAST(NULL AS STRING) product_images_json, CAST(NULL AS STRING) variant_images_json,
+               CAST(NULL AS TIMESTAMP) product_created_at, CAST(NULL AS TIMESTAMP) variant_created_at,
+               CAST(NULL AS STRING) attribute_hash, TIMESTAMP '1970-01-01' effective_from,
+               TIMESTAMP '9999-12-31' effective_to, TRUE is_current,
+               FALSE is_deleted, current_timestamp() created_at, current_timestamp() updated_at
+        """
     )
 
 

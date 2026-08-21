@@ -1,3 +1,4 @@
+import os
 import random
 import time
 from datetime import datetime, timedelta
@@ -24,6 +25,11 @@ def seed_once(
         raise ValueError("batch_size must be greater than 0")
     rng = random.Random(seed)
     config = load_config(config_path)
+    if reset and not _reset_is_allowed(config.postgres.host):
+        raise ValueError(
+            "Refusing to reset a remote PostgreSQL source. "
+            "Set ECOMMERCE_ALLOW_REMOTE_RESET=1 only for an intentional remote reset."
+        )
     now = _now(config.application.timezone)
     started = perf_counter()
 
@@ -102,3 +108,8 @@ def _now(timezone_name: str) -> datetime:
     # PostgreSQL columns are TIMESTAMP WITHOUT TIME ZONE. Convert from the
     # Keep business timestamps realistic even though ingestion ordering uses event_id.
     return datetime.now(ZoneInfo(timezone_name)).replace(tzinfo=None)
+
+
+def _reset_is_allowed(host: str) -> bool:
+    local_hosts = {"localhost", "127.0.0.1", "::1", "postgres", "airflow-db"}
+    return host.lower() in local_hosts or os.getenv("ECOMMERCE_ALLOW_REMOTE_RESET") == "1"

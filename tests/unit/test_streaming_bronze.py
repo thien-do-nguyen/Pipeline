@@ -39,3 +39,29 @@ def test_existing_bronze_target_enables_cdf_when_missing(monkeypatch: pytest.Mon
         bronze.CHANGE_DATA_FEED_PROPERTY,
         "true",
     )
+
+
+def test_catalog_bronze_repairs_dangling_registration_before_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    df = Mock()
+    spark = df.sparkSession
+    spark.catalog.tableExists.return_value = False
+    empty = spark.createDataFrame.return_value
+    writer = empty.write.format.return_value
+    writer.mode.return_value = writer
+    writer.option.return_value = writer
+    reference = TableReference(
+        "catalog.bronze.cdc_events",
+        True,
+        "abfss://lakehouse@example/bronze/cdc_events",
+    )
+    repair = Mock()
+    write = Mock()
+    monkeypatch.setattr(bronze, "drop_dangling_catalog_registration", repair)
+    monkeypatch.setattr(bronze, "write_delta", write)
+
+    bronze.ensure_bronze_target(df, reference)
+
+    repair.assert_called_once_with(spark, reference)
+    write.assert_called_once_with(writer, reference)

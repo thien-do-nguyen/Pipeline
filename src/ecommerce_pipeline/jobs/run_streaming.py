@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Sequence
 
 from pyspark.sql import SparkSession
+from pyspark.sql.streaming.query import StreamingQuery
 
 from ecommerce_pipeline.config.loader import load_config
 from ecommerce_pipeline.config.models import AppConfig
@@ -11,7 +12,9 @@ from ecommerce_pipeline.ingestion.streaming.bronze import start_bronze_stream
 from ecommerce_pipeline.ingestion.streaming.debezium import normalize_debezium_events
 from ecommerce_pipeline.ingestion.streaming.kafka_source import read_kafka_stream
 from ecommerce_pipeline.ingestion.streaming.state import assert_local_delta_target_matches_checkpoints
+from ecommerce_pipeline.runtime.shutdown import log_runtime_failure, stop_spark_safely, stop_streaming_query_safely
 from ecommerce_pipeline.runtime.spark import build_spark
+from ecommerce_pipeline.runtime.streaming_progress import summarize_streaming_progress
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -26,7 +29,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def run(spark: SparkSession, config: AppConfig, *, available_now: bool) -> None:
+def start_query(spark: SparkSession, config: AppConfig, *, available_now: bool) -> StreamingQuery:
     streaming = config.streaming
     if not streaming.enabled or streaming.kafka is None:
         raise RuntimeError(f"Streaming is not enabled for environment: {config.environment}")
@@ -47,7 +50,22 @@ def run(spark: SparkSession, config: AppConfig, *, available_now: bool) -> None:
         f"target={reference.value} checkpoint={streaming.checkpoint_location}",
         flush=True,
     )
-    query.awaitTermination()
+    return query
+
+
+def run(spark: SparkSession, config: AppConfig, *, available_now: bool) -> dict[str, int | float] | None:
+    query = start_query(spark, config, available_now=available_now)
+    try:
+        query.awaitTermination()
+        return summarize_streaming_progress(query) if available_now else None
+    except KeyboardInterrupt:
+        print("[streaming] status=stopping reason=keyboard_interrupt", flush=True)
+    except Exception as exc:
+        log_runtime_failure("streaming", exc)
+        raise
+    finally:
+        stop_streaming_query_safely(query, label="streaming")
+    return None
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -63,7 +81,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         run(spark, config, available_now=args.available_now)
     finally:
         if spark is not None and config.spark.stop_session:
-            spark.stop()
+            stop_spark_safely(spark, label="streaming")
 
 
 if __name__ == "__main__":

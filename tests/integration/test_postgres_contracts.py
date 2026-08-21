@@ -101,6 +101,21 @@ def test_debezium_role_and_publication_match_the_cdc_contract() -> None:
             """
         )
         published = {(str(row["schemaname"]), str(row["tablename"])) for row in cursor.fetchall()}
+        cursor.execute(
+            """
+            SELECT c.relname
+            FROM pg_class AS c
+            JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s
+              AND c.relname = ANY(%s)
+              AND c.relreplident = 'f'
+            """,
+            (config.postgres.source_schema, list(BRONZE_TABLES)),
+        )
+        full_replica_identity = {str(row["relname"]) for row in cursor.fetchall()}
 
     assert role is not None and role["rolreplication"] is True
-    assert published == {(config.postgres.source_schema, table) for table in BRONZE_TABLES}
+    assert published == {(config.postgres.source_schema, table) for table in BRONZE_TABLES} | {
+        ("cdc_control", "debezium_heartbeat")
+    }
+    assert full_replica_identity == set(BRONZE_TABLES)

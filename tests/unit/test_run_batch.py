@@ -230,6 +230,25 @@ def test_validate_release_uses_propagated_silver_manifest(monkeypatch: pytest.Mo
     validate.assert_called_once_with(spark, config, manifest)
 
 
+def test_validate_release_uses_control_state_without_xcom_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validate = Mock(return_value={"batch_id": "gold-1"})
+    monkeypatch.setattr(run_batch, "validate_gold_release", validate)
+    args = Namespace(
+        mode="validate_release",
+        tables=None,
+        full_rebuild_silver=False,
+        full_rebuild_gold=False,
+    )
+    config = SimpleNamespace(application=SimpleNamespace(timezone="Asia/Ho_Chi_Minh"))
+    spark = Mock()
+
+    run_batch.run_mode(spark, args, config, "batch", {})
+
+    validate.assert_called_once_with(spark, config, None)
+
+
 def test_preflight_mode_does_not_write_lakehouse_layers(monkeypatch: pytest.MonkeyPatch) -> None:
     check = Mock(return_value={"status": "passed"})
     monkeypatch.setattr(run_batch, "check_postgres_source", check)

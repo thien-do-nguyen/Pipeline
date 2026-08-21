@@ -34,6 +34,7 @@ def cloud_pipeline_lock(spark: SparkSession, config: AppConfig, owner: str) -> I
     _ensure_lock_table(contender, reference)
     delta = _delta_table(spark, reference)
     deadline = monotonic() + settings.lock_wait_seconds
+    wait_started = monotonic()
     current = None
     while True:
         try:
@@ -67,15 +68,31 @@ def cloud_pipeline_lock(spark: SparkSession, config: AppConfig, owner: str) -> I
             current = None
         if monotonic() >= deadline:
             holder = "unknown" if current is None else current["owner_id"]
+            print(
+                f"[pipeline-lock] status=TIMEOUT name={settings.cloud_lock_name} owner={owner} "
+                f"wait_ms={round((monotonic() - wait_started) * 1000)} holder={holder}",
+                flush=True,
+            )
             raise PipelineLockUnavailable(
                 f"Timed out waiting for cloud pipeline lock {settings.cloud_lock_name}; holder={holder}"
             )
         sleep(5)
 
+    wait_ms = round((monotonic() - wait_started) * 1000)
+    print(
+        f"[pipeline-lock] status=ACQUIRED name={settings.cloud_lock_name} owner={owner} wait_ms={wait_ms}",
+        flush=True,
+    )
+    held_started = monotonic()
     try:
         yield
     finally:
         delta.delete((F.col("lock_name") == settings.cloud_lock_name) & (F.col("owner_id") == owner_id))
+        print(
+            f"[pipeline-lock] status=RELEASED name={settings.cloud_lock_name} owner={owner} "
+            f"held_ms={round((monotonic() - held_started) * 1000)}",
+            flush=True,
+        )
 
 
 def _ensure_lock_table(template: DataFrame, reference: TableReference) -> None:

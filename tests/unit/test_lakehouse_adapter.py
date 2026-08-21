@@ -9,10 +9,10 @@ from pyspark.sql import Row
 from ecommerce_pipeline.adapters.lakehouse import (
     LakehouseAdapter,
     _delta_sql_identifier,
-    _drop_dangling_catalog_registration,
     _is_missing_delta_table,
     _lexicographic_newer_condition,
     _sql_identifier,
+    drop_dangling_catalog_registration,
     latest_delta_pipeline_commit,
     write_delta,
 )
@@ -176,7 +176,7 @@ def test_dangling_external_table_registration_is_dropped_before_recreate(
         "abfss://lakehouse@example/gold/gold_scd2_checkpoint",
     )
 
-    _drop_dangling_catalog_registration(spark, reference)
+    drop_dangling_catalog_registration(spark, reference)
 
     spark.sql.assert_called_once_with("DROP TABLE IF EXISTS `catalog`.`gold`.`gold_scd2_checkpoint`")
 
@@ -209,6 +209,47 @@ def test_known_nonempty_source_skips_the_extra_spark_action(monkeypatch: pytest.
     cached.isEmpty.assert_not_called()
     merge.execute.assert_called_once_with()
     cached.unpersist.assert_called_once_with()
+
+
+def test_soft_delete_preserves_business_columns_and_does_not_insert_orphan_tombstone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spark = Mock()
+    config = Mock()
+    config.lakehouse = LakehouseConfig(base_path="data/lakehouse")
+    adapter = LakehouseAdapter(spark, config)
+    target = Mock(columns=["order_item_id", "order_id", "_operation", "_is_deleted", "_source_lsn"])
+    adapter.read_table = Mock(return_value=target)
+    source = Mock(
+        columns=["order_item_id", "order_id", "_operation", "_is_deleted", "_source_lsn"],
+        is_cached=False,
+    )
+    changes = source.cache.return_value
+    merge = Mock()
+    merge.whenMatchedUpdate.return_value = merge
+    merge.whenNotMatchedInsertAll.return_value = merge
+    delta = Mock()
+    delta.alias.return_value.merge.return_value = merge
+    monkeypatch.setattr("ecommerce_pipeline.adapters.lakehouse._delta_table", Mock(return_value=delta))
+
+    adapter.upsert_table(
+        source,
+        "silver",
+        "order_items",
+        ["order_item_id"],
+        sequence_columns=["_source_lsn"],
+        target_exists=True,
+        source_is_nonempty=True,
+        preserve_target_on_soft_delete=True,
+    )
+
+    delete_call = merge.whenMatchedUpdate.call_args_list[0]
+    assert "source.`_is_deleted` = true" in delete_call.kwargs["condition"]
+    assert set(delete_call.kwargs["set"]) == {"_is_deleted", "_operation", "_source_lsn"}
+    assert "order_id" not in delete_call.kwargs["set"]
+    insert_condition = merge.whenNotMatchedInsertAll.call_args.kwargs["condition"]
+    assert "NOT coalesce(source.`_is_deleted`, false)" in insert_condition
+    changes.unpersist.assert_called_once_with()
 
 
 def test_immutable_dimension_uses_insert_only_merge(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -94,6 +94,12 @@ def test_local_lock_rejects_a_second_writer(tmp_path: Path) -> None:
     ):
         pass
 
+    # The inode is intentionally persistent, but an unlocked file must never
+    # be mistaken for a live writer after normal exit or a crashed process.
+    assert (tmp_path / "_pipeline.lock").exists()
+    with local_pipeline_lock(str(tmp_path), "batch-3"):
+        assert (tmp_path / "_pipeline.lock").read_text(encoding="utf-8") == "batch-3"
+
 
 def test_unsafe_batch_id_is_rejected() -> None:
     with pytest.raises(ValueError, match="Unsafe batch_id"):

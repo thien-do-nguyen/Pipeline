@@ -10,7 +10,9 @@ x-airflow-common: &airflow-common
   working_dir: /opt/airflow/project
   environment: &airflow-common-environment
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__CORE__PARALLELISM: "1"
+    # Cloud operators mostly wait on Databricks. Keep enough global slots for
+    # local and cloud DAGs to progress independently while each DAG remains serial.
+    AIRFLOW__CORE__PARALLELISM: "${AIRFLOW_PARALLELISM:-4}"
     AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "1"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
@@ -32,8 +34,13 @@ x-airflow-common: &airflow-common
     DATABRICKS_HOST: ${DATABRICKS_HOST:-}
     DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
     DATABRICKS_JOB_ID: ${DATABRICKS_JOB_ID:-}
+    DATABRICKS_CONN_ID: databricks_default
     DATABRICKS_POLL_SECONDS: ${DATABRICKS_POLL_SECONDS:-5}
+    DATABRICKS_HTTP_TIMEOUT_SECONDS: ${DATABRICKS_HTTP_TIMEOUT_SECONDS:-15}
     DATABRICKS_RUN_TIMEOUT_SECONDS: ${DATABRICKS_RUN_TIMEOUT_SECONDS:-7200}
+    AIRFLOW_BATCH_DAG_TIMEOUT_SECONDS: ${AIRFLOW_BATCH_DAG_TIMEOUT_SECONDS:-14400}
+    AIRFLOW_CONN_DATABRICKS_DEFAULT: >-
+      {"conn_type":"databricks","host":"${DATABRICKS_HOST:-https://not-configured}","password":"${DATABRICKS_TOKEN:-not-configured}"}
     POSTGRES_HOST: postgres
     POSTGRES_PORT: "5432"
     POSTGRES_DB: ${POSTGRES_DB:-ecommerce}

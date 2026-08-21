@@ -1,11 +1,13 @@
 from contextlib import nullcontext
 from decimal import Decimal
+from threading import Lock
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
 from pyspark.sql import Row, SparkSession
 
+from ecommerce_pipeline.control.gold_reconcile_queue import PendingGoldScope
 from ecommerce_pipeline.ingestion.streaming import unified_silver
 from ecommerce_pipeline.ingestion.streaming.unified_silver import UnifiedSilverMaterializer
 from ecommerce_pipeline.pipelines.quality import GoldQualityError
@@ -16,6 +18,7 @@ def test_foreach_batch_reads_materialized_typed_bronze_and_stops_at_shared_silve
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     materializer = object.__new__(UnifiedSilverMaterializer)
+    materializer._cycle_lock = Lock()
     materializer.table_names = ("orders",)
     materializer._targets_validated = False
     materializer._transform_table = Mock(return_value="silver-orders")
@@ -23,6 +26,8 @@ def test_foreach_batch_reads_materialized_typed_bronze_and_stops_at_shared_silve
     materializer._preflight_targets = Mock(return_value={"orders": True})
     materializer._merge_table = Mock()
     materializer.silver = Mock()
+    materializer.gold_queue = Mock()
+    materializer._gold_scope = Mock(return_value=(set(), False))
     materializer.spark = Mock()
     materializer.settings = SimpleNamespace(query_name="cdc-to-silver", checkpoint_version="v1")
     materializer.config = SimpleNamespace(
@@ -57,11 +62,17 @@ def test_foreach_batch_reads_materialized_typed_bronze_and_stops_at_shared_silve
     materializer._transform_table.assert_called_once_with("typed-orders", "orders")
     materializer._transform_history_table.assert_not_called()
     materializer.silver.append_change_history.assert_not_called()
+    materializer.gold_queue.enqueue.assert_called_once_with(
+        request_id="cdc-to-silver:v1:11",
+        affected_order_ids=set(),
+        requires_fact_readiness=False,
+    )
     gold.run.assert_not_called()
 
 
-def test_foreach_batch_reconciles_gold_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_foreach_batch_queues_gold_without_running_it_inline(monkeypatch: pytest.MonkeyPatch) -> None:
     materializer = object.__new__(UnifiedSilverMaterializer)
+    materializer._cycle_lock = Lock()
     materializer.table_names = ("orders",)
     materializer._targets_validated = False
     materializer._transform_table = Mock(return_value="silver-orders")
@@ -69,15 +80,12 @@ def test_foreach_batch_reconciles_gold_when_enabled(monkeypatch: pytest.MonkeyPa
     materializer._preflight_targets = Mock(return_value={"orders": True})
     materializer._merge_table = Mock()
     materializer.silver = Mock()
-    materializer._track_pending_gold_scope = Mock()
-    materializer.reconcile_gold = Mock(return_value="published")
-    materializer._pending_gold_order_ids = {42}
-    materializer._pending_gold_requires_full_readiness = False
+    materializer.gold_queue = Mock()
+    materializer._gold_scope = Mock(return_value=({42}, True))
     materializer.spark = Mock()
     materializer.settings = SimpleNamespace(
         query_name="cdc-to-silver",
         checkpoint_version="v1",
-        reconcile_gold_each_batch=True,
     )
     materializer.config = SimpleNamespace(
         spark=SimpleNamespace(master="local[2]", max_parallel_tables=1),
@@ -99,12 +107,10 @@ def test_foreach_batch_reconciles_gold_when_enabled(monkeypatch: pytest.MonkeyPa
 
     materializer.process_batch(Mock(), 11)
 
-    materializer.reconcile_gold.assert_called_once_with(
-        batch_id="cdc-stream-11",
-        raise_on_quality_error=False,
-        rebuild_on_quality_error=False,
-        defer_if_source_incomplete=True,
+    materializer.gold_queue.enqueue.assert_called_once_with(
+        request_id="cdc-to-silver:v1:11",
         affected_order_ids={42},
+        requires_fact_readiness=True,
     )
 
 
@@ -189,63 +195,42 @@ def test_delete_readiness_waits_when_item_delete_arrives_before_order_delete(spa
     assert materializer._source_fact_ready_for_gold({42}) is False
 
 
-def test_per_batch_gold_reconcile_retries_deferred_source(monkeypatch: pytest.MonkeyPatch) -> None:
-    materializer = object.__new__(UnifiedSilverMaterializer)
-    materializer.settings = SimpleNamespace(
-        gold_deferred_retry_seconds=10,
-        gold_deferred_retry_interval_seconds=2,
-    )
-    materializer.reconcile_gold = Mock(side_effect=["deferred_source_incomplete", "published"])
-    sleep_mock = Mock()
-    monkeypatch.setattr(unified_silver, "sleep", sleep_mock)
-
-    status = materializer._reconcile_gold_with_deferred_retry(
-        batch_id="cdc-stream-9",
-        raise_on_quality_error=False,
-        rebuild_on_quality_error=False,
-        defer_if_source_incomplete=True,
-        affected_order_ids={101},
-    )
-
-    assert status == "published"
-    sleep_mock.assert_called_once_with(2)
-    assert materializer.reconcile_gold.call_args_list == [
-        call(
-            batch_id="cdc-stream-9",
-            raise_on_quality_error=False,
-            rebuild_on_quality_error=False,
-            defer_if_source_incomplete=True,
-            affected_order_ids={101},
-        ),
-        call(
-            batch_id="cdc-stream-9-retry-1",
-            raise_on_quality_error=False,
-            rebuild_on_quality_error=False,
-            defer_if_source_incomplete=True,
-            affected_order_ids={101},
-        ),
-    ]
-
-
 def test_idle_gold_reconcile_publishes_pending_scope() -> None:
     materializer = object.__new__(UnifiedSilverMaterializer)
-    materializer.settings = SimpleNamespace(reconcile_gold_each_batch=True)
-    materializer._pending_gold_order_ids = {935}
-    materializer._pending_gold_requires_full_readiness = False
-    materializer.reconcile_gold = Mock(return_value="published")
+    materializer._cycle_lock = Lock()
+    materializer.settings = SimpleNamespace(max_gold_readiness_order_ids=5000)
+    pending = PendingGoldScope(
+        keys=(("request-1", "order:935"),),
+        affected_order_ids={935},
+        requires_fact_readiness=True,
+    )
+    materializer.gold_queue = Mock()
+    materializer.gold_queue.pending.side_effect = [pending, pending]
+    materializer._writer_lock = Mock(return_value=nullcontext())
+    materializer._source_fact_ready_for_gold = Mock(return_value=True)
+    materializer._run_gold_locked = Mock(return_value="published")
 
     status = materializer.reconcile_pending_gold_if_ready(batch_id="cdc-idle-reconcile")
 
     assert status == "published"
-    assert materializer._pending_gold_order_ids == set()
-    assert materializer._pending_gold_requires_full_readiness is False
-    materializer.reconcile_gold.assert_called_once_with(
+    materializer._run_gold_locked.assert_called_once_with(
         batch_id="cdc-idle-reconcile",
         raise_on_quality_error=False,
         rebuild_on_quality_error=False,
-        defer_if_source_incomplete=True,
-        affected_order_ids={935},
     )
+    materializer.gold_queue.complete.assert_called_once_with(pending.keys)
+
+
+def test_idle_gold_reconcile_does_not_lock_when_queue_is_empty() -> None:
+    materializer = object.__new__(UnifiedSilverMaterializer)
+    materializer._cycle_lock = Lock()
+    materializer.settings = SimpleNamespace(max_gold_readiness_order_ids=5000)
+    materializer.gold_queue = Mock()
+    materializer.gold_queue.pending.return_value = None
+    materializer._writer_lock = Mock()
+
+    assert materializer.reconcile_pending_gold_if_ready(batch_id="cdc-idle-reconcile") == "not_pending"
+    materializer._writer_lock.assert_not_called()
 
 
 def test_per_batch_gold_reconcile_skips_failed_publish_without_rebuild(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -341,9 +326,48 @@ def test_cdc_merge_writes_the_shared_silver_target_with_order_guard(
         sequence_columns=SILVER_SEQUENCE_COLUMNS,
         target_exists=True,
         source_is_nonempty=True,
+        preserve_target_on_soft_delete=True,
     )
     transaction.assert_called_once_with(
         worker_spark,
         application_id="cdc-to-silver-v1-orders",
         transaction_version=7,
+    )
+
+
+def test_cdc_bootstrap_uses_dataframe_owner_session_for_commit_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    materializer = object.__new__(UnifiedSilverMaterializer)
+    materializer.spark = Mock()
+    materializer.config = Mock()
+    materializer.settings = SimpleNamespace(query_name="cdc-to-silver", checkpoint_version="v1")
+    lakehouse = Mock()
+    dataframe = Mock()
+    transaction = Mock(return_value=nullcontext())
+    metadata = Mock(return_value=nullcontext())
+    monkeypatch.setattr(unified_silver, "delta_idempotent_transaction", transaction)
+    monkeypatch.setattr(unified_silver, "delta_commit_metadata", metadata)
+    monkeypatch.setattr(unified_silver, "LakehouseAdapter", Mock(return_value=lakehouse))
+
+    materializer._merge_table(
+        dataframe,
+        "orders",
+        7,
+        Row(record_count=2, min_source_lsn=10, max_source_lsn=20),
+        target_exists=False,
+    )
+
+    materializer.spark.newSession.assert_not_called()
+    transaction.assert_called_once_with(
+        materializer.spark,
+        application_id="cdc-to-silver-v1-orders",
+        transaction_version=7,
+    )
+    metadata.assert_called_once()
+    lakehouse.write_table.assert_called_once_with(
+        dataframe,
+        "silver",
+        "orders",
+        enable_change_data_feed=True,
     )

@@ -268,8 +268,6 @@ def run_mode(
             flush=True,
         )
     if args.mode in {"validate_release", "workflow"}:
-        if silver_manifest is None:
-            raise ValueError("validate_release requires a propagated Silver manifest")
         started = perf_counter()
         release_report = validate_gold_release(spark, config, silver_manifest)
         timings_ms["validation.release"] = round((perf_counter() - started) * 1000)

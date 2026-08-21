@@ -50,10 +50,8 @@ streaming:
     trigger_interval: 30 seconds
     max_files_per_trigger: 8
     max_bytes_per_trigger: 32m
-    reconcile_gold_each_batch: false
     max_gold_readiness_order_ids: 5000
-    gold_deferred_retry_seconds: 0
-    gold_deferred_retry_interval_seconds: 2
+    gold_reconcile_interval_seconds: 10
 
 coordination:
   # Batch and streaming may trigger Gold; this shared lock serializes Silver/Gold publication.
