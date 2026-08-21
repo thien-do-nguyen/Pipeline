@@ -135,11 +135,7 @@ class SilverBuilder:
                 raise RuntimeError(f"Silver progress version is missing for table: {table_name}")
             return self._result(
                 contract,
-                latest_delta_pipeline_commit(
-                    self.spark,
-                    silver_reference,
-                    pipelines=SILVER_DATA_PIPELINES,
-                ).version,
+                silver_state.progress_version,
             )
 
         self._validate_schema_version(table_name, silver_state.progress)

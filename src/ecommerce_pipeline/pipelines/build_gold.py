@@ -167,13 +167,7 @@ class GoldBuilder:
                 histories["products"], histories["product_variants"], self.spark
             ),
         }
-        for table_name, dimension in scd2_outputs.items():
-            with self._timed(f"gold.table.{table_name}"):
-                self.lakehouse.write_table(dimension, "gold", table_name)
-                if table_name == "dim_customer":
-                    self._write_scd2_checkpoint("dim_customer", "app_users")
-        fact_dimensions = self._read_fact_dimensions()
-        outputs: dict[str, tuple[DataFrame, list[str]]] = {
+        non_scd2_dimensions: dict[str, tuple[DataFrame, list[str]]] = {
             "dim_date": (build_dim_date(tables["orders"], self.spark), ["date_key"]),
             "dim_time": (build_dim_time(tables["orders"], self.spark), ["time_key"]),
             "dim_location": (
@@ -186,23 +180,52 @@ class GoldBuilder:
             ),
             "dim_payment": (build_dim_payment(tables["payments"], self.spark), ["payment_key"]),
             "dim_shipping": (build_dim_shipping(tables["shipments"], self.spark), ["shipping_key"]),
-            "fact_sales": (
-                build_fact_sales(tables, fact_dimensions),
-                ["source_order_id", "source_order_item_id"],
-            ),
         }
-        for table_name, (df, keys) in outputs.items():
-            with self._timed(f"gold.table.{table_name}"):
+
+        def write_scd2_table(name: str, dimension: DataFrame) -> None:
+            with self._timed(f"gold.table.{name}"):
+                self.lakehouse.write_table(dimension, "gold", name)
+                if name == "dim_customer":
+                    self._write_scd2_checkpoint("dim_customer", "app_users")
+
+        def write_non_scd2_table(name: str, df: DataFrame, keys: list[str]) -> None:
+            with self._timed(f"gold.table.{name}"):
                 if replace:
-                    self.lakehouse.write_table(df, "gold", table_name)
+                    self.lakehouse.write_table(df, "gold", name)
                 else:
                     self.lakehouse.upsert_table(
                         df,
                         "gold",
-                        table_name,
+                        name,
                         keys,
                         delete_not_matched_by_source=True,
                     )
+
+        tasks: list[Callable[[], None]] = [
+            *(lambda n=name, d=dim: write_scd2_table(n, d) for name, dim in scd2_outputs.items()),
+            *(
+                lambda n=name, d=df, k=keys: write_non_scd2_table(n, d, k)
+                for name, (df, keys) in non_scd2_dimensions.items()
+            ),
+        ]
+
+        workers = max(1, min(len(tasks), self.config.spark.max_parallel_tables))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(lambda fn: fn(), tasks))
+
+        fact_dimensions = self._read_fact_dimensions()
+        fact_df = build_fact_sales(tables, fact_dimensions)
+        with self._timed("gold.table.fact_sales"):
+            if replace:
+                self.lakehouse.write_table(fact_df, "gold", "fact_sales")
+            else:
+                self.lakehouse.upsert_table(
+                    fact_df,
+                    "gold",
+                    "fact_sales",
+                    ["source_order_id", "source_order_item_id"],
+                    delete_not_matched_by_source=True,
+                )
 
         GoldQualityChecker(self.lakehouse).run(tables)
         return frozenset(GOLD_TABLES)
